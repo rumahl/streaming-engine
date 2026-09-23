@@ -48,6 +48,7 @@ import zlib
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .logs import configure_logging
+from .private_token_file import read_private_token_file as _read_private_token_file
 
 logger = logging.getLogger("settings")
 
@@ -598,6 +599,12 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "help": "Master token to enable secure mode and protect the control plane API.",
     },
     {
+        "name": "master_token_file",
+        "type": "str",
+        "default": "",
+        "help": "Read the master token from a private regular file instead of an argument or environment variable.",
+    },
+    {
         "name": "enable_https",
         "type": "bool",
         "default": False,
@@ -1120,6 +1127,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
 # Secrets, flagged sensitive so consumers keep them out of client broadcasts.
 SENSITIVE_SETTING_NAMES = frozenset({
     "master_token",
+    "master_token_file",
     "https_key",
     "basic_auth_user",
     "basic_auth_password",
@@ -1991,6 +1999,11 @@ class AppSettings:
         stable and non-empty (`<expiry>:selkies`) instead of a bare
         `<expiry>:` or a volatile pod hostname.
         """
+        if self.master_token_file:
+            if self.master_token:
+                raise ValueError("master_token and master_token_file cannot both be set")
+            self.master_token = _read_private_token_file(self.master_token_file)
+
         subfolder = str(self.subfolder).strip().strip("/")
         self.subfolder = ("/" + subfolder) if subfolder else ""
 
