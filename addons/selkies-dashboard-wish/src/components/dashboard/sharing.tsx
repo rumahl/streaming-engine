@@ -13,6 +13,7 @@ import { Info } from "lucide-react";
 import { toast } from "sonner";
 import { computeRenderableSettings, getLastServerSettings } from "@/utils";
 import { t } from "@/i18n";
+import { shareablePageURL } from "../../../../selkies-web-core/lib/page-url.js";
 
 /**
  * The sharing card: copyable links for the viewer (`#shared`) and the
@@ -62,7 +63,7 @@ export const Sharing = ({ show }: SharingProps) => {
 	const [renderableSettings, setRenderableSettings] = useState<any>(() => computeRenderableSettings(getLastServerSettings()));
 
 	const baseUrl =
-		typeof window !== "undefined" ? window.location.href.split("#")[0] : "";
+		typeof window !== "undefined" ? shareablePageURL() : "";
 
 	useEffect(() => {
 		const handleMessage = (event: MessageEvent) => {
@@ -117,7 +118,7 @@ export const Sharing = ({ show }: SharingProps) => {
 
 	if (renderableSettings.enableSharing === false) {
 		return (
-			<Card className="w-[320px] bg-background/95 backdrop-blur-sm border shadow-lg rounded-lg relative p-4">
+			<Card className="w-[320px] bg-background border shadow-lg rounded-lg relative p-4">
 				<div className="text-center text-muted-foreground">
 					<Info className="h-8 w-8 mx-auto mb-2" />
 					<p className="text-sm">{t('sharing.disabledByAdmin')}</p>
@@ -127,15 +128,15 @@ export const Sharing = ({ show }: SharingProps) => {
 	}
 
 	return (
-		<Card className="w-[320px] bg-background/95 backdrop-blur-sm border shadow-lg rounded-lg relative p-2">
+		<Card className="w-[320px] bg-background border shadow-lg rounded-lg relative p-2">
 			<div className="px-2 py-0 flex flex-col gap-2">
 				<div className="flex items-center justify-between mb-1">
 					<CardTitle className="text-xs font-bold">{t('sharing.shareLinksTitle')}</CardTitle>
 					<Tooltip>
-						<TooltipTrigger asChild>
-							<span className="inline-block cursor-help">
-								<Info className="h-4 w-4 text-muted-foreground" />
-							</span>
+						<TooltipTrigger
+							render={<span className="inline-block cursor-help" />}
+						>
+							<Info className="h-4 w-4 text-muted-foreground" />
 						</TooltipTrigger>
 						<TooltipContent className="text-sm bg-primary text-primary-foreground">
 							{t('sharing.tooltipLine1')}<br />

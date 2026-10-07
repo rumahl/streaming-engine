@@ -26,13 +26,14 @@ thread, pcmflux encodes Opus on its own audio thread, and both hand
 zero-copy buffers back into the asyncio loop via `call_soon_threadsafe` for
 the transport's `produce_data` to packetize as RTP. Because RTP senders are
 live across capture restarts, the pipeline keeps its own monotonic pts
-clocks (video: 90 kHz wall-clock anchor; audio: an epoch offset over
-pcmflux's re-zeroing sample clock) so pts never jumps backward.
+clocks (video: 90 kHz from each frame's capture instant on a pipeline-scoped
+CLOCK_MONOTONIC anchor; audio: an epoch offset over pcmflux's re-zeroing
+sample clock) so pts never jumps backward.
 
 A running pipeline is the display's media graph; its two captures are
 started and paused one by one underneath it. `start_media_pipeline` opens
 only the captures a consumer asked for, and `pause_screen_capture`,
-`resume_screen_capture`, `pause_audio_capture` and `resume_audio_capture`
+`resume_screen_capture`, `pause_audio_capture`, and `resume_audio_capture`
 stop and restart each while the pipeline stays running, so a session whose
 policy starts video or audio off never captures what nobody receives.
 
@@ -55,11 +56,12 @@ import time
 from abc import ABCMeta, abstractmethod
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from .settings import RateControlMode, codec_for_encoder, encoder_for_codec, settings as app_settings
+from .settings import RateControlMode, codec_for_encoder, encoder_for_codec, fps_label, settings as app_settings
 from . import stream_stats
 from .audio_control import AudioControl
 from .display_utils import (
     FIRST_FRAME_WAIT_S,
+    FRAME_ANCHOR,
     apply_common_capture_settings,
     no_first_frame,
     format_pixelflux_cursor,
@@ -84,6 +86,9 @@ logger = logging.getLogger("webrtc")
 # nibble (a keyframe is 0x01; every JPEG picture stands alone), the frame id,
 # the stripe geometry, and the id of the frame it predicts from.
 STRIPE_HEADER_LEN = 12
+
+# The RTP MIME type of each codec id a video header carries.
+WIRE_VIDEO_MIMES = {1: "video/H264", 2: "video/VP8", 3: "video/VP9", 4: "video/AV1", 5: "video/H265"}
 
 
 async def _discard_stream_info(display_id: str, info: Dict[str, Any]) -> None:
@@ -115,7 +120,7 @@ class MediaPipeline(metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    async def set_framerate(self, framerate: int) -> None:
+    async def set_framerate(self, framerate: float) -> None:
         pass
 
     @abstractmethod
@@ -170,11 +175,12 @@ class MediaPipelinePixel(MediaPipeline):
             (DPI-scaled upstream); `<= 0` falls back to the settings default.
         capture_module: pixelflux `ScreenCapture`; Any, the import is optional.
         pcmflux_module: pcmflux `AudioCapture`; likewise.
-        _video_pts_anchor: Video pts clock origin; pipeline-scoped rather than
-            capture-scoped so restarts and fps changes never rewind pts.
+        _video_pts_anchor: Video pts clock origin, CLOCK_MONOTONIC ns;
+            pipeline-scoped rather than capture-scoped so restarts and fps
+            changes never rewind pts.
         _audio_capture_epoch: Bumped per audio capture start. The callback
-            re-anchors `_audio_pts_offset` one frame step past `_audio_last_pts`
-            when it sees a new epoch, since pcmflux re-zeros its sample clock.
+            re-anchors `_audio_pts_offset` when it sees a new epoch, since
+            pcmflux re-zeros its sample clock (`_audio_rtp_pts`).
         _audio_routing_task: Routing enforcement for the running capture; held
             so it is not garbage-collected mid-flight, canceled on stop.
         _audio_control: Sound-server control connection (sink provisioning,
@@ -182,13 +188,15 @@ class MediaPipelinePixel(MediaPipeline):
             start and closed with the capture.
         _audio_recover_last_attempt: Monotonic time of the last audio-recovery
             restart; floors the retry rate when a device keeps failing.
+        stereo_companion: Whether a surround capture also encodes its stereo
+            fold (`set_stereo_companion`), delivered as `audio_stereo`.
     """
 
     def __init__(
         self,
         async_event_loop: asyncio.AbstractEventLoop,
         encoder: str,
-        framerate: int = 30,
+        framerate: float = 30,
         video_bitrate: int = 8000,
         audio_bitrate: int = 128000,
         width: int = 1920,
@@ -199,6 +207,7 @@ class MediaPipelinePixel(MediaPipeline):
         crf: int = 23,
         rc_mode: RateControlMode = RateControlMode.CBR,
         video_fullcolor: bool = False,
+        video_10bit: bool = False,
         use_cpu: bool = False,
         video_streaming_mode: bool = True,
         use_paint_over_quality: bool = True,
@@ -217,6 +226,7 @@ class MediaPipelinePixel(MediaPipeline):
         self.rc_mode = rc_mode
         self.video_crf = crf
         self.video_fullcolor = video_fullcolor
+        self.video_10bit = video_10bit
         self.use_cpu = use_cpu
         self.video_streaming_mode = video_streaming_mode
         self.use_paint_over_quality = use_paint_over_quality
@@ -233,7 +243,7 @@ class MediaPipelinePixel(MediaPipeline):
         # A requested IDR not yet captured: a request landing meanwhile is
         # satisfied by it; one landing after it was captured is not.
         self.idr_pending = False
-        self.produce_data: Callable[..., None] = lambda buf, pts, kind, keyframe=True, timing=None, dependency=None: logger.warning(
+        self.produce_data: Callable[..., None] = lambda buf, pts, kind, keyframe=True, timing=None, dependency=None, codec=None, anchor=False: logger.warning(
             "unhandled produce_data"
         )
         self.on_pipeline_started: Callable[[], None] = lambda: None
@@ -253,7 +263,7 @@ class MediaPipelinePixel(MediaPipeline):
         self._is_pcmflux_capturing = False
         self._running = False
         self.async_lock = asyncio.Lock()
-        self._video_pts_anchor: Optional[float] = None
+        self._video_pts_anchor: Optional[int] = None
         # Whether the live capture has delivered a frame, for the first-frame check.
         self._framed = False
         self._last_video_pts = -1
@@ -261,10 +271,20 @@ class MediaPipelinePixel(MediaPipeline):
         self._audio_cb_epoch = -1
         self._audio_pts_offset = 0
         self._audio_last_pts = -1
+        self._audio_last_wall = 0.0
         self._audio_frame_samples = 480
         self._audio_routing_task: Optional[asyncio.Task] = None
         self._audio_control: Optional[AudioControl] = None
         self._audio_recover_last_attempt = 0.0
+        self.stereo_companion = False
+
+    def set_stereo_companion(self, wanted: bool) -> None:
+        """Have a surround capture encode its stereo companion, live, for the
+        peers whose engine decodes no multiopus; stored first, so a capture
+        started later takes it too. Nothing for a stereo capture."""
+        self.stereo_companion = wanted
+        if self.pcmflux_module is not None and self.audio_channels > 2:
+            self.pcmflux_module.set_stereo_companion(wanted)
 
     async def set_pointer_visible(self, visible: bool) -> None:
         """Toggle pixelflux cursor capture, live (the capture thread re-reads
@@ -369,6 +389,16 @@ class MediaPipelinePixel(MediaPipeline):
         logger.info(f"video_fullcolor -> {fullcolor}; restarting screen capture")
         await self.restart_screen_capture()
 
+    async def set_video_10bit(self, ten_bit: bool) -> None:
+        """Toggle 10-bit samples. Structural (pixel format), so restart capture (WS parity)."""
+        if self.video_10bit == ten_bit:
+            return
+        self.video_10bit = ten_bit
+        if not self._is_screen_capturing or self.capture_module is None:
+            return
+        logger.info(f"video_10bit -> {ten_bit}; restarting screen capture")
+        await self.restart_screen_capture()
+
     async def set_encoder(self, encoder: str) -> None:
         """Switch the WebRTC video encoder. Structural (a different encoder
         instance), so restart capture — same as use_cpu (WS parity)."""
@@ -465,7 +495,7 @@ class MediaPipelinePixel(MediaPipeline):
             await self._stop_audio_pipeline()
             await self._start_audio_pipeline()
 
-    async def set_framerate(self, framerate: int) -> None:
+    async def set_framerate(self, framerate: float) -> None:
         """Set the pixelflux capture rate, applied live."""
         async with self.async_lock:
             if framerate <= 0 or self.framerate == framerate:
@@ -475,7 +505,7 @@ class MediaPipelinePixel(MediaPipeline):
             if not self._is_screen_capturing or self.capture_module is None:
                 return
             self.capture_module.update_framerate(float(self.framerate))
-            logger.info(f"Updated framerate to: {self.framerate}")
+            logger.info(f"Updated framerate to {fps_label(self.framerate)} fps")
 
     async def dynamic_idr_frame(self) -> None:
         """Request an IDR frame from pixelflux; `idr_pending` holds until it is captured."""
@@ -492,6 +522,13 @@ class MediaPipelinePixel(MediaPipeline):
         """A consumer lost `frame_id`: the frames after it stop predicting from it."""
         if self._is_screen_capturing and self.capture_module is not None:
             self.capture_module.invalidate_reference(frame_id & 0xFFFF)
+
+    def acknowledge_reference(self, frame_id: int, held: bool = True) -> None:
+        """Every consumer holds `frame_id`, or where not `held` was sent it
+        (`CommonFrames`); a pixelflux that cannot take it is not told."""
+        acknowledge = getattr(self.capture_module, "acknowledge_reference", None)
+        if self._is_screen_capturing and acknowledge is not None:
+            acknowledge(frame_id & 0xFFFF, held)
 
     def generate_capture_settings(self) -> Any:
         """Build the pixelflux CaptureSettings snapshot for the current state.
@@ -535,6 +572,7 @@ class MediaPipelinePixel(MediaPipeline):
             paintover_crf=self.video_paintover_crf,
             paintover_burst=self.video_paintover_burst_frames,
             fullcolor=self.video_fullcolor,
+            ten_bit=self.video_10bit,
             streaming=self.video_streaming_mode,
             use_paint_over_quality=self.use_paint_over_quality,
             capture_cursor=self.capture_cursor,
@@ -546,21 +584,28 @@ class MediaPipelinePixel(MediaPipeline):
         """Deliver one encoded video frame; runs on the pixelflux capture thread.
 
         The frame owns its native buffer and goes downstream as a zero-copy
-        memoryview sliced past the header, with the keyframe flag read off
-        the header's picture-type byte and, for a full frame whose encoder
-        tracks its references, the frame's id and the id it predicts from;
+        memoryview sliced past the header, with its keyframe flag and codec
+        read off the header's type byte and, for a frame whose encoder tracks
+        its references, the frame's id and the id it predicts from: only
+        whole-frame sessions track them, and a frame is judged by that rather
+        than by the pipeline's size, which a resize changes while frames of
+        the old size and the new are still arriving;
         `produce_data` wraps it in an EncodedPacket and keeps a reference so
-        the frame stays alive. pts
-        (90 kHz) comes from the pipeline-scoped monotonic clock rather than
-        `frame.frame_id`: the u16 counter wraps, restarts at 0 on every
-        capture restart, and its implied step changes on live fps raises,
-        all backward RTP jumps on a live sender. Ties bump one tick so pts is
-        strictly increasing. Only one capture thread exists at a time (stop
-        joins before a new start), so this state needs no lock; and
-        `produce_data` is synchronous, so `call_soon_threadsafe` delivers it
-        with no per-frame Future, matching the websockets path. The frame's
-        capture and encode instants travel with it for the video-timing
-        extension.
+        the frame stays alive. pts (90 kHz) is the frame's capture instant, as
+        pixelflux stamped it on CLOCK_MONOTONIC, from the pipeline-scoped
+        anchor rather than `frame.frame_id`: the u16 counter wraps, restarts at
+        0 on every capture restart, and its implied step changes on live fps
+        raises, all backward RTP jumps on a live sender. The capture instant
+        rather than the delivery keeps the encode's varying duration out of
+        the RTP clock, so a receiver mapping it through the sender reports
+        reads capture times; a path that stamps no capture falls back to the
+        delivery. Ties bump one tick so pts is strictly increasing. Only one
+        capture thread exists at a time (stop joins before a new start), so
+        this state needs no lock; and `produce_data` is synchronous, so
+        `call_soon_threadsafe` delivers it with no per-frame Future, matching
+        the websockets path. The frame's capture and encode instants travel
+        with it for the sender's timing extensions and reports, the capture
+        one being the instant its pts was taken at.
         """
         self._framed = True
         try:
@@ -570,21 +615,25 @@ class MediaPipelinePixel(MediaPipeline):
                 if keyframe:
                     self.idr_pending = False
                 data_bytes = view[STRIPE_HEADER_LEN:]
-                now = time.monotonic()
+                captured = frame.capture_ns
+                if captured <= 0:
+                    captured = time.monotonic_ns()
                 if self._video_pts_anchor is None:
-                    self._video_pts_anchor = now
-                pts = int((now - self._video_pts_anchor) * 90000)
+                    self._video_pts_anchor = captured
+                pts = (captured - self._video_pts_anchor) * 9 // 100_000
                 if pts <= self._last_video_pts:
                     pts = self._last_video_pts + 1
                 self._last_video_pts = pts
-                timing = (frame.capture_ns, frame.encode_start_ns, frame.encode_end_ns)
+                timing = (captured, frame.encode_start_ns, frame.encode_end_ns)
                 reference = frame.reference_frame_id
                 dependency = None
-                if reference != -2 and frame.stripe_y_start == 0 and frame.stripe_height == self.height:
+                if reference != -2:
                     dependency = (frame.frame_id & 0xFFFF, None if reference == -1 else reference)
+                codec = WIRE_VIDEO_MIMES.get(view[1] >> 4) if view[0] == 0x04 else None
+                anchor = view[0] == 0x04 and bool(view[1] & FRAME_ANCHOR)
                 self.async_event_loop.call_soon_threadsafe(
                     functools.partial(self.produce_data, data_bytes, pts, "video", keyframe,
-                                      timing=timing, dependency=dependency)
+                                      timing=timing, dependency=dependency, codec=codec, anchor=anchor)
                 )
 
         except Exception as e:
@@ -613,6 +662,11 @@ class MediaPipelinePixel(MediaPipeline):
         pixelflux is the cursor source on both backends (compositor on
         Wayland, XFixes monitor on X11); an older X11-only build stashes the
         callback harmlessly and the input handler's monitor keeps delivering.
+        The capture counts as running from before the start is awaited: its
+        first frames reach the video bridge while the start is still under
+        way, and what the bridge and the other live setters ask of it in reply
+        (a lost frame, a keyframe, a rate) has to reach it rather than be
+        dropped as meant for a capture that is not running.
 
         Raises:
             MediaPipelineError: When pixelflux is unavailable or the capture
@@ -634,12 +688,12 @@ class MediaPipelinePixel(MediaPipeline):
             self.capture_module = ScreenCapture()
             self.capture_module.set_cursor_callback(self._pixelflux_cursor_handler)
             self._framed = False
+            self._is_screen_capturing = True
             await asyncio.to_thread(
                 self.capture_module.start_capture,
                 self._screen_capture_callback,
                 settings,
             )
-            self._is_screen_capturing = True
             logger.info("Started screen capture module")
             module = self.capture_module
             asyncio.get_running_loop().call_later(
@@ -855,31 +909,26 @@ class MediaPipelinePixel(MediaPipeline):
                 """Deliver one Opus frame; runs on the pcmflux capture thread.
 
                 The frame goes downstream as a zero-copy memoryview that
-                `produce_data` keeps a reference to. pcmflux re-zeros pts on
-                every start, so the per-capture sample clock is mapped onto a
-                continuous one: a backward RTP jump on a live sender plays as
-                a glitch.
+                `produce_data` keeps a reference to, stamped on the
+                pipeline's continuous audio clock (`_audio_rtp_pts`).
                 """
                 try:
                     if len(frame) > 0:
                         data_bytes = memoryview(frame)
-                        raw_pts = int(frame.pts)
-                        if self._audio_cb_epoch != self._audio_capture_epoch:
-                            self._audio_cb_epoch = self._audio_capture_epoch
-                            self._audio_pts_offset = (
-                                self._audio_last_pts + self._audio_frame_samples - raw_pts
-                                if self._audio_last_pts >= 0 else 0
-                            )
-                        pts = self._audio_pts_offset + raw_pts
-                        self._audio_last_pts = pts
+                        pts = self._audio_rtp_pts(int(frame.pts), time.monotonic())
+                        # A surround capture's stereo companion shares its frame's pts.
+                        kind = ("audio_stereo" if self.audio_channels > 2
+                                and frame.channels < self.audio_channels else "audio")
 
                         self.async_event_loop.call_soon_threadsafe(
-                            self.produce_data, data_bytes, pts, "audio"
+                            self.produce_data, data_bytes, pts, kind
                         )
                 except Exception as e:
                     logger.info(f"Error audio capture callback: {e}")
 
             self.pcmflux_module = AudioCapture()
+            if self.audio_channels > 2:
+                self.pcmflux_module.set_stereo_companion(self.stereo_companion)
             # Before start_capture, so the first frame re-anchors on the new epoch.
             self._audio_capture_epoch += 1
             await asyncio.to_thread(
@@ -900,6 +949,34 @@ class MediaPipelinePixel(MediaPipeline):
             logger.error(f"Failed to start pcmflux audio pipeline: {e}", exc_info=True)
             await self._stop_audio_pipeline()
             return
+
+    def _audio_rtp_pts(self, raw_pts: int, now: float) -> int:
+        """The pts, on the pipeline's continuous 48 kHz audio clock, of a
+        capture frame whose own pts is `raw_pts` and which was delivered at
+        monotonic time `now`.
+
+        pcmflux re-zeros its sample clock on every capture start, so the
+        first frame of a new `_audio_capture_epoch` re-anchors the offset: it
+        lands as far past the last frame as the wall clock moved between the
+        two deliveries, and at least one frame past it. A backward RTP jump on
+        a live sender plays as a glitch, and one that ignores the time the
+        capture was stopped (an audio pause and resume) makes the receiver
+        take the first packet after it for a packet that late: libwebrtc's
+        jitter buffer then holds that much audio, a second for a one-second
+        pause, for about twenty seconds.
+        """
+        if self._audio_cb_epoch != self._audio_capture_epoch:
+            self._audio_cb_epoch = self._audio_capture_epoch
+            if self._audio_last_pts >= 0:
+                elapsed = round((now - self._audio_last_wall) * 48000)
+                self._audio_pts_offset = (
+                    self._audio_last_pts + max(self._audio_frame_samples, elapsed) - raw_pts)
+            else:
+                self._audio_pts_offset = 0
+        pts = self._audio_pts_offset + raw_pts
+        self._audio_last_pts = pts
+        self._audio_last_wall = now
+        return pts
 
     def _get_audio_control(self) -> AudioControl:
         """The sound-server control client, created on the pipeline's loop."""
@@ -1065,7 +1142,7 @@ class MediaPipelinePixel(MediaPipeline):
         return self._running
 
     def is_screen_capturing(self) -> bool:
-        """True once the screen capture runs, which precedes `_running` (the
+        """True once the screen capture starts, which precedes `_running` (the
         audio half of the pipeline may still be starting); settings that must
         reach a live capture key on this, not on the whole pipeline."""
         return self._is_screen_capturing

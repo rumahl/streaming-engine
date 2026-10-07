@@ -1,15 +1,30 @@
 #!/usr/bin/env python3
 """The image clipboard, both directions, against a live session.
 
-The dashboard's upload button is the only way an image the user did not copy
-reaches the session clipboard, and choosing a file blurs the page and refocuses
-it -- which fires the focus-driven local sync. Whether the image survives that
-is the whole feature, so the checks read the session's own clipboard rather
-than the message that carried the image to the core.
+The dashboards' Upload Image button is the only way an image the user did not
+copy reaches the session clipboard. Choosing the file takes the window's focus
+while the dialog is open -- which closes the Wish panel's menu -- and gives it
+back as the dialog closes, which fires the focus-driven local sync. Whether the
+image survives that is the whole feature, so the checks read the session's own
+clipboard rather than the message that carried the image to the core, in both
+dashboards; a JPEG has to reach it as a PNG as well, since that is the only
+image type most applications paste.
+
+The other way, a session image has to land on the local clipboard even when
+the user leaves the tab right after copying it, as someone switching to the
+application they copied it for does: the browser refuses a clipboard write from
+a page that has lost focus (Chromium) or its user activation (Firefox, WebKit),
+and a multi-megabyte image is still crossing the link by then; and a copy made
+while a larger one is still crossing has to be the one that lands. The page
+under test is taken out of Playwright's focus emulation, under which it never
+loses focus, and the local clipboard is read from the tab the user went to,
+before they come back.
 
 Usage: python3 tests/e2e/test_clipboard_image.py [websockets|webrtc|wayland]
 """
+import io
 import os
+import random
 import struct
 import subprocess
 import sys
@@ -18,12 +33,17 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import helpers as H  # noqa: E402
 import core_lib as C  # noqa: E402
+import test_dashboards as TD  # noqa: E402
 from playwright.sync_api import sync_playwright  # noqa: E402
 
-DASH = os.path.join(H.REPO, "addons/selkies-dashboard/dist")
+DASHES = {"classic": H.CLASSIC_DIST, "wish": H.WISH_DIST}
 WL_SOCKET = "wayland-1"
+# Stays under python-xlib's request size (it has no BIG-REQUESTS), as the
+# server's own selection owner does.
+X_CHUNK = 240 * 1024
 
 
 def png(seed: int) -> bytes:
@@ -43,18 +63,45 @@ def png(seed: int) -> bytes:
             + chunk(b"IEND", b""))
 
 
+def noise_png(width: int, height: int, seed: int) -> bytes:
+    """A PNG of noise: incompressible, so its size is what crosses the link."""
+    from PIL import Image
+    rng = random.Random(seed)
+    buf = io.BytesIO()
+    Image.frombytes("RGB", (width, height), rng.randbytes(width * height * 3)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+def jpeg(width: int, height: int) -> bytes:
+    """A JPEG, as a photo picked from disk arrives."""
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), (20, 120, 200)).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+def dims(data: bytes):
+    """An image's size, or None when the bytes are not one."""
+    from PIL import Image
+    try:
+        return Image.open(io.BytesIO(data)).size
+    except Exception:
+        return None
+
+
 def _wl_env() -> dict:
     return {**os.environ, "WAYLAND_DISPLAY": WL_SOCKET,
             "XDG_RUNTIME_DIR": H.RUNTIME_DIR}
 
 
-def session_image(wayland: bool) -> tuple:
-    """The session clipboard's offered targets and its image bytes."""
+def session_image(wayland: bool, want: str = "") -> tuple:
+    """The session clipboard's offered targets and its image bytes: those of
+    `want` when it names a type, else of the first image type offered."""
     if wayland:
         listed = subprocess.run(["wl-paste", "-l"], capture_output=True, text=True,
                                 timeout=8, env=_wl_env())
         targets = [t.strip() for t in listed.stdout.splitlines() if t.strip()]
-        mime = next((t for t in targets if t.startswith("image/")), None)
+        mime = next((t for t in targets if (t == want if want else t.startswith("image/"))), None)
         if mime is None:
             return targets, None, None
         got = subprocess.run(["wl-paste", "-t", mime], capture_output=True,
@@ -91,7 +138,7 @@ def session_image(wayland: bool) -> tuple:
 
         offered = convert(d.get_atom("TARGETS"))
         targets = [d.get_atom_name(a) for a in (offered or [])]
-        mime = next((t for t in targets if t.startswith("image/")), None)
+        mime = next((t for t in targets if (t == want if want else t.startswith("image/"))), None)
         if mime is None:
             return targets, None, None
         return targets, mime, bytes(bytearray(convert(d.get_atom(mime)) or b""))
@@ -137,7 +184,10 @@ def own_session_image(data: bytes, wayland: bool) -> dict:
                 if ev.target == targets:
                     ev.requestor.change_property(ev.property, targets, 32, [targets, image])
                 elif ev.target == image:
-                    ev.requestor.change_property(ev.property, image, 8, data)
+                    ev.requestor.change_property(ev.property, image, 8, data[:X_CHUNK])
+                    for at in range(X_CHUNK, len(data), X_CHUNK):
+                        ev.requestor.change_property(ev.property, image, 8, data[at:at + X_CHUNK],
+                                                     mode=X.PropModeAppend)
                 else:
                     ev.requestor.send_event(xevent.SelectionNotify(
                         time=ev.time, requestor=ev.requestor, selection=ev.selection,
@@ -162,25 +212,75 @@ def own_session_image(data: bytes, wayland: bool) -> dict:
     return {"stop": stop}
 
 
-def open_clipboard_panel(page) -> bool:
-    """Open the classic dashboard's clipboard section; False when it is absent."""
-    if not page.evaluate("!!document.querySelector('.sidebar.is-open')"):
-        page.evaluate("window.postMessage({type: 'toggleDashboard'}, window.location.origin)")
-        time.sleep(0.8)
-    header = page.locator('.sidebar-section-header:has-text("Clipboard")')
-    if header.count() == 0:
-        return False
-    header.first.click()
-    time.sleep(0.6)
-    return page.locator('input[type="file"][accept="image/*"]').count() > 0
+READ_LOCAL_IMAGE_JS = """async () => {
+  try {
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      for (const type of item.types) {
+        if (!type.startsWith('image/')) continue;
+        const blob = await item.getType(type);
+        const bmp = await createImageBitmap(blob);
+        return { type, size: blob.size, w: bmp.width, h: bmp.height };
+      }
+    }
+    return null;
+  } catch (err) { return 'read failed: ' + err.name; }
+}"""
 
 
-def block(mode: str, wayland: bool) -> "H.Results":
-    """One transport and backend: upload out, session copy in."""
-    tag = f"clipimage-{'wl' if wayland else mode}"
+def upload(page, dashboard: str, name: str, mime: str, data: bytes, wayland: bool,
+           want: str = "") -> tuple:
+    """Upload `data` through the dashboard's button and read the session clipboard back.
+
+    The dialog's own refocus as it closes fires the focus read, which is what
+    the upload has to survive.
+    """
+    if not TD.pick_clipboard_image(page, dashboard, {"name": name, "mimeType": mime, "buffer": data}):
+        return None
+    page.evaluate("window.dispatchEvent(new Event('focus'))")
+    time.sleep(5.0)
+    return session_image(wayland, want)
+
+
+def leave_and_read(ctx, page, cdp, leave_after: float) -> dict:
+    """Switch to another tab `leave_after` seconds from now, wait for the
+    transfer, and read the local clipboard from there, before coming back.
+
+    Coming back would land a write the page stashed for its next focus, which
+    is exactly what the user who pasted meanwhile did not get.
+    """
+    time.sleep(leave_after)
+    other = ctx.new_page()
+    try:
+        # A still image of the same origin: a document to read from that starts no client.
+        other.goto(H.BASE_URL + "/icon-512.png", wait_until="load")
+    except Exception:
+        pass
+    other.bring_to_front()
+    time.sleep(0.3)
+    focused = page.evaluate("document.hasFocus()")
+    time.sleep(6.0)
+    local = other.evaluate(READ_LOCAL_IMAGE_JS)
+    other.close()
+    page.bring_to_front()
+    time.sleep(0.5)
+    return {"image": local, "page kept focus": focused}
+
+
+def block(mode: str, wayland: bool, dashboard: str) -> "H.Results":
+    """One transport, backend, and dashboard: upload out, session copies in."""
+    tag = f"clipimage-{'wl' if wayland else mode}-{dashboard}"
     res = H.Results(tag)
+    checks(res, tag, mode, wayland, dashboard)
+    res.summary()
+    return res
+
+
+def checks(res: "H.Results", tag: str, mode: str, wayland: bool, dashboard: str) -> None:
+    """The checks of one block, each recorded in `res`."""
     uploaded = png(23)
-    H.server_start(mode=mode, wayland=wayland, web_root=DASH, extra_env={"SELKIES_DEBUG": "true"})
+    H.server_start(mode=mode, wayland=wayland, web_root=DASHES[dashboard],
+                   extra_env={"SELKIES_DEBUG": "true"})
     with sync_playwright() as p:
         browser = C.chromium_launch(p)
         ctx = browser.new_context(viewport={"width": 1440, "height": 900},
@@ -192,29 +292,32 @@ def block(mode: str, wayland: bool) -> "H.Results":
             pass
         page = ctx.new_page()
         page.goto(H.BASE_URL, wait_until="load")
-        owner = None
+        owners = []
         try:
             time.sleep(12.0)
             # Something the user copied locally and has not synced: the value
             # the focus read would put back over the upload.
             page.evaluate("navigator.clipboard.writeText('local text, not the image')")
             time.sleep(1.0)
-            if not open_clipboard_panel(page):
-                res.skip(f"{tag}: the upload path", "no clipboard image picker in the panel")
-                return res
-
-            picker = page.locator('input[type="file"][accept="image/*"]').first
-            picker.set_input_files({"name": "clip.png", "mimeType": "image/png",
-                                    "buffer": uploaded})
-            # What the file picker itself does to the page as it closes.
-            page.evaluate("window.dispatchEvent(new Event('focus'))")
-            time.sleep(5.0)
-            targets, mime, got = session_image(wayland)
+            got = upload(page, dashboard, "clip.png", "image/png", uploaded, wayland)
+            if got is None:
+                res.skip(f"{tag}: the upload path", "no Upload Image button in the panel")
+                return
+            targets, mime, data = got
             res.check("an uploaded image reaches the session clipboard",
-                      got == uploaded, f"{mime} {len(got) if got else 0} bytes, offered {targets}")
+                      data == uploaded, f"{mime} {len(data) if data else 0} bytes, offered {targets}")
+
+            photo = jpeg(40, 30)
+            targets, mime, data = upload(page, dashboard, "photo.jpg", "image/jpeg", photo, wayland,
+                                         want="image/png") or ([], None, None)
+            res.check("an uploaded JPEG is offered to the session as PNG as well",
+                      mime == "image/png" and dims(data) == (40, 30) and "image/jpeg" in targets,
+                      f"{mime} {dims(data) if data else None}, offered {targets}")
+            if dashboard != "classic":
+                return
 
             copied = png(91)
-            owner = own_session_image(copied, wayland)
+            owners.append(own_session_image(copied, wayland))
             # Two gestures: the write is refused without a user activation, and
             # the payload has to have arrived before the one that lands it.
             for _ in range(2):
@@ -222,19 +325,7 @@ def block(mode: str, wayland: bool) -> "H.Results":
                 page.mouse.down()
                 page.mouse.up()
                 time.sleep(2.5)
-            local = page.evaluate("""async () => {
-              try {
-                const items = await navigator.clipboard.read();
-                for (const item of items) {
-                  for (const type of item.types) {
-                    if (!type.startsWith('image/')) continue;
-                    const blob = await item.getType(type);
-                    return { type, size: (await blob.arrayBuffer()).byteLength };
-                  }
-                }
-                return null;
-              } catch (err) { return 'read failed: ' + err.name; }
-            }""")
+            local = page.evaluate(READ_LOCAL_IMAGE_JS)
             # The browser re-encodes what it writes, so the size is its own;
             # that an image is there at all is what the push had to achieve.
             res.check("a session image reaches the local clipboard",
@@ -245,27 +336,48 @@ def block(mode: str, wayland: bool) -> "H.Results":
             # one has nothing else to wait for. Counted in the log, since the
             # client suppresses a local write of content it already holds.
             sends = H.server_log().count("Clipboard changed. Sending content")
-            owner["stop"]()
+            owners.pop()["stop"]()
             time.sleep(1.0)
-            owner = own_session_image(copied, wayland)
+            owners.append(own_session_image(copied, wayland))
             time.sleep(4.0)
             again = H.server_log().count("Clipboard changed. Sending content")
             res.check("the same image copied again is sent again",
                       again > sends, f"{sends} sends, then {again}")
+
+            # From here the page can lose focus as a real window does.
+            cdp = ctx.new_cdp_session(page)
+            cdp.send("Emulation.setFocusEmulationEnabled", {"enabled": False})
+            page.bring_to_front()
+            time.sleep(0.5)
+            big = noise_png(1000, 700, 7)
+            owners.append(own_session_image(big, wayland))
+            seen = leave_and_read(ctx, page, cdp, 0.4)
+            res.check(f"a {len(big) // 1024} KiB session image lands locally though the user "
+                      "left the tab right after copying it",
+                      isinstance(seen["image"], dict)
+                      and (seen["image"]["w"], seen["image"]["h"]) == (1000, 700)
+                      and seen["page kept focus"] is False, seen)
+
+            bigger = noise_png(1200, 800, 11)
+            owners.append(own_session_image(bigger, wayland))
+            time.sleep(0.25)
+            small = png(57)
+            owners.append(own_session_image(small, wayland))
+            seen = leave_and_read(ctx, page, cdp, 0.4)
+            res.check("a copy made while a larger one is still crossing the link is the one "
+                      "that lands, though the user left right after it",
+                      isinstance(seen["image"], dict)
+                      and (seen["image"]["w"], seen["image"]["h"]) == (8, 8), seen)
         finally:
-            if owner:
+            for owner in owners:
                 owner["stop"]()
             browser.close()
-    res.summary()
-    return res
 
 
 def main() -> None:
     which = sys.argv[1] if len(sys.argv) > 1 else "websockets"
-    if which == "wayland":
-        results = [block("websockets", True)]
-    else:
-        results = [block(which, False)]
+    mode, wayland = ("websockets", True) if which == "wayland" else (which, False)
+    results = [block(mode, wayland, dashboard) for dashboard in DASHES]
     H.server_stop()
     failed = sum(len(r.failed()) for r in results)
     print(f"\n=== CLIPBOARD IMAGE: {'FAIL' if failed else 'PASS'} ===")

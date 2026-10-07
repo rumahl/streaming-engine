@@ -35,6 +35,9 @@ FILL = int(os.environ.get("WLOBS_FILL", "0"), 16)
 # damage-driven capture keeps receiving frames from an otherwise static screen.
 FILL2 = int(os.environ.get("WLOBS_FILL2", "0"), 16)
 BLINK_MS = int(os.environ.get("WLOBS_BLINK_MS", "0"))
+# A rectangle painted over the fill, "x,y,w,h,argb" (e.g. 500,100,300,200,ffff0000), so the
+# picture carries a second known color.
+BLOCK = os.environ.get("WLOBS_BLOCK", "")
 # Keymap files handed to the driver; removed when this observer ends, so a
 # suite that never reads them leaves nothing behind.
 KEYMAP_FILES = []
@@ -155,6 +158,14 @@ def ptr_axis(ptr, time_ms, axis, value):
     emit("ptr_axis", axis=axis, value=value)
 
 
+def ptr_axis_source(ptr, source):
+    emit("ptr_axis_source", source=int(source))
+
+
+def ptr_axis_stop(ptr, time_ms, axis):
+    emit("ptr_axis_stop", axis=int(axis))
+
+
 def offer_mimes(offer) -> dict:
     """Attach dispatchers that accumulate the offer's advertised mime types."""
     out = {"mimes": []}
@@ -175,28 +186,42 @@ def dd_selection(dd, offer):
     emit("dd_selection", present=bool(offer))
 
 
-# Devices are taken only for the capabilities the seat announces: a seat
-# without a keyboard (a compositor started with no input devices) refuses
-# get_keyboard with a protocol error.
+# Devices are taken only for the capabilities the seat announces, and when it
+# announces one later: a seat without a keyboard (a compositor started with no
+# input devices) refuses get_keyboard with a protocol error, and KWin's seat
+# gains its pointer only once an emulated device, such as a portal's, joins.
 caps = [0]
-seat.dispatcher["capabilities"] = lambda _s, c: caps.__setitem__(0, int(c))
+kbd = ptr = None
+
+
+def take_devices() -> None:
+    global kbd, ptr
+    if kbd is None and caps[0] & WlSeat.capability.keyboard:
+        kbd = seat.get_keyboard()
+        kbd.dispatcher["keymap"] = kbd_keymap
+        kbd.dispatcher["enter"] = kbd_enter
+        kbd.dispatcher["leave"] = kbd_leave
+        kbd.dispatcher["key"] = kbd_key
+        kbd.dispatcher["modifiers"] = kbd_mods
+    if ptr is None and caps[0] & WlSeat.capability.pointer:
+        ptr = seat.get_pointer()
+        ptr.dispatcher["enter"] = ptr_enter
+        ptr.dispatcher["leave"] = ptr_leave
+        ptr.dispatcher["motion"] = ptr_motion
+        ptr.dispatcher["button"] = ptr_button
+        ptr.dispatcher["axis"] = ptr_axis
+        ptr.dispatcher["axis_source"] = ptr_axis_source
+        ptr.dispatcher["axis_stop"] = ptr_axis_stop
+
+
+def seat_capabilities(_s, c) -> None:
+    caps[0] = int(c)
+    take_devices()
+
+
+seat.dispatcher["capabilities"] = seat_capabilities
 seat.dispatcher["name"] = lambda _s, _n: None
 display.roundtrip()
-kbd = seat.get_keyboard() if caps[0] & WlSeat.capability.keyboard else None
-if kbd is not None:
-    kbd.dispatcher["keymap"] = kbd_keymap
-    kbd.dispatcher["enter"] = kbd_enter
-    kbd.dispatcher["leave"] = kbd_leave
-    kbd.dispatcher["key"] = kbd_key
-    kbd.dispatcher["modifiers"] = kbd_mods
-
-ptr = seat.get_pointer() if caps[0] & WlSeat.capability.pointer else None
-if ptr is not None:
-    ptr.dispatcher["enter"] = ptr_enter
-    ptr.dispatcher["leave"] = ptr_leave
-    ptr.dispatcher["motion"] = ptr_motion
-    ptr.dispatcher["button"] = ptr_button
-    ptr.dispatcher["axis"] = ptr_axis
 
 if handles["ddm"] is not None:
     dd = handles["ddm"].get_data_device(seat)
@@ -257,6 +282,13 @@ def solid_buffer(fill):
     if fill:
         with mmap.mmap(fd, size) as m:
             m.write(struct.pack("<I", fill) * (W * H))
+            if BLOCK:
+                *rect, argb = BLOCK.split(",")
+                bx, by, bw, bh = map(int, rect)
+                row = struct.pack("<I", int(argb, 16)) * max(0, min(bw, W - bx))
+                for y in range(by, min(by + bh, H)):
+                    m.seek(y * stride + bx * 4)
+                    m.write(row)
     pool = handles["shm"].create_pool(fd, size)
     buf = pool.create_buffer(0, W, H, stride, 0)
     pool.destroy()

@@ -37,14 +37,14 @@ If this does not fix the connection issue (normally when the server is behind an
 
 If your host sits behind **static 1:1 NAT** — most commonly a cloud instance whose private address is mapped one-to-one to a fixed public/elastic IP, with the WebRTC UDP ports forwarded (see [Self-Hosted Instances](#self-hosted-instances)) — the host ICE candidates Selkies gathers still carry the *private* address, which a remote peer cannot reach, so the connection falls back to a TURN relay (or fails if none is configured). Set the command-line option `--webrtc-public-ip` or the environment variable `SELKIES_WEBRTC_PUBLIC_IP` to your public IPv4 and/or IPv6 address (comma- or space-separated to supply both); Selkies then advertises each address in its host ICE candidates of the matching family (equivalent to a `NAT1TO1` mapping) so the peer connects directly. Server-reflexive (STUN) and relay (TURN) candidates are left untouched, so hole-punching and TURN fallback still work if the direct path is blocked. Leave it empty (the default) on any host that is not behind static 1:1 NAT.
 
-### Restricting the Ports: Port Range, UDP Mux, TCP Mux and ICE-lite
+### Restricting the Ports: Port Range, UDP Mux, TCP Mux, and ICE-lite
 
 Instead of the whole ephemeral UDP range above, the ports WebRTC uses on the host can be confined, the way Pion-based servers do it:
 
 - **Port range** (`--webrtc-port-range=50000-50100`, `SELKIES_WEBRTC_PORT_RANGE`): every session's host ICE candidate binds a UDP port inside the window, tried in random order so concurrent sessions sharing one window spread without coordination. Open or forward exactly that range (`-p 50000-50100:50000-50100/udp`, without remapping). This is distinct from the TURN relay's `TURN_MIN_PORT`/`TURN_MAX_PORT`.
 - **UDP mux** (`--webrtc-udp-mux-port=59000`, `SELKIES_WEBRTC_UDP_MUX_PORT`): every session shares one UDP port, bound once on each host address at startup; sessions are told apart by their ICE username fragment, and STUN discovery rides the same port. Open or forward that single port (`-p 59000:59000/udp`). A port range set beside it is unused.
 - **TCP mux / ICE-TCP** (`--webrtc-tcp-mux-port=59000`, `SELKIES_WEBRTC_TCP_MUX_PORT`): the server also accepts ICE-TCP connections on one TCP port and advertises it as a passive TCP host candidate beside the UDP ones, so a client on a network that blocks UDP still connects; the browser prefers UDP whenever it works. It may share its number with the UDP mux port (`-p 59000:59000/tcp`), and a port firewalls pass, such as 443, is the usual choice for public deployments. Media over TCP costs latency under loss, so keep UDP reachable where you can.
-- **ICE-lite** (`--webrtc-ice-lite=true`, `SELKIES_WEBRTC_ICE_LITE`): the server's ICE agent offers host candidates only, takes the controlled role and answers the browser's connectivity checks instead of running its own. Use it only where the host candidates are reachable as advertised: a public address, a static 1:1 NAT with `--webrtc-public-ip`, or forwarded mux ports. The server then uses no STUN or TURN of its own, though clients still receive them for candidates of their own, so a client behind a NAT keeps connecting through its reflexive or relayed address.
+- **ICE-lite** (`--webrtc-ice-lite=true`, `SELKIES_WEBRTC_ICE_LITE`): the server's ICE agent offers host candidates only, takes the controlled role, and answers the browser's connectivity checks instead of running its own. Use it only where the host candidates are reachable as advertised: a public address, a static 1:1 NAT with `--webrtc-public-ip`, or forwarded mux ports. The server then uses no STUN or TURN of its own, though clients still receive them for candidates of their own, so a client behind a NAT keeps connecting through its reflexive or relayed address.
 
 A container that exposes one port for both transports and advertises its public address:
 
@@ -169,11 +169,11 @@ no-stun-backward-compatibility
 response-origin-only-with-rfc5780
 ```
 
-`/etc/turnserver.conf` must have the lines `listening-ip=0.0.0.0`, `listening-ip=::` and `realm=example.com` (change the realm as appropriate), and either the lines `use-auth-secret` and `static-auth-secret=n0TaRealCoTURNAuthSecretThatIsSixtyFourLengthsLongPlaceholdPlace`, or the lines `lt-cred-mech` and `user=username1:password1` are required.
+`/etc/turnserver.conf` must have the lines `listening-ip=0.0.0.0`, `listening-ip=::`, and `realm=example.com` (change the realm as appropriate), and either the lines `use-auth-secret` and `static-auth-secret=n0TaRealCoTURNAuthSecretThatIsSixtyFourLengthsLongPlaceholdPlace`, or the lines `lt-cred-mech` and `user=username1:password1` are required.
 
 For single-user environments, traditional long-term credential authentication is the easiest, but multi-user environments likely need TURN REST API authentication with a static auth secret.
 
-**Ports specified in `listening-port=`, `min-port=` and `max-port=` must be opened.**
+**Ports specified in `listening-port=`, `min-port=`, and `max-port=` must be opened.**
 
 It is strongly recommended to set the `min-port=` and `max-port=` parameters which specifies the relay ports (all ports between this range must be open). Add the line `no-udp-relay` if you cannot open the UDP `min-port=` to `max-port=` port ranges, or the line `no-tcp-relay` if you cannot open the TCP `min-port=` to `max-port=` port ranges. Note that the `no-udp-relay` option may not be supported with web browsers and may lead to the TURN server not working.
 

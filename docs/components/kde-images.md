@@ -3,7 +3,7 @@ title: KDE Plasma Desktops
 description: The docker-selkies-egl-desktop and docker-selkies-glx-desktop images, what each draws the desktop on, how they are laid out, and how they are developed and kept in step.
 ---
 
-[`docker-selkies-egl-desktop`](https://github.com/selkies-project/docker-selkies-egl-desktop) and [`docker-selkies-glx-desktop`](https://github.com/selkies-project/docker-selkies-glx-desktop) are ready-to-go KDE Plasma desktops in separate repositories, built `FROM` the [Base Container](base-image.md) the way [`addons/desktop`](desktop-image.md) builds the LXQt one. Each README carries the run commands for Docker, Kubernetes and Apptainer, the variables the image adds, and its troubleshooting; this page is what the two are and how they relate to what this repository provides.
+[`docker-selkies-egl-desktop`](https://github.com/selkies-project/docker-selkies-egl-desktop) and [`docker-selkies-glx-desktop`](https://github.com/selkies-project/docker-selkies-glx-desktop) are ready-to-go KDE Plasma desktops in separate repositories, built `FROM` the [Base Container](base-image.md) the way [`addons/desktop`](desktop-image.md) builds the LXQt one. Each README carries the run commands for Docker, Kubernetes, and Apptainer, the variables the image adds, and its troubleshooting; this page is what the two are and how they relate to what this repository provides.
 
 ## What each one is
 
@@ -15,16 +15,16 @@ description: The docker-selkies-egl-desktop and docker-selkies-glx-desktop image
 | Second display | A kwin virtual output on Wayland (the image rebuilds `kwin-wayland` with the patch under `patches/kwin`), a RandR monitor on X11 (`kwin_x11` rebuilt with `patches/kwin-x11` to take its screens from those monitors) | A RandR monitor on the X server's one output, with the same `kwin_x11` rebuild |
 | Tags | `26.04`, `26.04-<build>`, `latest` | the same |
 
-Both add the same desktop to the base: `plasma-desktop` with Dolphin, Konsole, KWrite, Gwenview, Ark and System Settings, Firefox and Google Chrome, the [proot-apps](https://github.com/linuxserver/proot-apps) runner behind the dashboards' apps panel, and on `x86_64` Steam behind [proot-bwrap](https://github.com/selkies-project/proot-bwrap) and Wine Staging with `winetricks`. Both build on the Ubuntu 26.04 base alone, since the rebuilt kwin packages are the archive's exact version, and publish for `amd64` and `arm64`. Plasma's own compositing is off in the system defaults, since every desktop animation is bandwidth for nothing on a stream.
+Both add the same desktop to the base: `plasma-desktop` with Dolphin, Konsole, KWrite, Gwenview, Ark, and System Settings, Firefox and Google Chrome, the [proot-apps](https://github.com/linuxserver/proot-apps) runner behind the dashboards' apps panel, and on `x86_64` Steam behind [proot-bwrap](https://github.com/selkies-project/proot-bwrap) and Wine Staging with `winetricks`. Both build on the Ubuntu 26.04 base alone, since the rebuilt kwin packages are the archive's exact version, and publish for `amd64` and `arm64`. Plasma's own compositing is off in the system defaults, since every desktop animation is bandwidth for nothing on a stream.
 
 ## How they start
 
-Neither carries an entrypoint, a supervisor configuration or a web server of its own. The base's `container-entrypoint.sh`, its `selkies` service and every other service are used as they are ([How it starts](base-image.md#how-it-starts)), and each repository adds only the s6 services its session needs under `services/`:
+Neither carries an entrypoint, a supervisor configuration, or a web server of its own. The base's `container-entrypoint.sh`, its `selkies` service, and every other service are used as they are ([How it starts](base-image.md#how-it-starts)), and each repository adds only the s6 services its session needs under `services/`:
 
 | Service | Image | Runs |
 | --- | --- | --- |
 | `dbus-session` | both | The session bus Plasma's components find each other on |
-| `plasma` | both | The Plasma session on X11, `startplasma-x11` on the display server, or `kwin_x11` alone under `START_PLASMA=false`, so a single application from the apps panel is managed, resized and maximized without a desktop around it; on the EGL image's Wayland backend it parks, since the Plasma session is then the nested compositor the base's `wayland` service starts |
+| `plasma` | both | The Plasma session on X11, `startplasma-x11` on the display server, or `kwin_x11` alone under `START_PLASMA=false`, so a single application from the apps panel is managed, resized, and maximized without a desktop around it; on the EGL image's Wayland backend it parks, since the Plasma session is then the nested compositor the base's `wayland` service starts |
 | `xorg` | GLX only | The X.Org server, on the GPU the base resolved for the session, sharing a virtual terminal it never switches to; its log is at `/tmp/runtime-ubuntu/Xorg.log` |
 
 The EGL image sets `SELKIES_WAYLAND_COMPOSITOR` to the Plasma session, so the base's `wayland` service starts `kwin_wayland` rather than labwc. The GLX image removes the base's `xvfb` and `wayland` services and presets `DISABLE_ZINK=true`, since OpenGL goes through the X server's own GLX vendor; where another display server already holds the GPU's DRM master, a host session on the same card, its `xorg` service hands over to the base's framebuffer server, which it keeps as `selkies-xvfb-server`, rather than fail the session.
@@ -33,7 +33,7 @@ On X11 the Plasma shell lays its panels and wallpaper out for the DPI it started
 
 ## Configuration
 
-Everything Selkies reads is a variable of the [Settings Reference](../settings.md); each README's configuration table lists the ones the image adds (`PASSWD`, `TZ`, `START_PLASMA`, and for the GLX image the X server's initial mode `DISPLAY_SIZEW`, `DISPLAY_SIZEH`, `DISPLAY_REFRESH`, `DISPLAY_CDEPTH`, the NVIDIA `VIDEO_PORT`, and `NVIDIA_DRIVER_VERSION` where the host's cannot be read). The video encoder, the bitrates, the frame rate and the UI scaling are chosen from the web interface and are not set in the environment; a single value in `SELKIES_ENCODER` or `SELKIES_SCALING_DPI` locks that choice.
+Everything Selkies reads is a variable of the [Settings Reference](../settings.md); each README's configuration table lists the ones the image adds (`PASSWD`, `TZ`, `START_PLASMA`, the size `DISPLAY_SIZEW` by `DISPLAY_SIZEH` the base presets the desktop to until a client connects, and for the GLX image the X server's refresh `DISPLAY_REFRESH`, the NVIDIA `VIDEO_PORT`, and `NVIDIA_DRIVER_VERSION` where the host's cannot be read). Where one of them and a Selkies setting name the same thing, the Selkies setting wins, read as `settings.py` reads it: the size a manual resolution locks the stream to over `DISPLAY_SIZEW` and `DISPLAY_SIZEH`, and the frame rate `SELKIES_FRAMERATE` starts the stream at over `DISPLAY_REFRESH`. The video encoder, the bitrates, the frame rate, and the UI scaling are chosen from the web interface and are not set in the environment; a single value in `SELKIES_ENCODER` or `SELKIES_SCALING_DPI` locks that choice.
 
 The GLX image's NVIDIA X server modules (`nvidia_drv.so` and the GLX server module) come in with the driver's libraries from the NVIDIA Container Toolkit v1.20.1 or higher; under a runtime that injects the libraries alone, the first start lifts the two out of the driver installer matching the host's version, and a container that keeps its filesystem keeps them across restarts.
 
@@ -53,4 +53,4 @@ A change to a shared component is two Pull Requests, one per repository; a chang
 | `services/xorg`, `selkies-xorg-config` | GLX image only | assess by hand |
 | `README.md`, `docker-compose.yml`, `egl.yml`/`xgl.yml`, the publish workflow | both repositories | similar but not identical; assess by hand |
 
-Each repository's `container-publish.yml` builds both architectures on native runners, pushes by digest and merges the manifest under the release, timestamped and `latest` tags on a push to `main`; a pull request builds both architectures and pushes nothing.
+Each repository's `container-publish.yml` builds both architectures on native runners, pushes by digest, and merges the manifest under the release, timestamped and `latest` tags on a push to `main`; a pull request builds both architectures and pushes nothing.

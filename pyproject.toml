@@ -33,8 +33,8 @@ dependencies = [
     "psutil",
     "watchdog",
     "Pillow",
-    "pixelflux~=2.1.0rc1",
-    "pcmflux~=2.1.0rc1",
+    "pixelflux~=2.1.0",
+    "pcmflux~=2.1.0",
     # PulseAudio Microphone
     "pulsectl-asyncio",
     # WebRTC
@@ -60,7 +60,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # The test suites, on top of an installed selkies (which already brings
-# pixelflux/pcmflux, aiohttp and psutil): `pip install .[test]`. The browsers the
+# pixelflux/pcmflux, aiohttp, and psutil): `pip install .[test]`. The browsers the
 # e2e tier drives come from `playwright install --with-deps chromium firefox
 # webkit`; WebKit on Linux also needs GStreamer's opengl plugin
 # (gstreamer1.0-gl, on that dependency list), or its video sink falls back.
@@ -69,6 +69,13 @@ test = [
     "playwright",
     "websockets",
     "pywayland",
+    "jupyter-server",
+    "jupyter-server-proxy",
+]
+# The Jupyter launcher item and route: `pip install selkies[jupyter]` beside the
+# Jupyter server that should offer the desktop
+jupyter = [
+    "jupyter-server-proxy>=4.1",
 ]
 
 [project.urls]
@@ -80,6 +87,14 @@ selkies = "selkies.__main__:main"
 selkies-resize = "selkies.display_utils:entrypoint"
 selkies-gpu-probe = "selkies.gpu_probe:main"
 rumahl-streaming-session = "rumahl_streaming.session:main"
+
+selkies-session = "selkies.session:main"
+
+# Jupyter's server proxy reads this group: with jupyter-server-proxy installed
+# beside selkies, every Jupyter server gains a Selkies desktop at /selkies/
+[project.entry-points.jupyter_serverproxy_servers]
+selkies = "selkies.session:jupyter"
+
 
 # Package the static web files, and the license of the vendored python-xlib
 # fork, as part of the distribution wheel
@@ -97,10 +112,11 @@ where = ["src"]
 testpaths = ["tests"]
 markers = [
     "unit: needs only the source tree",
-    "integration: needs a display, PulseAudio and an installed selkies",
+    "integration: needs a display, PulseAudio, and an installed selkies",
     "e2e: additionally needs Playwright browsers and the built web client",
     "perf: long constrained-link benchmark, run on request",
     "soak: full pixelflux and pcmflux API surface, run on request",
+    "image: a published desktop image through the release checklist, run on request",
 ]
 
 # Ruff runs as a bug-finder, not a style enforcer: only rule families that flag

@@ -66,7 +66,7 @@ def wish_menu(page: Any) -> Optional[list]:
     deadline = time.time() + 10
     while time.time() < deadline:
         items = page.evaluate(
-            "() => Array.from(document.querySelectorAll('[role=\"menu\"][data-state=\"open\"] [role=\"menuitem\"]'))"
+            "() => Array.from(document.querySelectorAll('[role=\"menu\"][data-open] [role=\"menuitem\"]'))"
             ".map((i) => [i.textContent, i.getAttribute('aria-disabled') === 'true' || i.hasAttribute('data-disabled')])")
         if items:
             return items
@@ -92,11 +92,11 @@ def menu_block(dashboard: str, mode: str) -> "H.Results":
                       entries is not None and len(entries) == (5 if mode == "webrtc" else 7), entries)
             res.check("H.265, which this browser does not play, is listed disabled and marked as unsupported here",
                       H265 in by_label and by_label[H265][1] and UNSUPPORTED in by_label[H265][0], by_label.get(H265))
-            res.check("H.264 is listed, enabled and unmarked",
+            res.check("H.264 is listed, enabled, and unmarked",
                       H264 in by_label and not by_label[H264][1] and UNSUPPORTED not in by_label[H264][0], by_label.get(H264))
             if dashboard == "wish":
                 layers = page.evaluate(
-                    "() => { const m = document.querySelector('[role=\"menu\"][data-state=\"open\"]');"
+                    "() => { const m = document.querySelector('[role=\"menu\"][data-open]');"
                     " const z = (e) => parseInt(getComputedStyle(e).zIndex, 10);"
                     " return m ? [z(m.parentElement), z(document.getElementById('dashboard-root'))] : null; }")
                 res.check("the open menu stacks above the dashboard root that hosts the panel",

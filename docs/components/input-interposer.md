@@ -1,6 +1,6 @@
 ---
 title: Gamepads
-description: The Input Interposer and fake-udev, which give a container's applications gamepads with no kernel device, and the kernel gamepads Selkies registers where /dev/uinput is writable.
+description: The Input Interposer and fake-udev, which give a container's applications gamepads with no kernel device, the kernel gamepads Selkies registers where /dev/uinput is writable, and how a game's rumble reaches the controller in the browser.
 ---
 
 ## Input Interposer
@@ -59,7 +59,7 @@ Check the following links for explanations of similar, but different attempts, f
 
 The [fake-udev](https://github.com/selkies-project/selkies/tree/main/addons/fake-udev) addon provides a `libudev` shared library (`libudev.so.1`) designed to be used with `LD_PRELOAD`. It intercepts `libudev` calls and adds a fixed set of virtual gamepads to what the system's `libudev` reports, so that applications which discover input devices through `libudev` (for example, via `udev_enumerate_scan_devices`) find the Selkies virtual gamepads; a pad is listed only while the interposer serves it, and one served later arrives as a hotplug add, so a scanner never opens a node that would only time out. A running udev daemon is no substitute on this backend: the pads exist only as interposer sockets, so a real `libudev` query never reports them (the [kernel devices](#kernel-gamepads) are the case where it does). fake-udev covers discovery and the [Input Interposer](#input-interposer) covers the device itself — applications that enumerate through `libudev` need both, and, like the interposer, it uses `LD_PRELOAD` by design.
 
-Everything outside the pads passes through to the real `libudev`, which fake-udev loads by path at first use, so a preloaded application still sees its GPU, webcam or hidraw devices and the host's own input devices exactly as without the preload: a nested KWin, which discovers its render nodes through `libudev`, keeps hardware acceleration under the preload. The only real devices hidden are input nodes that share a pad's name (`js0`–`js3`, `event1000`–`event1003`), since their `/dev/input` paths are the interposer's. `SELKIES_REAL_LIBUDEV` names the real library when it lives outside the platform library directories, and `SELKIES_REAL_LIBUDEV=none` turns passthrough off, leaving only the pads visible. Without a real `libudev` on the system, that is the behavior by default.
+Everything outside the pads passes through to the real `libudev`, which fake-udev loads by path at first use, so a preloaded application still sees its GPU, webcam, or hidraw devices and the host's own input devices exactly as without the preload: a nested KWin, which discovers its render nodes through `libudev`, keeps hardware acceleration under the preload. The only real devices hidden are input nodes that share a pad's name (`js0`–`js3`, `event1000`–`event1003`), since their `/dev/input` paths are the interposer's. `SELKIES_REAL_LIBUDEV` names the real library when it lives outside the platform library directories, and `SELKIES_REAL_LIBUDEV=none` turns passthrough off, leaving only the pads visible. Without a real `libudev` on the system, that is the behavior by default.
 
 ## Kernel Gamepads
 
@@ -81,3 +81,18 @@ This needs the `uinput` module and write access to `/dev/uinput` for the account
 sudo modprobe uinput
 sudo usermod -aG input "$(whoami)"
 ```
+
+### Keeping the devices off the host's seat
+
+A kernel device Selkies registers from inside a container is a device of the host's kernel, so the host's own session sees it as well: a desktop logged in at the host's screen takes a published virtual keyboard and pointer as its own input, and its games find the pad. Every kernel device Selkies registers names itself in its physical path: `virtual/input/selkies_ev<slot>/phys` for a pad, which is also what the interposer reports, and `selkies/virtinput/keyboard` or `selkies/virtinput/pointer`. One udev rule on the host moves them all to a seat of their own and grants the host's desktop user no access to them:
+
+```
+# /etc/udev/rules.d/72-selkies-seat.rules
+SUBSYSTEM=="input", ATTRS{phys}=="selkies/*|virtual/input/selkies_ev*", ENV{ID_SEAT}="seat-selkies", TAG-="uaccess"
+```
+
+The number places it after systemd's `70-uaccess.rules`, which tags controllers for the seat's user, and before `73-seat-late.rules`, which applies the seat. Without it, the user at the host's screen is granted access to the pad's node; with it, the devices sit on `seat-selkies`, which has no session, so no host session takes them or is granted access to them. Load it with `sudo udevadm control --reload`, and apply it to devices already present with `sudo udevadm trigger --subsystem-match=input`; `udevadm info /dev/input/eventN` then shows `ID_SEAT=seat-selkies`. On systemd 256 and later, `udevadm test --extra-rules-dir=DIR` shows the same for a rule not yet installed. Applications in the container are unaffected, since they open the nodes through the `input` group above.
+
+## Rumble
+
+Both backends take a game's force feedback the way the kernel takes it from an Xbox pad: the evdev node reports rumble, the periodic waveforms such a pad plays as rumble, and gain, sixteen effects at a time, and a game uploads effects, plays them, and stops them with the usual `EVIOCSFF`, `EV_FF` writes, and `EVIOCRMFF` (SDL's `SDL_JoystickRumble` among them). Selkies mixes what each slot's games play and sends it to the one client driving that slot, which plays it on its own controller through the browser: a `dual-rumble` effect where the browser offers one (Chromium and Safari), the single-motor pulse Firefox offers otherwise, and the phone's own vibrator for the on-screen touch gamepad where the browser has `navigator.vibrate` (Android). A client that stops hearing from the server stops shaking within two seconds, and one that takes over a slot mid-effect gets it at once. The Rumble toggle among each dashboard's gamepad controls turns it off for that browser, which keeps the choice.

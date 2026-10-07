@@ -23,7 +23,7 @@
  */
 
 /**
- * Keyboard, pointer, touch, wheel and gamepad capture on the stream element,
+ * Keyboard, pointer, touch, wheel, and gamepad capture on the stream element,
  * sent to the server as the text messages of the input protocol.
  *
  * Keyboard: every event resolves to an X11 keysym through noVNC's key tables
@@ -43,20 +43,35 @@
  *
  * Pointer: absolute positions map through the presenting sink (the canvas or
  * `<video>` box) where the stream has a fixed size, and through the element's
- * window math otherwise; motion is coalesced to one send per animation frame.
+ * window math otherwise; motion goes out as it arrives, from
+ * `pointerrawupdate` where the engine fires it, no closer together than
+ * `MOTION_SEND_INTERVAL_MS` apart.
  * Under pointer lock the payload is a relative delta, scaled to server pixels
  * and quantized with a carried remainder. Gaming mode is document fullscreen
  * plus pointer and keyboard lock. Touch is direct (tap, drag, long-press right
- * click, two-finger scroll) or a trackpad emulation. Wheel events are
+ * click, two-finger scroll and pinch) or a trackpad emulation. Wheel events are
  * classified as discrete wheel or trackpad and accumulated in fractional
- * notches so no distance is lost. The server-drawn cursor is painted on a
- * page canvas or applied as a CSS cursor.
+ * notches so no distance is lost; a macOS wheel, whose deltas the system
+ * accelerates past any notch size, is one notch a detent (`_isDetentWheel`),
+ * and a WebKitGTK wheel, whose notch shrinks with the view, goes by the
+ * notches it reports (`_webKitGtkWheelNotches`).
+ * A pinch, on the touchscreen or a touchpad,
+ * reaches the session as Ctrl+wheel. The server-drawn cursor is painted on a
+ * page canvas or applied as a CSS cursor; in trackpad mode the canvas is drawn
+ * where the server echoes the pointer, moved on by the deltas sent since
+ * (`onPointerEcho`).
  *
  * Wire messages: `kd,<keysym>`, `ku,<keysym>`, `kh,<keysym>,...`, `kr`;
  * `m,<x>,<y>,<mask>,<magnitude>` (absolute) and
  * `m2,<dx>,<dy>,<mask>,<magnitude>` (relative; scroll pulses ride mask bits
  * 3 to 7); `p,<0|1>` and `SET_NATIVE_CURSOR_RENDERING,<0|1>` on pointer lock
- * changes; `js,c`, `js,d`, `js,b`, `js,a` and `js,h` for gamepads.
+ * changes, the latter also where trackpad mode gets no pointer echo; `js,c`,
+ * `js,d`, `js,b`, `js,a`, and `js,h` for gamepads, whose
+ * rumble comes back as the system action `rumble,<slot>,<strong>,<weak>,<ms>`
+ * (`rumble`); `_pointer_echo,<0|1>` in trackpad mode, answered by the system
+ * action `pointer,<display>,<x>,<y>,<scale>,<seq>` or `pointer,none`; and,
+ * where the session takes a touchpad's scroll as a finger's, `sf,<dx>,<dy>`
+ * in stream pixels and `sfe` at its end (`setFingerScroll`).
  * @module
  */
 
@@ -65,6 +80,146 @@ import { Queue, isMacDesktop } from './util.js';
 
 /** CSS class on elements (and their descendants) whose input stays native. */
 const WHITELIST_CLASS = 'allow-native-input';
+
+/**
+ * Shortest spacing of two pointer motion messages, in milliseconds. Motion
+ * arriving sooner waits out the rest of it, the newest position replacing an
+ * older one and deltas summing, so a 1000 Hz mouse sends at most 500 messages
+ * a second while a 500 Hz or slower device's every sample goes out the moment
+ * it arrives. A wider spacing would halve the messages again, but each held
+ * sample would wait longer on a timer the engine may run late, and that wait
+ * reaches the photon.
+ */
+const MOTION_SEND_INTERVAL_MS = 2;
+
+/**
+ * Bytes the motion path's transport may hold unsent before motion goes back
+ * to one message per animation frame: past it the link is not draining, and
+ * each further message only queues behind what it holds.
+ */
+const MOTION_BACKLOG_BYTES = 16 * 1024;
+
+/**
+ * Animation frames gaming mode's pointer lock waits at most for the engine to
+ * place the fullscreen viewport (`Input._viewportSettled`) before asking anyway.
+ */
+const LOCK_SETTLE_FRAMES = 30;
+
+/**
+ * How long a trackpad tap holds the button it pressed before releasing it, in
+ * milliseconds: libinput's tap timeout. A touch landing sooner takes the held
+ * button over as a drag, or makes a double click if it lifts without moving.
+ */
+const TRACKPAD_TAP_HOLD_MS = 180;
+
+/**
+ * How long the finger left over from a multi-finger trackpad gesture is kept
+ * from moving the pointer, in milliseconds: fingers never lift together, and
+ * the last one rolls as it leaves.
+ */
+const TRACKPAD_HANDOFF_MS = 200;
+
+/**
+ * Trackpad pointer acceleration, on the finger's speed in CSS pixels per
+ * millisecond, which does not depend on how often the digitizer reports:
+ * travel at up to TRACKPAD_ACCEL_SLOW goes out as it is, for aiming, and the
+ * gain rises smoothly to TRACKPAD_ACCEL_MAX by TRACKPAD_ACCEL_FAST, so a flick
+ * crosses the desktop (`trackpadGain`); `Input.trackpadSpeed` scales it all.
+ */
+const TRACKPAD_ACCEL_SLOW = 0.15;
+const TRACKPAD_ACCEL_FAST = 1.2;
+const TRACKPAD_ACCEL_MAX = 3;
+
+/** Time constant, in milliseconds, over which a trackpad finger's speed is smoothed. */
+const TRACKPAD_SPEED_TAU_MS = 25;
+
+/** The range `Input.setTrackpadSpeed` takes. */
+const TRACKPAD_SPEED_MIN = 0.25;
+const TRACKPAD_SPEED_MAX = 4;
+
+/**
+ * The smallest pixel delta a wheel notch reports: a smaller one is a
+ * touchpad's (`_isDiscreteWheel`, `_isFingerScroll`).
+ */
+const WHEEL_NOTCH_MIN_PX = 80;
+
+/** Pixels Blink and WebKit report for a line a macOS wheel turned (`_isDetentWheel`). */
+const MAC_WHEEL_LINE_PX = 40;
+
+/** The legacy `wheelDelta` of one wheel notch (`_webKitGtkWheelNotches`). */
+const LEGACY_WHEEL_DELTA_PER_NOTCH = 120;
+
+/**
+ * How long a touchpad's scroll may pause before it counts as ended (`sfe`), in
+ * milliseconds: the page sees no lift, and a moving finger, or the client's own
+ * momentum after one, sends its next wheel event within a frame or two. Past
+ * the 150 ms GTK 4 takes a fling's velocity over, so a toolkit adds no fling to
+ * that momentum, nor to a finger held still or a wheel taken for a touchpad.
+ */
+const FINGER_SCROLL_END_MS = 200;
+
+/**
+ * How long trackpad mode waits for the server's first pointer echo before it
+ * has the cursor composited into the video instead, in milliseconds: a server
+ * without the echo never answers.
+ */
+const POINTER_ECHO_WAIT_MS = 2000;
+
+/**
+ * Deltas trackpad mode keeps past the last echo at most; older ones are
+ * counted into it, so a server that stops echoing, or has not echoed yet,
+ * costs no memory.
+ */
+const POINTER_ECHO_DELTAS_MAX = 256;
+
+/**
+ * The trackpad's gain at a finger speed: 1, rising along a smoothstep to
+ * TRACKPAD_ACCEL_MAX between TRACKPAD_ACCEL_SLOW and TRACKPAD_ACCEL_FAST.
+ * @param {number} speed CSS pixels per millisecond.
+ * @returns {number}
+ */
+function trackpadGain(speed) {
+    const t = Math.min(1, Math.max(0,
+        (speed - TRACKPAD_ACCEL_SLOW) / (TRACKPAD_ACCEL_FAST - TRACKPAD_ACCEL_SLOW)));
+    return 1 + (TRACKPAD_ACCEL_MAX - 1) * t * t * (3 - 2 * t);
+}
+
+/**
+ * The one-based gamepad slots a server verdict's `slot` names, in the order the
+ * client's pads take them: one number, a list of them (a token holding
+ * several), or none.
+ * @param {number|number[]|null|undefined} slot
+ * @returns {number[]|null}
+ */
+export function slotList(slot) {
+    const named = Array.isArray(slot) ? slot : (slot === null || slot === undefined ? [] : [slot]);
+    const slots = named.map(Number).filter((s) => Number.isInteger(s) && s >= 1);
+    return slots.length ? slots : null;
+}
+
+/** Finger travel, in CSS pixels, that one wheel notch of a two-finger scroll stands for. */
+const TOUCH_SCROLL_NOTCH_PX = 50;
+
+/**
+ * Finger travel, in CSS pixels, after which a two-finger gesture is a scroll
+ * or a pinch, and a scroll keeps to the axis it is mostly along.
+ */
+const TWO_FINGER_SLOP_PX = 10;
+
+/**
+ * Change of scale one Ctrl+wheel notch of a pinch stands for, as a ratio: a
+ * pinch that doubles the spread of the fingers is five notches, about what a
+ * desktop application zooms by for a doubling.
+ */
+const PINCH_NOTCH_RATIO = 1.14;
+
+/**
+ * Largest pixel `deltaY` of one wheel event that is taken as a step of a
+ * touchpad pinch rather than a wheel notch turned under a Control the page
+ * never saw: Chromium sends a pinch as -100 ln(scale) per step, under 40 for
+ * any step short of half again the scale, and a wheel notch is 48 or more.
+ */
+const PINCH_STEP_MAX_PX = 40;
 
 /**
  * A `MouseEvent.buttons` bitmask in the wire's numbering, which counts buttons
@@ -1065,6 +1220,7 @@ const browser = {
         return !!window.chrome && (!!window.chrome.webstore || !!window.chrome.runtime);
     },
     isSafari: function() { return /Safari/.test(navigator.userAgent) && !/Chrome/.test(navigator.userAgent); },
+    isFirefox: function() { return /Firefox\//.test(navigator.userAgent); },
 };
 
 /** Codes of the modifiers no layout picks a character with, so a chord holding
@@ -1283,7 +1439,7 @@ const KeyboardUtil = {
      * Keysym from the physical key code, for a shortcut chord whose logical
      * key an IME swallowed (keyCode 229, key `Process`) or a non-Latin layout
      * localized. Shortcuts match on the base level keysym, so letters map
-     * lowercase; covers letters, digits, punctuation and the non-printable
+     * lowercase; covers letters, digits, punctuation, and the non-printable
      * keys common shortcuts use.
      * @param {string} code
      * @returns {number|null}
@@ -1351,7 +1507,8 @@ export class Input {
      * @param {boolean} [isSharedMode=false] Viewer-only session: listeners are limited to suppressing touch defaults.
      * @param {number} [playerIndex=0] Gamepad slot used while the server has assigned no controller slot.
      * @param {boolean} [useCssScaling=false] Whether the stream is realized in CSS pixels, so no device pixel ratio applies.
-     * @param {number|null} [initialSlot=null] One-based controller slot assigned by the server.
+     * @param {number|number[]|null} [initialSlot=null] One-based controller slot assigned by the server,
+     *     or the list of them a token holding several names.
      */
     constructor(element, send, isSharedMode = false, playerIndex = 0,  useCssScaling = false, initialSlot = null) {
         this.element = element;
@@ -1363,10 +1520,17 @@ export class Input {
          * @type {((message: string) => void)|null}
          */
         this.sendMotion = null;
+        /**
+         * Bytes the transport still holds ahead of the next pointer motion
+         * message, or null where it cannot say.
+         * @type {(() => number)|null}
+         */
+        this.motionBacklog = null;
         this._pointerSeq = 0;
         this._isSidebarOpen = false;
         this.isSharedMode = isSharedMode;
-        this.controllerSlot = initialSlot;
+        /** The one-based slots the server assigned, in the order the pads take them, or null (`slotList`). */
+        this.controllerSlots = slotList(initialSlot);
         this.playerIndex = playerIndex;
         this.cursorDiv = document.createElement('canvas');
         this.cursorDiv.style.position = 'fixed';
@@ -1375,6 +1539,8 @@ export class Input {
         this.cursorDiv.style.display = 'none';
         this.cursorDiv.style.left = '0px';
         this.cursorDiv.style.top = '0px';
+        // Moved on every pointer move: a layer of its own repaints nothing under it.
+        this.cursorDiv.style.willChange = 'transform';
         this.cursorImg = this.cursorDiv.getContext('2d');
         document.body.appendChild(this.cursorDiv);
         this.cursorHotspot = { x: 0, y: 0 };
@@ -1384,6 +1550,21 @@ export class Input {
         this.use_browser_cursors = false;
         this._latestMouseX = 0;
         this._latestMouseY = 0;
+        /** The display this page renders, which the pointer echo names (`onPointerEcho`). */
+        this.displayId = 'primary';
+        /**
+         * Trackpad mode's cursor: the last pointer echo, as
+         * `{display, x, y, scale, seq}`, and each `[seq, dx, dy]` sent past it.
+         */
+        this._echo = null;
+        this._echoDeltas = [];
+        /** Whether this page has the server composite the cursor, where no echo came. */
+        this._echoComposited = false;
+        /** Whether the session takes a touchpad's scroll as a finger's (`setFingerScroll`). */
+        this.fingerScroll = false;
+        this._fingerScrollTimer = null;
+        this._echoTimer = null;
+        this._echoAsking = false;
         this.useCssScaling = useCssScaling;
         this._streamDensity = null;
         this.m = null;
@@ -1401,6 +1582,10 @@ export class Input {
         this._geometryTimer = null;
         this.buttonMask = 0;
         this.gamepadManager = null;
+        /** Per slot position, the server slot a `js,c` was last sent on, which a `js,d` releases (`_gamepadActive`). */
+        this._gamepadAnnounced = {};
+        /** Pads play the rumble the server relays (`setGamepadRumble`). */
+        this.gamepadRumble = true;
         this.x = 0;
         this.y = 0;
         this._relCarryX = 0;
@@ -1408,8 +1593,14 @@ export class Input {
         this._pointerScaleFrame = null;
         this._pendingMove = null;
         this._moveFlushScheduled = false;
+        /** When the last pointer motion message went out (`performance.now()`). */
+        this._lastMotionSend = -Infinity;
+        /** Whether a `pointerrawupdate` has sent motion the next frame-aligned move event also reports. */
+        this._rawMotionSeen = false;
         this.onmenuhotkey = null;
         this.gamingMode = false;
+        /** The browser holds the keys for this fullscreen (`_gamingFullscreenOptions`). */
+        this._fullscreenKeyboardLock = false;
         this.shortcutsEnabled = true;
         this._escapePresses = 0;
         this._lastEscapeAt = 0;
@@ -1423,18 +1614,20 @@ export class Input {
         this.listeners = [];
         this.listeners_context = [];
         this._queue = new Queue();
-        this._allowTrackpadScrolling = true;
+        /** A press reported as the secondary button is the primary's, and so is its release (`_pressedButton`). */
+        this._primaryAsSecondary = false;
         /**
-         * Whether wheel input is classified as a trackpad. Starts true until
-         * the detector has its samples: the throttle path never drops events,
-         * so an unclassified burst costs at most one smoothing window, whereas
-         * a discrete-wheel start would emit a trackpad gesture's opening deltas
-         * as scroll clicks.
+         * Whether wheel input is classified as a trackpad, which takes a fixed
+         * 100px notch (`_wheelNotches`). Starts true until the detector has its
+         * samples: a wheel taken for a trackpad loses nothing but the notch
+         * size of its first few clicks, whereas a trackpad taken for a wheel
+         * would emit its gesture's opening deltas as scroll clicks.
          */
         this._allowThreshold = true;
+        /** Whether the detector has had its samples since the last wheel reset. */
+        this._wheelClassified = false;
         this._smallestDeltaY = 10000;
         this._smallestLineDeltaY = 10000;
-        this._wheelThreshold = 100;
         this._scrollMagnitude = 10;
         /**
          * Fractional-notch accumulators, one per wheel axis: a fast discrete
@@ -1444,6 +1637,8 @@ export class Input {
         this._wheelDirY = null;
         this._wheelAccumX = 0;
         this._wheelDirX = null;
+        /** Fraction of a zoom notch a touchpad pinch has carried (`_pinchWheel`). */
+        this._pinchCarry = 0;
         /**
          * Last wheel event time, driving the idle reset of the learned notch
          * quantums: the smallest-delta learning only holds within one device's
@@ -1466,7 +1661,6 @@ export class Input {
         this._altGrArmed = false;
         this._altGrTimeout = null;
         this._altGrCtrlTime = 0;
-        this._macCmdSwapped = false;
 
         this._isSynth = false;
         /**
@@ -1499,20 +1693,19 @@ export class Input {
         this._activeTouches = new Map();
         this._activeTouchIdentifier = null;
         this._isTwoFingerGesture = false;
-        this._MIN_SWIPE_DISTANCE = 30;
-        this._MAX_SWIPE_DURATION = 600;
-        this._VERTICAL_SWIPE_RATIO = 1.5;
-        this._SCROLL_PIXELS_PER_TICK = 40;
-        this._MAX_SCROLL_MAGNITUDE = 8;
+        /** The two-finger gesture in progress in either touch mode (`_twoFingerStart`), or null. */
+        this._twoFinger = null;
         this._TAP_THRESHOLD_DISTANCE_SQ = 10*10;
         this._TAP_MAX_DURATION = 250;
         this._trackpadMode = false;
         this._trackpadTouches = new Map();
-        this._trackpadLastTapTime = 0;
         this._trackpadGestureMode = null;
-        this._trackpadTapTimeout = null;
-        this._trackpadLastScrollCentroid = null;
-        this._touchScrollLastCentroid = null;
+        /** Pending release of the button a trackpad tap pressed; a touch landing before it fires drags. */
+        this._trackpadReleaseTimer = null;
+        /** When a multi-finger trackpad gesture last dropped to one finger, for `TRACKPAD_HANDOFF_MS`. */
+        this._trackpadHandoffAt = -Infinity;
+        /** The dashboards' trackpad speed, scaling the accelerated travel (`setTrackpadSpeed`). */
+        this.trackpadSpeed = 1;
         this.inputAttached = false;
     }
 
@@ -1521,11 +1714,21 @@ export class Input {
         this.isSharedMode = !!enabled;
     }
 
-    /** Assigns the one-based controller slot the server gave this client. */
+    /**
+     * Assigns the one-based controller slot the server gave this client, or
+     * the list of them, and announces the pads that drive them there: a `js,c`
+     * sent before the slot was known was refused by the server's slot gate,
+     * which left the pad unassociated.
+     * @param {number|number[]|null} newSlot
+     */
     updateControllerSlot(newSlot) {
-        if (this.controllerSlot !== newSlot) {
-            console.log(`Input class: Controller slot updated to: ${newSlot}`);
-            this.controllerSlot = newSlot;
+        const slots = slotList(newSlot);
+        if (String(slots) === String(this.controllerSlots)) return;
+        console.log(`Input class: Controller slots updated to: ${slots}`);
+        this.controllerSlots = slots;
+        if (this.gamepadManager) {
+            this.gamepadManager.setSlotCount(slots ? slots.length : 1);
+            this.gamepadManager.reannounce();
         }
     }
     /** Tracks the dashboard's `sidebarVisibilityChanged` message so gamepad state is only mirrored while it is open. */
@@ -1578,7 +1781,24 @@ export class Input {
         return Input.rawPointerMotion && !Input._rawMotionRefused;
     }
 
-    /** Paints the server cursor bitmap onto the cursor canvas at the current device pixel ratio and rebases the hotspot. */
+    /**
+     * Whether the engine's own record of where the viewport sits on the
+     * screen puts it at the window's origin, as a fullscreen viewport sits.
+     * Only Gecko exposes that record (`mozInnerScreenX`/`mozInnerScreenY`),
+     * and only Gecko needs it: under pointer lock it warps the pointer to the
+     * viewport's center through that record and measures the next movement
+     * from there, while the record trails a fullscreen transition by the
+     * toolbars the transition collapses, so a lock taken meanwhile adds their
+     * height to its first movement. Elsewhere the viewport counts as placed.
+     * @returns {boolean}
+     */
+    static _viewportSettled() {
+        const x = window.mozInnerScreenX, y = window.mozInnerScreenY;
+        if (typeof x !== 'number' || typeof y !== 'number') return true;
+        return Math.abs(x - window.screenX) < 1 && Math.abs(y - window.screenY) < 1;
+    }
+
+    /** Paints the server cursor at the displayed stream scale and rebases its hotspot into CSS pixels. */
     _drawAndScaleCursor() {
         if (!this._cursorImageBitmap) {
             return;
@@ -1593,12 +1813,16 @@ export class Input {
         this.cursorImg.drawImage(img, 0, 0);
         this.cursorHotspot.x = this._rawHotspotX / dpr;
         this.cursorHotspot.y = this._rawHotspotY / dpr;
-        this._updateCursorPosition(this._latestMouseX, this._latestMouseY);
+        if (this._trackpadMode) {
+            this._placeEchoCursor();
+        } else {
+            this._updateCursorPosition(this._latestMouseX, this._latestMouseY);
+        }
     }
 
     /** Hides the page-drawn cursor when a press lands outside the stream. */
     _handleOutsideClick(event) {
-        if (!this.use_browser_cursors && !this.element.contains(event.target)) {
+        if (!this.use_browser_cursors && !this._trackpadMode && !this.element.contains(event.target)) {
             this.cursorDiv.style.display = 'none';
         }
     }
@@ -1632,8 +1856,8 @@ export class Input {
 
     /**
      * Applies the server cursor as a CSS cursor. The PNG is in remote device
-     * pixels but CSS cursors render one image pixel per CSS pixel, so above a
-     * device pixel ratio of 1 the density is declared through `image-set()`
+     * pixels but CSS cursors render one image pixel per CSS pixel, so the
+     * displayed stream density is declared through `image-set()`
      * and the hotspot rebased into CSS pixels, mirroring `_drawAndScaleCursor`;
      * a plain `url()` with the raw hotspot is the fallback where `image-set()`
      * is unsupported.
@@ -1667,15 +1891,17 @@ export class Input {
     }
 
     /**
-     * Applies a cursor update from the server; an empty or null-handle update,
-     * and trackpad mode, hide the cursor.
+     * Applies a cursor update from the server; an empty or null-handle update
+     * hides the cursor. A new PNG invalidates the cached canvas bitmap even
+     * while CSS renders it, so changing modes retains the current shape and
+     * size. Trackpad mode always paints the canvas, at the pointer echo,
+     * since no local pointer shows where the remote one is.
      * @param {{curdata?: string, handle: string|number, hotx?: string|number, hoty?: string|number}} cursorData
      *     Base64 PNG and hotspot as the server sends them.
      */
     async updateServerCursor(cursorData) {
         if (!cursorData.curdata ||
-            parseInt(cursorData.handle, 10) === 0 ||
-            this._trackpadMode)
+            parseInt(cursorData.handle, 10) === 0)
         {
             this._cursorImageBitmap = null;
             this._cursorBase64Data = null;
@@ -1688,12 +1914,16 @@ export class Input {
         this._rawHotspotX = parseInt(cursorData.hotx) || 0;
         this._rawHotspotY = parseInt(cursorData.hoty) || 0;
         this._cursorBase64Data = cursorData.curdata;
+        this._cursorImageBitmap = null;
         if (!this.inputAttached) {
             this.cursorDiv.style.display = 'none';
             this.element.style.cursor = 'auto';
             return;
         }
-        if (this.use_browser_cursors) {
+        if (this._trackpadMode) {
+            this._cursorImageBitmap = await this._cursorBitmapFromBase64(this._cursorBase64Data);
+            this._drawAndScaleCursor();
+        } else if (this.use_browser_cursors) {
             this.cursorDiv.style.display = 'none';
             this._updateBrowserCursor();
         } else {
@@ -1716,7 +1946,7 @@ export class Input {
             console.log(`Input: Updating useCssScaling from ${this.useCssScaling} to ${newUseCssScalingValue}`);
             this.useCssScaling = newUseCssScalingValue;
             this._windowMath();
-            this._drawAndScaleCursor();
+            this._refreshCursorScale();
         }
     }
 
@@ -1732,9 +1962,9 @@ export class Input {
     _sendKeyEvent(keysym, code, down) {
         if (keysym === null) return;
         let finalKeysymToSend = keysym;
-        if (NumpadTranslations_NumLockOn.hasOwnProperty(keysym)) {
+        if (Object.prototype.hasOwnProperty.call(NumpadTranslations_NumLockOn, keysym)) {
             finalKeysymToSend = NumpadTranslations_NumLockOn[keysym];
-        } else if (NumpadTranslations_NumLockOff.hasOwnProperty(keysym)) {
+        } else if (Object.prototype.hasOwnProperty.call(NumpadTranslations_NumLockOff, keysym)) {
             finalKeysymToSend = NumpadTranslations_NumLockOff[keysym];
         }
         if (down) {
@@ -1820,8 +2050,10 @@ export class Input {
      * it holds is reported down, because a remap can leave the two disagreeing
      * and either one still means the key is held: an xkb Ctrl/Alt swap leaves
      * an Alt code holding Control_L, and macOS Command holds Alt_L on a Meta
-     * code. Asking only one of them releases a modifier mid-chord, which the
-     * server then sees as the chord ending.
+     * code, or the Control_L it stands for in a chord. Asking only one of them
+     * releases a modifier mid-chord, which the server then sees as the chord
+     * ending. A macOS Command found up this way lost its keyup, which the keys
+     * held under it follow (`_releaseLostKey`).
      */
     _releaseDesyncedModifiers(event) {
         if (typeof event.getModifierState !== 'function' || this._isSynth) return;
@@ -1834,8 +2066,31 @@ export class Input {
             const byKeysym = MODIFIER_STATE_BY_KEYSYM[keysym];
             if (!byCode && !byKeysym) continue;
             if (_modifierStateHeld(event, byCode) || _modifierStateHeld(event, byKeysym)) continue;
-            this._sendKeyEvent(keysym, code, false);
-            delete this._keyDownList[code];
+            this._releaseLostKey(code);
+        }
+    }
+
+    /**
+     * Releases a held key whose keyup the stream never handled, as that keyup
+     * would have.
+     * @param {string} code Physical `event.code`.
+     */
+    _releaseLostKey(code) {
+        this._sendKeyEvent(this._keyDownList[code], code, false);
+        if (browser.isMac() && MODIFIER_STATE_BY_CODE[code] === 'Meta') this._releaseUnderCommand();
+    }
+
+    /**
+     * Releases every held key but the modifiers once macOS Command is up.
+     * Blink and WebKit never deliver the keyup of a key released while Command
+     * is down, so no key held under Command is known to be down any more; one
+     * still held goes down again with its next autorepeat.
+     */
+    _releaseUnderCommand() {
+        for (const code of Object.keys(this._keyDownList)) {
+            if (MODIFIER_STATE_BY_CODE[code]) continue;
+            console.log(`macOS: Force-releasing stuck key: ${code}`);
+            this._sendKeyEvent(this._keyDownList[code], code, false);
         }
     }
 
@@ -1879,7 +2134,8 @@ export class Input {
      * class, modifier healing (`_releaseDesyncedModifiers`), CapsLock, repeat
      * suppression, the IME path, keysym resolution with the Windows AltGr and
      * macOS remaps, and the send, wrapped in any chord modifiers the server
-     * is not holding.
+     * is not holding. A key pressed again while held, and not as a repeat,
+     * lost its keyup, and is released before it goes down again.
      *
      * Hotkeys come before the native-input class, which exempts plain typing,
      * not the chords. CapsLock is swallowed: case is already resolved into
@@ -1939,13 +2195,18 @@ export class Input {
             return;
         }
         if (keycode in this._keyDownList) {
-            _stopEvent(event);
-            return;
+            if (event.repeat) {
+                _stopEvent(event);
+                return;
+            }
+            this._releaseLostKey(keycode);
         }
         if (this.isComposing || event.isComposing || event.keyCode === 229) {
             const armedCtrl = this._altGrArmed;
+            // A dead key composes with the key after it: macOS Option+E is
+            // the acute accent's, never Alt+E.
             if ((event.ctrlKey || event.altKey || event.metaKey || armedCtrl) &&
-                !this._composesText(event)) {
+                event.key !== 'Dead' && !this._composesText(event)) {
                 const chordKeysym = KeyboardUtil.getKeysymFromCode(event.code);
                 if (chordKeysym) {
                     if (this.isComposing || event.isComposing) {
@@ -2005,17 +2266,25 @@ export class Input {
         }
 
         if (browser.isMac() && Input.macCmdAsCtrl && _isPhysicalKey(event) && code !== "MetaLeft" &&
-            code !== "MetaRight" && event.metaKey && !event.ctrlKey && !event.altKey) {
+            code !== "MetaRight" && event.metaKey && !event.ctrlKey && !event.altKey &&
+            !this._commandIsControl()) {
             if (this._keyDownList["MetaLeft"] || this._keyDownList["MetaRight"]) {
                 console.log(`macOS: Cmd+key detected for code '${code}'. Remapping Cmd to Ctrl.`);
+                const command = this._keyDownList["MetaLeft"] ? "MetaLeft" : "MetaRight";
                 if (this._keyDownList["MetaLeft"]) {
                     this._sendKeyEvent(this._keyDownList["MetaLeft"], "MetaLeft", false);
                 }
                 if (this._keyDownList["MetaRight"]) {
                     this._sendKeyEvent(this._keyDownList["MetaRight"], "MetaRight", false);
                 }
-                this._sendKeyEvent(KeyTable.XK_Control_L, "ControlLeft", true);
-                this._macCmdSwapped = true;
+                // Held on Command's code, whose state _releaseDesyncedModifiers reads for it.
+                this._sendKeyEvent(KeyTable.XK_Control_L, command, true);
+            } else {
+                // Command went down before the page had the keyboard (held through
+                // Cmd+Tab back to it): it stands for Control from this chord on, held
+                // on the left Command's code for its keyup, or the next event showing
+                // it up, to release.
+                this._sendKeyEvent(KeyTable.XK_Control_L, "MetaLeft", true);
             }
         }
 
@@ -2074,6 +2343,11 @@ export class Input {
             }, 100);
             return;
         }
+        // WebKit and Gecko on macOS never deliver the keyup of a key let go
+        // while Command is down, so such a key goes out as a tap, and each of
+        // its autorepeats as another; Blink's keyup then finds nothing held.
+        const tap = browser.isMac() && event.metaKey && _isPhysicalKey(event) &&
+            keysym !== null && !MODIFIER_STATE_BY_CODE[code];
         // Meta is exempt while the macOS Cmd-to-Ctrl swap carries the chord.
         if (keysym !== null && !MODIFIER_STATE_BY_CODE[code] &&
             (event.ctrlKey || event.altKey || event.metaKey) &&
@@ -2081,18 +2355,20 @@ export class Input {
             const missingMods = this._missingChordModifiers({
                 ctrl: event.ctrlKey,
                 alt: event.altKey,
-                meta: event.metaKey && !this._macCmdSwapped,
+                meta: event.metaKey && !this._commandIsControl(),
                 shift: event.shiftKey,
             });
             if (missingMods.length > 0) {
                 this._noteMomentaryChordMods(missingMods);
                 for (const m of missingMods) this.send("kd," + m);
                 this._sendKeyEvent(keysym, code, true);
+                if (tap) this._sendKeyEvent(keysym, code, false);
                 for (const m of missingMods.reverse()) this.send("ku," + m);
                 return;
             }
         }
         this._sendKeyEvent(keysym, code, true);
+        if (tap) this._sendKeyEvent(keysym, code, false);
     }
 
     /** Keyup handler: releases the keysym the key went down with, with the macOS Command and Windows Shift cleanups. */
@@ -2119,7 +2395,12 @@ export class Input {
     }
 
     _handleKeyUp(event) {
-        if (this._targetHasClass(event.target, WHITELIST_CLASS)) return;
+        if (this._targetHasClass(event.target, WHITELIST_CLASS)) {
+            // Focus moved to a native control while the stream held the key.
+            const code = KeyboardUtil.getKeyCode(event);
+            if (code in this._keyDownList) this._releaseLostKey(code);
+            return;
+        }
         if (!this._guac_markEvent(event)) return;
         
         _stopEvent(event);
@@ -2133,27 +2414,7 @@ export class Input {
 
         if (browser.isMac() && (code === 'MetaLeft' || code === 'MetaRight')) {
             console.log(`macOS: Command key ('${code}') released. Cleaning up potentially stuck keys.`);
-
-            const pressedCodes = Object.keys(this._keyDownList);
-            for (const pressedCode of pressedCodes) {
-                if (pressedCode === 'ShiftLeft' || pressedCode === 'ShiftRight' ||
-                    pressedCode === 'ControlLeft' || pressedCode === 'ControlRight' ||
-                    pressedCode === 'AltLeft' || pressedCode === 'AltRight' ||
-                    pressedCode === 'MetaLeft' || pressedCode === 'MetaRight') {
-                    continue;
-                }
-
-                console.log(`macOS: Force-releasing stuck key: ${pressedCode}`);
-                this._sendKeyEvent(this._keyDownList[pressedCode], pressedCode, false);
-            }
-            
-            if (this._macCmdSwapped) {
-                console.log("macOS: Releasing the swapped virtual Ctrl key.");
-                if ('ControlLeft' in this._keyDownList) {
-                    this._sendKeyEvent(this._keyDownList['ControlLeft'], 'ControlLeft', false);
-                }
-                this._macCmdSwapped = false;
-            }
+            this._releaseUnderCommand();
         }
 
         // Abort the armed AltGr sequence: this key-up is not AltRight.
@@ -2374,11 +2635,15 @@ export class Input {
      * compositionend Blink chains after it only clears the preedit. Only an
      * IME commit reaches this: plain keydowns are stopped before the browser
      * action, and Blink can deliver a commit as textInput with an empty
-     * compositionend.
+     * compositionend. The preedit still on the server is erased first, the
+     * commit landing where it stood: WebKit commits a dead key's letter with
+     * no update before it, so erasing after would take the letter and leave
+     * the accent.
      */
     _handleTextInput(event) {
         if (!event.data) return;
         if (this._chordEchoPending()) return;
+        if (this.isComposing) this._updateCompositionText("");
         this._typeText(event.data);
         this._lastTextInputCommit = { data: event.data, at: performance.now() };
         this._clearCompositionHostSoon();
@@ -2484,7 +2749,7 @@ export class Input {
      * Whether every Alt-position key down is a level shift rather than Alt.
      * This client wraps Alt_L around a chord because it read the Alt-position
      * key as Alt, so a key it read as anything else must not be wrapped: the
-     * `getKeysym` remaps put macOS Option on Mode_switch, ISO_Level3_Shift or
+     * `getKeysym` remaps put macOS Option on Mode_switch, ISO_Level3_Shift, or
      * Meta_L there, and only Alt_L/Alt_R name the action modifier. With
      * nothing resolved for it -- a keydown an IME or an OS grab swallowed --
      * only an engine's own `AltGraph` says it shifted a level.
@@ -2508,6 +2773,12 @@ export class Input {
             if (keysyms.includes(this._keyDownList[code])) return true;
         }
         return false;
+    }
+
+    /** True while a macOS Command key holds the Control a chord made it stand for. */
+    _commandIsControl() {
+        return this._keyDownList["MetaLeft"] === KeyTable.XK_Control_L ||
+            this._keyDownList["MetaRight"] === KeyTable.XK_Control_L;
     }
 
     /**
@@ -2535,43 +2806,73 @@ export class Input {
     }
 
     /**
+     * The button a press or release is of. Gecko on macOS reports a
+     * Control-click as the secondary button while `buttons` holds the primary
+     * alone, where Blink and WebKit report the primary; taken as reported, the
+     * press would add a secondary to the primary the motion before it stated
+     * and the release would leave that primary held. The press is read from
+     * `buttons` there and its release follows it, so every engine sends
+     * Control and the primary button.
+     * @param {MouseEvent} event
+     * @param {number} down 1 for a press, 0 for a release.
+     * @returns {number} The button, as `MouseEvent.button` counts.
+     */
+    _pressedButton(event, down) {
+        if (event.button !== 2) return event.button;
+        if (down) this._primaryAsSecondary = event.ctrlKey && (event.buttons & 0x3) === 0x1;
+        if (!this._primaryAsSecondary) return 2;
+        if (!down) this._primaryAsSecondary = false;
+        return 0;
+    }
+
+    /**
      * Mouse and pen handler: moves the page-drawn cursor (to the predicted
      * position where the engine offers one), maps the position through the
      * sink or the window math, keeps the button mask, and sends motion
-     * coalesced to one message per animation frame, button events flushing
-     * what is pending first. Button events map their own coordinates too: a
+     * through `_queueCoalescedMouseMove`, button events flushing what is
+     * pending first. Button events map their own coordinates too: a
      * non-hovering stylus emits no pointermove before contact, and a press
      * right after a pointer lock ends has only seen deltas. Under pointer
      * lock the payload is the movement delta instead, in CSS pixels, scaled
-     * and quantized where the motion is sent so a frame's worth rounds once.
+     * and quantized where the motion is sent so what is sent at once rounds
+     * once. Where the engine delivers motion as `pointerrawupdate`
+     * (`_handleRawPointerUpdate`), that sends it, and the frame-aligned
+     * `mousemove` or pen `pointermove` reporting the same motion only moves
+     * the page-drawn cursor.
      * Ctrl+Shift+Click takes pointer lock, and in gaming mode a click re-arms
      * it after an Escape unlock while the click still goes to the server.
      */
     _mouseButtonMovement(event) {
+        const raw = event.type === 'pointerrawupdate';
+        const sentRaw = !raw && this._rawMotionSeen &&
+            (event.type === 'mousemove' || event.type === 'pointermove');
+        if (event.type === 'mousemove') this._rawMotionSeen = false;
         if (this.buttonMask === 0 && event.target !== this.element) {
             return;
         }
-        if (this.inputAttached && !this.use_browser_cursors) {
-            this.cursorDiv.style.display = 'block';
-            this.element.style.setProperty('cursor', 'none', 'important');
-        }
         this._noteScreenAnchor(event);
-        let visualClientX = event.clientX;
-        let visualClientY = event.clientY;
-        if (event.getPredictedEvents && typeof event.getPredictedEvents === 'function') {
-            const predictedEvents = event.getPredictedEvents();
-            if (predictedEvents.length > 0) {
-                const lastPredictedEvent = predictedEvents[predictedEvents.length - 1];
-                visualClientX = lastPredictedEvent.clientX;
-                visualClientY = lastPredictedEvent.clientY;
+        if (!raw) {
+            if (this.inputAttached && !this.use_browser_cursors && !this._trackpadMode) {
+                this.cursorDiv.style.display = 'block';
+                this.element.style.setProperty('cursor', 'none', 'important');
             }
+            let visualClientX = event.clientX;
+            let visualClientY = event.clientY;
+            if (event.getPredictedEvents && typeof event.getPredictedEvents === 'function') {
+                const predictedEvents = event.getPredictedEvents();
+                if (predictedEvents.length > 0) {
+                    const lastPredictedEvent = predictedEvents[predictedEvents.length - 1];
+                    visualClientX = lastPredictedEvent.clientX;
+                    visualClientY = lastPredictedEvent.clientY;
+                }
+            }
+            if (this.inputAttached && !this.use_browser_cursors && !this._trackpadMode) {
+                this._updateCursorPosition(visualClientX, visualClientY);
+            }
+            this._latestMouseX = visualClientX;
+            this._latestMouseY = visualClientY;
         }
-        if (this.inputAttached && !this.use_browser_cursors) {
-            this._updateCursorPosition(visualClientX, visualClientY);
-        }
-        this._latestMouseX = visualClientX;
-        this._latestMouseY = visualClientY;
-        if (this._trackpadMode) return;
+        if (this._trackpadMode || sentRaw) return;
         const dpr_for_input_coords = this._inputDpr();
         const down = (event.type === 'mousedown' || event.type === 'pointerdown' ? 1 : 0);
         if (down) {
@@ -2611,7 +2912,7 @@ export class Input {
             mtype = "m2";
             relX = event.movementX || 0;
             relY = event.movementY || 0;
-        } else if (event.type === 'mousemove' || event.type === 'pointermove' ||
+        } else if (event.type === 'mousemove' || event.type === 'pointermove' || raw ||
                    event.type === 'mousedown' || event.type === 'mouseup' ||
                    event.type === 'pointerdown' || event.type === 'pointerup') {
             if (this._applySinkCoordinates(event.clientX, event.clientY, canvas, videoEle,
@@ -2640,7 +2941,7 @@ export class Input {
         // suppresses the compatibility mousedown.
         if (event.type === 'mousedown' || event.type === 'mouseup' ||
             ((event.type === 'pointerdown' || event.type === 'pointerup') && event.button >= 0)) {
-            var mask = 1 << event.button;
+            var mask = 1 << this._pressedButton(event, down);
             if (down) {
                 this.buttonMask |= mask;
             } else {
@@ -2658,7 +2959,7 @@ export class Input {
         }
         const outX = (mtype === "m2") ? relX : this.x;
         const outY = (mtype === "m2") ? relY : this.y;
-        if (event.type === 'mousemove' || event.type === 'pointermove') {
+        if (event.type === 'mousemove' || event.type === 'pointermove' || raw) {
             this._queueCoalescedMouseMove(mtype, outX, outY, this.buttonMask);
         } else {
             this._flushCoalescedMouseMove();
@@ -2672,10 +2973,13 @@ export class Input {
     }
 
     /**
-     * Queues motion for the next animation frame, so a 1000 Hz mouse cannot
-     * congest the uplink and the server's input loop: relative deltas sum,
-     * absolute positions keep only the latest, and a mode change flushes
-     * first.
+     * Sends motion now, or holds it for the rest of `MOTION_SEND_INTERVAL_MS`
+     * after the last motion message, so a 1000 Hz mouse cannot congest the
+     * uplink and the server's input loop while a sample is never held longer
+     * than that: relative deltas held together sum, an absolute position
+     * replaces the one held, and a mode change flushes first. A transport
+     * holding more than `MOTION_BACKLOG_BYTES` (`motionBacklog`) is not
+     * draining, so motion then waits for the next animation frame instead.
      * @param {'m'|'m2'} mtype
      * @param {number} x CSS-pixel delta under lock, else the mapped position.
      * @param {number} y
@@ -2697,19 +3001,27 @@ export class Input {
             }
             this._pendingMove = { mtype: "m", x: x, y: y, buttonMask: buttonMask };
         }
-        if (!this._moveFlushScheduled) {
-            this._moveFlushScheduled = true;
-            const raf = window.requestAnimationFrame
-                ? window.requestAnimationFrame.bind(window)
-                : (cb) => setTimeout(cb, 16);
-            raf(() => {
-                this._moveFlushScheduled = false;
-                this._flushCoalescedMouseMove();
-            });
+        if (this._moveFlushScheduled) return;
+        const wait = MOTION_SEND_INTERVAL_MS - (performance.now() - (this._lastMotionSend || 0));
+        const backedUp = typeof this.motionBacklog === 'function' &&
+            this.motionBacklog() > MOTION_BACKLOG_BYTES;
+        if (wait <= 0 && !backedUp) {
+            this._flushCoalescedMouseMove();
+            return;
+        }
+        this._moveFlushScheduled = true;
+        const flush = () => {
+            this._moveFlushScheduled = false;
+            this._flushCoalescedMouseMove();
+        };
+        if (backedUp && window.requestAnimationFrame) {
+            window.requestAnimationFrame(flush);
+        } else {
+            setTimeout(flush, Math.max(0, wait));
         }
     }
 
-    /** Sends the queued motion; a relative move that quantizes to (0, 0) is dropped and its remainder stays for the next frame. */
+    /** Sends the queued motion; a relative move that quantizes to (0, 0) is dropped and its remainder stays for the next send. */
     _flushCoalescedMouseMove() {
         const m = this._pendingMove;
         if (!m) return;
@@ -2718,9 +3030,60 @@ export class Input {
             const moved = this._relativeToServer(m.x, m.y);
             if (moved[0] === 0 && moved[1] === 0) return;
             this._sendPointer([ m.mtype, moved[0], moved[1], m.buttonMask, 0 ], true);
+        } else {
+            this._sendPointer([ m.mtype, m.x, m.y, m.buttonMask, 0 ], true);
+        }
+        this._lastMotionSend = performance.now();
+    }
+
+    /**
+     * Pointer motion from `pointerrawupdate`, which the engine dispatches as
+     * each sample arrives rather than at the next frame the way `mousemove`
+     * and `pointermove` are; the engines that fire it (Chromium, Gecko) do so
+     * only in a secure context, and elsewhere those events carry the motion
+     * as before. Its movement already sums what it coalesced, and a held
+     * button's coalesced positions go out as well (`_sendCoalescedContact`).
+     * @param {PointerEvent} event
+     */
+    _handleRawPointerUpdate(event) {
+        if (event.pointerType === 'touch') {
+            this._trackpadRawUpdate(event);
             return;
         }
-        this._sendPointer([ m.mtype, m.x, m.y, m.buttonMask, 0 ], true);
+        if (event.pointerType !== 'mouse' && event.pointerType !== 'pen') return;
+        this._rawMotionSeen = true;
+        this._sendCoalescedContact(event);
+        this._mouseButtonMovement(event);
+    }
+
+    /**
+     * While a button or a pen's tip is down, sends the positions an event
+     * coalesced ahead of its own (a busy page thread, a digitizer faster than
+     * the page), one per `MOTION_SEND_INTERVAL_MS` of their own time, so a
+     * stroke keeps its shape; hovering, only the newest position matters, and
+     * under pointer lock the event's movement already sums them. They go out
+     * as they are read, outside the spacing live motion keeps: they are late
+     * already, their own time bounds their rate, and a spacing they started
+     * would hold back the event's own position, the newest.
+     * @param {PointerEvent} event
+     */
+    _sendCoalescedContact(event) {
+        if (event.buttons === 0 || typeof event.getCoalescedEvents !== 'function' ||
+            this._isStreamLocked()) {
+            return;
+        }
+        const samples = event.getCoalescedEvents();
+        const flushScheduled = this._moveFlushScheduled, lastSend = this._lastMotionSend;
+        this._moveFlushScheduled = true;
+        let last = -Infinity;
+        for (let i = 0; i + 1 < samples.length; i++) {
+            if (samples[i].timeStamp - last < MOTION_SEND_INTERVAL_MS) continue;
+            last = samples[i].timeStamp;
+            this._mouseButtonMovement(samples[i]);
+            this._flushCoalescedMouseMove();
+        }
+        this._moveFlushScheduled = flushScheduled;
+        this._lastMotionSend = lastSend;
     }
 
     /**
@@ -2734,6 +3097,15 @@ export class Input {
         this._pointerSeq += 1;
         const message = fields.join(",") + "," + this._pointerSeq;
         ((motion && this.sendMotion) || this.send)(message);
+        if (this._trackpadMode && !this._echoComposited && fields[0] === "m2" &&
+            (fields[1] !== 0 || fields[2] !== 0)) {
+            this._echoDeltas.push([this._pointerSeq, fields[1], fields[2]]);
+            if (this._echoDeltas.length > POINTER_ECHO_DELTAS_MAX) {
+                const [, dx, dy] = this._echoDeltas.shift();
+                if (this._echo) [this._echo.x, this._echo.y] = this._echoStep(this._echo.x, this._echo.y, dx, dy);
+            }
+            this._placeEchoCursor();
+        }
     }
 
     /** Pen pointer events feed the mouse path; other pointer types arrive as mouse events. */
@@ -2745,11 +3117,17 @@ export class Input {
         this._mouseButtonMovement(event);
     }
 
-    /** Pen pointer motion, see `_handlePointerDown`. */
+    /**
+     * Pen pointer motion, see `_handlePointerDown`. Where no
+     * `pointerrawupdate` carried it (Safari, whose Apple Pencil reports four
+     * times as often as the frames this event is held for), the tip's
+     * coalesced positions go out from here.
+     */
     _handlePointerMove(event) {
         if (event.pointerType !== 'pen') {
            return;
         }
+        if (!this._rawMotionSeen) this._sendCoalescedContact(event);
         this._mouseButtonMovement(event);
     }
  
@@ -2763,31 +3141,37 @@ export class Input {
 
     /**
      * Trackpad emulation: one finger moves the pointer relatively, a tap
-     * clicks, a tap then hold drags, two fingers scroll, and a two-finger tap
-     * right-clicks. Every payload is relative motion.
+     * clicks, a tap then a touch that moves drags, two fingers scroll or
+     * pinch (`_twoFingerMove`), and a two-finger tap right-clicks. Every
+     * payload is relative motion.
+     *
+     * A tap presses the button as the finger lifts and releases it
+     * `TRACKPAD_TAP_HOLD_MS` later, so only the release waits on the window in
+     * which the next touch decides what the tap was: a touch landing inside
+     * it takes the held button over as a drag, and one that lifts without
+     * moving ends the click and adds a second, a double click. A second
+     * finger landing ends the hold first, so a scroll never runs with the
+     * button down.
+     *
+     * A three-finger tap is a middle click. When a gesture of two or more
+     * fingers drops to one, that finger moves the pointer on from where it
+     * then is, once `TRACKPAD_HANDOFF_MS` have passed, and never taps.
      */
     _handleTrackpadEvent(event) {
         if (this._targetHasClass(event.target, WHITELIST_CLASS)) return;
         event.preventDefault();
         event.stopPropagation();
 
-        const now = Date.now();
-        const TAP_AND_HOLD_THRESHOLD = 300;
-
         const type = event.type;
         const changedTouches = event.changedTouches;
 
         if (type === 'touchstart') {
-            if (this._trackpadTapTimeout) {
-                clearTimeout(this._trackpadTapTimeout);
-                this._trackpadTapTimeout = null;
-            }
-
             for (const touch of changedTouches) {
                 this._trackpadTouches.set(touch.identifier, {
                     id: touch.identifier,
                     startX: touch.clientX, startY: touch.clientY,
                     lastX: touch.clientX, lastY: touch.clientY,
+                    lastT: event.timeStamp, speed: null,
                     moved: false
                 });
             }
@@ -2795,98 +3179,84 @@ export class Input {
             const touchCount = this._trackpadTouches.size;
 
             if (touchCount === 1) {
-                if ((now - this._trackpadLastTapTime) < TAP_AND_HOLD_THRESHOLD) {
+                if (this._trackpadReleaseTimer !== null) {
+                    clearTimeout(this._trackpadReleaseTimer);
+                    this._trackpadReleaseTimer = null;
                     this._trackpadGestureMode = 'dragging';
-                    this.buttonMask |= 1;
-                    this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false);
-                    this._trackpadLastTapTime = 0;
                 } else {
                     this._trackpadGestureMode = 'moving';
                 }
             }
             else if (touchCount === 2) {
+                this._trackpadReleaseButton();
                 this._trackpadGestureMode = 'scrolling';
-                this._trackpadLastTapTime = 0;
-                const touches = Array.from(this._trackpadTouches.values());
-                this._trackpadLastScrollCentroid = {
-                    x: (touches[0].lastX + touches[1].lastX) / 2,
-                    y: (touches[0].lastY + touches[1].lastY) / 2
-                };
+                const [a, b] = this._trackpadTouches.values();
+                this._twoFingerStart(a.lastX, a.lastY, b.lastX, b.lastY);
+            }
+            else {
+                this._trackpadReleaseButton();
+                this._trackpadGestureMode = touchCount === 3 ? 'three' : 'completed';
+                this._twoFinger = null;
             }
         }
         else if (type === 'touchmove') {
-            let hasAnyFingerMovedBeyondThreshold = false;
             for (const touch of this._trackpadTouches.values()) {
                 if (!touch.moved) {
                     const currentTouch = Array.from(changedTouches).find(t => t.identifier === touch.id) || touch;
-                    if (currentTouch) {
-                        const dx = currentTouch.clientX - touch.startX;
-                        const dy = currentTouch.clientY - touch.startY;
-                        if (dx * dx + dy * dy > this._TAP_THRESHOLD_DISTANCE_SQ) {
-                            touch.moved = true;
-                        }
+                    const dx = currentTouch.clientX - touch.startX;
+                    const dy = currentTouch.clientY - touch.startY;
+                    if (dx * dx + dy * dy > this._TAP_THRESHOLD_DISTANCE_SQ) {
+                        touch.moved = true;
                     }
                 }
-                if (touch.moved) {
-                    hasAnyFingerMovedBeyondThreshold = true;
-                }
-            }
-
-            if (hasAnyFingerMovedBeyondThreshold) {
-                this._trackpadLastTapTime = 0;
             }
 
             if (this._trackpadGestureMode === 'moving' || this._trackpadGestureMode === 'dragging') {
                 const touchData = this._trackpadTouches.values().next().value;
-                if (touchData) {
-                    const changedTouch = Array.from(changedTouches).find(t => t.identifier === touchData.id);
-                    if (changedTouch) {
-                        const moved = this._relativeToServer(
-                            changedTouch.clientX - touchData.lastX,
-                            changedTouch.clientY - touchData.lastY);
-                        if (moved[0] !== 0 || moved[1] !== 0) {
-                            this._sendPointer([ "m2", moved[0], moved[1], this.buttonMask, 0 ], true);
-                        }
-                        touchData.lastX = changedTouch.clientX;
-                        touchData.lastY = changedTouch.clientY;
-                    }
+                const changedTouch = touchData &&
+                    Array.from(changedTouches).find(t => t.identifier === touchData.id);
+                if (changedTouch) {
+                    this._trackpadMove(touchData, changedTouch.clientX, changedTouch.clientY,
+                                       event.timeStamp);
                 }
-            } else if (this._trackpadGestureMode === 'scrolling') {
-                const touches = Array.from(this._trackpadTouches.values());
-                if (touches.length === 2) {
-                    for (const changed of changedTouches) {
-                        const data = this._trackpadTouches.get(changed.identifier);
-                        if (data) { data.lastX = changed.clientX; data.lastY = changed.clientY; }
-                    }
-                    const curr_avg_x = (touches[0].lastX + touches[1].lastX) / 2;
-                    const curr_avg_y = (touches[0].lastY + touches[1].lastY) / 2;
-                    if (this._trackpadLastScrollCentroid) {
-                        const deltaX = curr_avg_x - this._trackpadLastScrollCentroid.x;
-                        const deltaY = curr_avg_y - this._trackpadLastScrollCentroid.y;
-                        const SCROLL_THRESHOLD = 2;
-                        if (Math.abs(deltaY) > SCROLL_THRESHOLD) this._triggerMouseWheel(deltaY < 0 ? 'down' : 'up', 1);
-                        if (Math.abs(deltaX) > SCROLL_THRESHOLD) this._triggerHorizontalMouseWheel(deltaX < 0 ? 'left' : 'right', 1);
-                    }
-                    this._trackpadLastScrollCentroid = { x: curr_avg_x, y: curr_avg_y };
+            } else {
+                for (const changed of changedTouches) {
+                    const data = this._trackpadTouches.get(changed.identifier);
+                    if (data) { data.lastX = changed.clientX; data.lastY = changed.clientY; }
+                }
+                if (this._trackpadGestureMode === 'scrolling' && this._trackpadTouches.size === 2) {
+                    const [a, b] = this._trackpadTouches.values();
+                    this._twoFingerMove(a.lastX, a.lastY, b.lastX, b.lastY);
                 }
             }
         }
         else if (type === 'touchend' || type === 'touchcancel') {
             const touchCountBeforeEnd = this._trackpadTouches.size;
-            const wasTap = !Array.from(this._trackpadTouches.values()).some(t => t.moved);
+            const wasTap = type === 'touchend' &&
+                !Array.from(this._trackpadTouches.values()).some(t => t.moved);
+            const mode = this._trackpadGestureMode;
 
-            if (touchCountBeforeEnd === 2 && wasTap) {
-                this.buttonMask |= (1 << 2); this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false);
-                setTimeout(() => { this.buttonMask &= ~(1 << 2); this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false); }, 50);
+            if ((touchCountBeforeEnd === 2 || touchCountBeforeEnd === 3) && wasTap && mode !== 'completed') {
+                const bit = touchCountBeforeEnd === 2 ? (1 << 2) : (1 << 1);
+                this.buttonMask |= bit; this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false);
+                setTimeout(() => { this.buttonMask &= ~bit; this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false); }, 50);
                 this._trackpadGestureMode = 'completed';
-                this._trackpadLastTapTime = 0;
             }
-            else if (touchCountBeforeEnd === 1 && wasTap && this._trackpadGestureMode !== 'completed' && this._trackpadGestureMode !== 'dragging') {
-                this._trackpadLastTapTime = now;
-                this._trackpadTapTimeout = setTimeout(() => {
-                    this.buttonMask |= 1; this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false);
-                    setTimeout(() => { this.buttonMask &= ~1; this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false); }, 50);
-                }, 200);
+            else if (touchCountBeforeEnd === 1 && mode === 'moving' && wasTap) {
+                this.buttonMask |= 1;
+                this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false);
+                this._trackpadReleaseTimer = setTimeout(() => {
+                    this._trackpadReleaseTimer = null;
+                    this._trackpadReleaseButton();
+                }, TRACKPAD_TAP_HOLD_MS);
+            }
+            else if (touchCountBeforeEnd === 1 && mode === 'dragging') {
+                this._trackpadReleaseButton();
+                if (wasTap) {
+                    this.buttonMask |= 1;
+                    this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false);
+                    this._trackpadReleaseButton();
+                }
             }
 
             for (const touch of changedTouches) {
@@ -2894,13 +3264,89 @@ export class Input {
             }
 
             if (this._trackpadTouches.size === 0) {
-                if (this._trackpadGestureMode === 'dragging') {
-                    this.buttonMask &= ~1;
-                    this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false);
-                }
                 this._trackpadGestureMode = null;
-                this._trackpadLastScrollCentroid = null;
+                this._twoFinger = null;
+            } else if (this._trackpadTouches.size === 1 && touchCountBeforeEnd > 1) {
+                const [left] = this._trackpadTouches.values();
+                left.moved = true;
+                this._trackpadGestureMode = 'moving';
+                this._trackpadHandoffAt = performance.now();
+                this._twoFinger = null;
             }
+        }
+    }
+
+    /**
+     * Trackpad motion from `pointerrawupdate`, for the one finger moving the
+     * pointer: the engine fires it as the digitizer reports, where `touchmove`
+     * waits for the next frame. Both move by the finger's travel since it was
+     * last seen, so the touchmove that follows finds nothing left to send.
+     * @param {PointerEvent} event
+     */
+    _trackpadRawUpdate(event) {
+        const mode = this._trackpadGestureMode;
+        if (!this._trackpadMode || this._trackpadTouches.size !== 1 ||
+            (mode !== 'moving' && mode !== 'dragging')) return;
+        this._trackpadMove(this._trackpadTouches.values().next().value, event.clientX, event.clientY,
+                           event.timeStamp);
+    }
+
+    /**
+     * Moves the pointer by a trackpad finger's travel since it was last seen,
+     * accelerated by its speed (`trackpadGain`) and scaled by `trackpadSpeed`,
+     * unless the hand-off from a multi-finger gesture is still settling. The
+     * speed is the travel over the time between the finger's reports that
+     * moved it, smoothed over `TRACKPAD_SPEED_TAU_MS`; the fraction of a pixel
+     * the gain leaves is carried to the next move (`_relativeToServer`).
+     * @param {{lastX: number, lastY: number, lastT: number, speed: ?number}} touchData
+     * @param {number} x
+     * @param {number} y
+     * @param {number} t The report's timestamp, in milliseconds.
+     */
+    _trackpadMove(touchData, x, y, t) {
+        const dx = x - touchData.lastX;
+        const dy = y - touchData.lastY;
+        const dt = t - touchData.lastT;
+        // A report that brings no travel (a touchmove after the raw updates
+        // that carried it) says nothing of the speed.
+        if (dt > 0 && (dx !== 0 || dy !== 0)) {
+            const instant = Math.hypot(dx, dy) / dt;
+            touchData.speed = touchData.speed === null ? instant
+                : touchData.speed + (1 - Math.exp(-dt / TRACKPAD_SPEED_TAU_MS)) * (instant - touchData.speed);
+            touchData.lastT = t;
+        }
+        if (performance.now() - this._trackpadHandoffAt >= TRACKPAD_HANDOFF_MS) {
+            const gain = trackpadGain(touchData.speed || 0) * this.trackpadSpeed;
+            const moved = this._relativeToServer(dx * gain, dy * gain);
+            if (moved[0] !== 0 || moved[1] !== 0) {
+                this._sendPointer([ "m2", moved[0], moved[1], this.buttonMask, 0 ], true);
+            }
+        }
+        touchData.lastX = x;
+        touchData.lastY = y;
+    }
+
+    /**
+     * Sets how far the trackpad moves the pointer for a finger's travel, as a
+     * factor on the accelerated gain; the dashboards' setting, persisted by
+     * the core as `trackpad_speed`.
+     * @param {number} speed Clamped to `TRACKPAD_SPEED_MIN`-`TRACKPAD_SPEED_MAX`.
+     */
+    setTrackpadSpeed(speed) {
+        const v = Number(speed);
+        if (!Number.isFinite(v)) return;
+        this.trackpadSpeed = Math.min(TRACKPAD_SPEED_MAX, Math.max(TRACKPAD_SPEED_MIN, v));
+    }
+
+    /** Releases the left button a trackpad tap or tap-drag holds, and any release still pending for it. */
+    _trackpadReleaseButton() {
+        if (this._trackpadReleaseTimer !== null) {
+            clearTimeout(this._trackpadReleaseTimer);
+            this._trackpadReleaseTimer = null;
+        }
+        if (this.buttonMask & 1) {
+            this.buttonMask &= ~1;
+            this._sendPointer([ "m2", 0, 0, this.buttonMask, 0 ], false);
         }
     }
 
@@ -2930,13 +3376,15 @@ export class Input {
      * box; a canvas reports its buffer.
      * @param {HTMLCanvasElement|null} canvas
      * @param {HTMLVideoElement|null} videoEle
+     * @param {boolean} measureCursor Measure even automatic resolution; wait for decoded video dimensions.
      * @returns {{boxLeft: number, boxTop: number, boxW: number, boxH: number, sinkW: number, sinkH: number}|null}
      */
-    _sinkBox(canvas, videoEle) {
-        const sink = ((window.manual_resolution || this.isSharedMode || window.streamResolutionDiverged) && canvas)
+    _sinkBox(canvas, videoEle, measureCursor = false) {
+        const sink = ((measureCursor || window.manual_resolution || this.isSharedMode || window.streamResolutionDiverged) && canvas)
             ? canvas
-            : ((window.manualResolution || window.streamResolutionDiverged) && videoEle) ? videoEle : null;
-        if (!sink) {
+            : ((measureCursor || window.manualResolution || window.streamResolutionDiverged) && videoEle) ? videoEle : null;
+        if (!sink || (measureCursor && sink.tagName === 'VIDEO' &&
+            !(sink.videoWidth > 0 && sink.videoHeight > 0))) {
             return null;
         }
         let rect = sink.getBoundingClientRect();
@@ -3021,13 +3469,14 @@ export class Input {
      * This page's stream box in its own CSS pixels, with the remote pixels per
      * CSS pixel that map into it: the sink box where one applies, else the
      * window math. Both absolute paths are `(client - left) * scale`.
-     * @returns {{left: number, top: number, scaleX: number, scaleY: number}|null}
+     * @returns {{left: number, top: number, width: number, height: number,
+     *     scaleX: number, scaleY: number}|null}
      */
     _streamBox() {
         const box = this._sinkBox(document.getElementById('videoCanvas'),
                                   document.getElementById('stream'));
         if (box) {
-            return { left: box.boxLeft, top: box.boxTop,
+            return { left: box.boxLeft, top: box.boxTop, width: box.boxW, height: box.boxH,
                      scaleX: box.sinkW / box.boxW, scaleY: box.sinkH / box.boxH };
         }
         if (!this.m) {
@@ -3039,6 +3488,7 @@ export class Input {
         const dpr = this._inputDpr();
         return { left: this.m.elementClientX + this.m.mouseOffsetX,
                  top: this.m.elementClientY + this.m.mouseOffsetY,
+                 width: this.m.frameW / this.m.mouseMultiX, height: this.m.frameH / this.m.mouseMultiY,
                  scaleX: this.m.mouseMultiX * dpr, scaleY: this.m.mouseMultiY * dpr };
     }
 
@@ -3298,21 +3748,69 @@ export class Input {
         if (window.manual_resolution || window.manualResolution || this.isSharedMode) {
             return 1;
         }
-        return this._cursorDensity();
+        return this._streamDensity || (this.useCssScaling ? 1 : (window.devicePixelRatio || 1));
     }
 
     /**
-     * Stream pixels per CSS pixel the page draws at: the density the core
-     * set (a secondary streams at the primary's), else the page's own, 1
-     * under CSS scaling. The cursor image arrives in stream pixels and is
-     * shown at that many per CSS pixel.
+     * Stream pixels per CSS pixel in the fitted content box. The requested
+     * density is only a fallback before a sink can be measured: a manual
+     * resolution, a capped stream, or a shared viewer can draw at a different
+     * scale. Cursor pixels and hotspots use that scale; input keeps its own
+     * mapping so this measurement never adds layout work to pointer motion.
      * @returns {number}
      */
     _cursorDensity() {
+        const box = this._sinkBox(document.getElementById('videoCanvas'),
+                                  document.getElementById('stream'), true);
+        if (box) return Math.max(box.sinkW / box.boxW, box.sinkH / box.boxH);
         if (this._streamDensity) {
             return this._streamDensity;
         }
         return this.useCssScaling ? 1 : (window.devicePixelRatio || 1);
+    }
+
+    /** Redraws a cached cursor only when its displayed scale changes. */
+    _refreshCursorScale() {
+        const density = this._cursorDensity();
+        if (density === this._lastCursorDensity) return;
+        this._lastCursorDensity = density;
+        if (!this.inputAttached) return;
+        if (this.use_browser_cursors && !this._trackpadMode) {
+            this._updateBrowserCursor();
+        } else {
+            this._drawAndScaleCursor();
+        }
+    }
+
+    /**
+     * Follows CSS geometry and decoded dimensions even with a stationary
+     * pointer. A canvas buffer can resize without changing its CSS box, and
+     * a video can receive its first frame after its box is already laid out.
+     * Both transports keep their canonical sinks for the input lifetime;
+     * WebSocket mirrors share the canonical canvas style and buffer size.
+     */
+    _watchCursorScale() {
+        if (typeof ResizeObserver !== 'undefined') {
+            this._cursorResizeObserver = new ResizeObserver(() => this._refreshCursorScale());
+            this._cursorResizeObserver.observe(this.element);
+        }
+        if (typeof MutationObserver !== 'undefined') {
+            this._cursorMutationObserver = new MutationObserver(() => this._refreshCursorScale());
+        }
+        this.listeners.push(addListener(window, 'resize', this._refreshCursorScale, this));
+        for (const id of ['stream', 'videoCanvas']) {
+            const sink = document.getElementById(id);
+            if (!sink) continue;
+            if (this._cursorResizeObserver) this._cursorResizeObserver.observe(sink);
+            if (this._cursorMutationObserver) {
+                this._cursorMutationObserver.observe(sink, {
+                    attributes: true, attributeFilter: ['width', 'height', 'style'],
+                });
+            }
+            this.listeners.push(addListener(sink, 'resize', this._refreshCursorScale, this));
+            this.listeners.push(addListener(sink, 'loadedmetadata', this._refreshCursorScale, this));
+        }
+        this._refreshCursorScale();
     }
 
     /**
@@ -3325,8 +3823,7 @@ export class Input {
         if (this._streamDensity === value) return;
         this._streamDensity = value;
         this._windowMath();
-        this._drawAndScaleCursor();
-        this._updateBrowserCursor();
+        this._refreshCursorScale();
     }
 
     /**
@@ -3438,30 +3935,170 @@ export class Input {
 
         console.log(`Input: Trackpad mode ${newMode ? 'enabled' : 'disabled'}.`);
         this._trackpadMode = newMode;
+        if (newMode) {
+            this._startPointerEcho();
+        } else {
+            this._stopPointerEcho();
+        }
 
         this._activeTouches.clear();
         this._activeTouchIdentifier = null;
         this._isTwoFingerGesture = false;
-        this._touchScrollLastCentroid = null;
+        this._twoFinger = null;
 
         if (this._longPressTimer) {
             clearTimeout(this._longPressTimer);
             this._longPressTimer = null;
             this._longPressTouchIdentifier = null;
         }
+        clearTimeout(this._trackpadReleaseTimer);
+        this._trackpadReleaseTimer = null;
+        this._trackpadTouches.clear();
+        this._trackpadGestureMode = null;
 
         if (this.buttonMask !== 0) {
             this.buttonMask = 0;
             this._sendMouseState();
         }
 
-        if (this._trackpadMode || this.use_browser_cursors) {
+        if (this._trackpadMode) {
             this.element.style.setProperty('cursor', 'none', 'important');
             this.element.style.cursor = 'default';
+        } else if (this.use_browser_cursors) {
+            this.cursorDiv.style.display = 'none';
+            this._updateBrowserCursor();
         } else {
             this.element.style.setProperty('cursor', 'none', 'important');
             this.cursorDiv.style.display = 'none';
         }
+    }
+
+    /**
+     * The transport connected again: a trackpad page asks the new connection
+     * for the pointer echo, since the last one's ended with it.
+     */
+    resumePointerEcho() {
+        if (this._trackpadMode) this._startPointerEcho();
+    }
+
+    /**
+     * Asks the server to echo the pointer, which trackpad mode draws the
+     * cursor from (`onPointerEcho`), and has it composited into the video
+     * instead when no echo comes within `POINTER_ECHO_WAIT_MS`. A toggle and a
+     * reconnect in the same task ask once.
+     */
+    _startPointerEcho() {
+        this._echo = null;
+        this._echoDeltas = [];
+        this._placeEchoCursor();
+        if (this._echoAsking) return;
+        this._echoAsking = true;
+        queueMicrotask(() => {
+            this._echoAsking = false;
+            if (!this._trackpadMode) return;
+            this.send('_pointer_echo,1');
+            clearTimeout(this._echoTimer);
+            this._echoTimer = setTimeout(() => {
+                this._echoTimer = null;
+                if (this._trackpadMode && !this._echo) this._compositeCursor();
+            }, POINTER_ECHO_WAIT_MS);
+            if (!this._cursorImageBitmap && this._cursorBase64Data) {
+                this._cursorBitmapFromBase64(this._cursorBase64Data).then((bitmap) => {
+                    if (!this._cursorImageBitmap && this._trackpadMode) {
+                        this._cursorImageBitmap = bitmap;
+                        this._drawAndScaleCursor();
+                    }
+                }, () => {});
+            }
+        });
+    }
+
+    /** Leaves trackpad mode's echo, and the compositing that stood in for it. */
+    _stopPointerEcho() {
+        clearTimeout(this._echoTimer);
+        this._echoTimer = null;
+        this._echo = null;
+        this._echoDeltas = [];
+        this.send('_pointer_echo,0');
+        if (this._echoComposited) {
+            this._echoComposited = false;
+            this.send('SET_NATIVE_CURSOR_RENDERING,0');
+        }
+    }
+
+    /** Has the server composite the cursor, for a session that sends no echo. */
+    _compositeCursor() {
+        this._echoComposited = true;
+        this._echoDeltas = [];
+        this.send('SET_NATIVE_CURSOR_RENDERING,1');
+        this._placeEchoCursor();
+    }
+
+    /**
+     * Takes a pointer echo: the system action
+     * `pointer,<display>,<x>,<y>,<scale>,<seq>`, the position in that
+     * display's server pixels, the physical pixels a relative one moves it
+     * there, and the last pointer message of this page the position includes;
+     * or `pointer,none` from a session that cannot say where its pointer is.
+     * @param {string} action
+     */
+    onPointerEcho(action) {
+        if (!this._trackpadMode) return;
+        const fields = action.split(',');
+        if (fields[1] === 'none') {
+            clearTimeout(this._echoTimer);
+            this._echoTimer = null;
+            this._compositeCursor();
+            return;
+        }
+        const [x, y, scale, seq] = fields.slice(2, 6).map(Number);
+        if (fields.length < 6 || ![x, y, scale, seq].every(Number.isFinite)) return;
+        clearTimeout(this._echoTimer);
+        this._echoTimer = null;
+        if (this._echoComposited) {
+            this._echoComposited = false;
+            this.send('SET_NATIVE_CURSOR_RENDERING,0');
+        }
+        this._echo = { display: fields[1], x, y, scale: scale > 0 ? scale : 1, seq,
+                       maxX: Infinity, maxY: Infinity };
+        this._echoDeltas = this._echoDeltas.filter((delta) => delta[0] > seq);
+        this._placeEchoCursor();
+    }
+
+    /**
+     * One delta past the echo, in the echo's display: scaled as the echo says
+     * and held inside the display after it, as the session holds its pointer
+     * after each move. The server follows the same steps to tell whether an
+     * echo would move the drawn cursor at all (`_PointerEcho` in
+     * input_handler.py).
+     */
+    _echoStep(x, y, dx, dy) {
+        const echo = this._echo;
+        return [Math.min(Math.max(x + dx * echo.scale, 0), echo.maxX),
+                Math.min(Math.max(y + dy * echo.scale, 0), echo.maxY)];
+    }
+
+    /**
+     * Draws trackpad mode's cursor at the last echo moved on by the deltas
+     * sent past it (`_echoStep`), and hides it while no echo has come, while
+     * the echo names another display (whose page draws it), and while the
+     * server composites it.
+     */
+    _placeEchoCursor() {
+        const echo = this._echo;
+        const box = (this._trackpadMode && echo && !this._echoComposited && this.inputAttached &&
+                     this._cursorImageBitmap && echo.display === this.displayId) ? this._streamBox() : null;
+        if (!box || !(box.scaleX > 0) || !(box.scaleY > 0)) {
+            if (this.cursorDiv.style.display !== 'none') this.cursorDiv.style.display = 'none';
+            return;
+        }
+        echo.maxX = Math.max(0, box.width * box.scaleX - 1);
+        echo.maxY = Math.max(0, box.height * box.scaleY - 1);
+        let x = echo.x;
+        let y = echo.y;
+        for (const [, dx, dy] of this._echoDeltas) [x, y] = this._echoStep(x, y, dx, dy);
+        if (this.cursorDiv.style.display !== 'block') this.cursorDiv.style.display = 'block';
+        this._updateCursorPosition(box.left + x / box.scaleX, box.top + y / box.scaleY);
     }
 
     /**
@@ -3502,11 +4139,10 @@ export class Input {
         if (Input.macCmdAsCtrl === want) return;
         Input.macCmdAsCtrl = want;
         console.log(`Input: macOS Command sent as ${want ? 'Control' : 'Super'}.`);
-        if (this._macCmdSwapped) {
-            if ('ControlLeft' in this._keyDownList) {
-                this._sendKeyEvent(this._keyDownList['ControlLeft'], 'ControlLeft', false);
+        for (const command of ['MetaLeft', 'MetaRight']) {
+            if (this._keyDownList[command] === KeyTable.XK_Control_L) {
+                this._sendKeyEvent(KeyTable.XK_Control_L, command, false);
             }
-            this._macCmdSwapped = false;
         }
     }
 
@@ -3519,7 +4155,6 @@ export class Input {
         console.log(`Input: Use browser cursors ${newMode ? 'enabled' : 'disabled'}.`);
         this.use_browser_cursors = newMode;
         if (this._trackpadMode) {
-            this.cursorDiv.style.display = 'none';
             this.element.style.setProperty('cursor', 'none', 'important');
         } else if (this.use_browser_cursors) {
             this.cursorDiv.style.display = 'none';
@@ -3541,7 +4176,8 @@ export class Input {
     /**
      * Direct touch: a tap clicks at the touch point, a drag beyond the tap
      * threshold holds the left button, a long press right-clicks, two fingers
-     * scroll, and a third finger releases everything.
+     * scroll or pinch (`_twoFingerMove`), and a third finger releases
+     * everything.
      */
     _handleTouchEvent(event) {
         if (this._trackpadMode) {
@@ -3621,11 +4257,8 @@ export class Input {
                         this.cursorDiv.style.visibility = 'hidden';
                     }
                     this._isTwoFingerGesture = true; this._activeTouchIdentifier = null;
-                    const touches = Array.from(this._activeTouches.values());
-                    this._touchScrollLastCentroid = {
-                        x: (touches[0].currentX + touches[1].currentX) / 2,
-                        y: (touches[0].currentY + touches[1].currentY) / 2
-                    };
+                    const [a, b] = this._activeTouches.values();
+                    this._twoFingerStart(a.currentX, a.currentY, b.currentX, b.currentY);
                     if ((this.buttonMask & 1) === 1) this.buttonMask &= ~1;
                     preventDefault = true;
                 } else if (touchCount > 2) {
@@ -3655,17 +4288,8 @@ export class Input {
         }
         if (this._isTwoFingerGesture && this._activeTouches.size === 2) {
             preventDefault = true;
-            const touches = Array.from(this._activeTouches.values());
-            const curr_avg_x = (touches[0].currentX + touches[1].currentX) / 2;
-            const curr_avg_y = (touches[0].currentY + touches[1].currentY) / 2;
-            if (this._touchScrollLastCentroid) {
-                const deltaX = curr_avg_x - this._touchScrollLastCentroid.x;
-                const deltaY = curr_avg_y - this._touchScrollLastCentroid.y;
-                const SCROLL_THRESHOLD = 2;
-                if (Math.abs(deltaY) > SCROLL_THRESHOLD) this._triggerMouseWheel(deltaY < 0 ? 'down' : 'up', 1);
-                if (Math.abs(deltaX) > SCROLL_THRESHOLD) this._triggerHorizontalMouseWheel(deltaX < 0 ? 'left' : 'right', 1);
-            }
-            this._touchScrollLastCentroid = { x: curr_avg_x, y: curr_avg_y };
+            const [a, b] = this._activeTouches.values();
+            this._twoFingerMove(a.currentX, a.currentY, b.currentX, b.currentY);
         } else if (this._activeTouches.size === 1) {
             const [singleTouchID] = this._activeTouches.keys();
             const touchData = this._activeTouches.get(singleTouchID);
@@ -3729,11 +4353,11 @@ export class Input {
                         this.cursorDiv.style.visibility = 'visible';
                     }
                     this._isTwoFingerGesture = false;
-                    this._touchScrollLastCentroid = null;
+                    this._twoFinger = null;
                 }
                 if (remainingTouchCount === 0) {
                     this._activeTouchIdentifier = null; this._isTwoFingerGesture = false;
-                    this._touchScrollLastCentroid = null;
+                    this._twoFinger = null;
                     if (this._longPressTimer) { clearTimeout(this._longPressTimer); this._longPressTimer = null; }
                     this._longPressTouchIdentifier = null;
                 }
@@ -3778,6 +4402,110 @@ export class Input {
         if (preventDefault && this.element.contains(event.target)) {
             event.preventDefault();
         }
+    }
+
+    /** Starts a two-finger gesture at two touch points, in client coordinates. */
+    _twoFingerStart(ax, ay, bx, by) {
+        const x = (ax + bx) / 2;
+        const y = (ay + by) / 2;
+        const span = Math.hypot(ax - bx, ay - by);
+        this._twoFinger = { x, y, x0: x, y0: y, span, span0: span,
+                            kind: null, rail: null, accX: 0, accY: 0, zoom: 0 };
+    }
+
+    /**
+     * Moves the two-finger gesture to new touch points. Once the fingers have
+     * moved `TWO_FINGER_SLOP_PX` the gesture is a pinch if their spacing
+     * changed more than their midpoint traveled, and a scroll otherwise, until
+     * they lift.
+     *
+     * A scroll turns the midpoint's travel into wheel notches at
+     * `TOUCH_SCROLL_NOTCH_PX` each, carrying the fraction of a notch forward,
+     * so a slow scroll goes as far as a fast one and neither depends on how
+     * often the digitizer reports. It keeps to an axis it is mostly along
+     * (twice the other), as a touchpad's scroll rails do, so the drift of a
+     * vertical scroll never scrolls sideways; a diagonal one moves both. The
+     * content follows the fingers: up scrolls down, left scrolls right.
+     *
+     * A pinch is Ctrl+wheel (`_sendZoomNotches`), one notch per
+     * `PINCH_NOTCH_RATIO` of change in the spacing, the fraction carried.
+     */
+    _twoFingerMove(ax, ay, bx, by) {
+        const g = this._twoFinger;
+        if (!g) return;
+        const x = (ax + bx) / 2;
+        const y = (ay + by) / 2;
+        const span = Math.hypot(ax - bx, ay - by);
+        if (g.kind === null) {
+            const panX = Math.abs(x - g.x0);
+            const panY = Math.abs(y - g.y0);
+            const pan = Math.hypot(panX, panY);
+            const spread = Math.abs(span - g.span0);
+            if (Math.max(pan, spread) < TWO_FINGER_SLOP_PX) return;
+            if (spread > pan) {
+                g.kind = 'pinch';
+            } else {
+                g.kind = 'scroll';
+                g.rail = panY >= 2 * panX ? 'y' : (panX >= 2 * panY ? 'x' : 'xy');
+            }
+        }
+        if (g.kind === 'pinch') {
+            if (g.span > 0 && span > 0) g.zoom += Math.log(span / g.span) / Math.log(PINCH_NOTCH_RATIO);
+            g.span = span;
+            const notches = Math.trunc(g.zoom);
+            g.zoom -= notches;
+            this._sendZoomNotches(notches);
+            return;
+        }
+        if (g.rail !== 'x') g.accY += g.y - y;
+        if (g.rail !== 'y') g.accX += g.x - x;
+        g.x = x;
+        g.y = y;
+        g.accY = this._drainScrollNotches(g.accY, true);
+        g.accX = this._drainScrollNotches(g.accX, false);
+    }
+
+    /**
+     * Sends the whole notches of a scroll carry, in CSS pixels of finger
+     * travel, and returns the travel left over; positive is down or right.
+     * @param {number} carry
+     * @param {boolean} vertical
+     * @returns {number}
+     */
+    _drainScrollNotches(carry, vertical) {
+        let notches = Math.trunc(carry / TOUCH_SCROLL_NOTCH_PX);
+        if (notches === 0) return carry;
+        const rest = carry - notches * TOUCH_SCROLL_NOTCH_PX;
+        const direction = vertical ? (notches > 0 ? 'down' : 'up') : (notches > 0 ? 'right' : 'left');
+        notches = Math.abs(notches);
+        while (notches > 0) {
+            const burst = Math.min(notches, this._scrollMagnitude);
+            if (vertical) this._triggerMouseWheel(direction, burst);
+            else this._triggerHorizontalMouseWheel(direction, burst);
+            notches -= burst;
+        }
+        return rest;
+    }
+
+    /**
+     * Sends zoom notches the way a desktop application reads a pinch, as
+     * Ctrl+wheel; positive zooms in. Control goes down and up around the
+     * clicks unless the page already holds it, since a pinch comes with no
+     * key of its own.
+     * @param {number} notches
+     */
+    _sendZoomNotches(notches) {
+        if (notches === 0) return;
+        const control = KeyTable.XK_Control_L;
+        const wrap = !this._keysymHeld(control, KeyTable.XK_Control_R);
+        if (wrap) this.send('kd,' + control);
+        let left = Math.abs(notches);
+        while (left > 0) {
+            const burst = Math.min(left, this._scrollMagnitude);
+            this._triggerMouseWheel(notches > 0 ? 'up' : 'down', burst);
+            left -= burst;
+        }
+        if (wrap) this.send('ku,' + control);
     }
 
     /**
@@ -3835,7 +4563,7 @@ export class Input {
         if (vals.length < 2) { return true; }
         var quantum = Math.min.apply(null, vals);
         // A wheel notch is a large pixel jump; small pixel deltas are a trackpad.
-        if (quantum < 80) { return false; }
+        if (quantum < WHEEL_NOTCH_MIN_PX) { return false; }
         for (var i = 0; i < vals.length; i++) {
             var ratio = vals[i] / quantum;
             if (Math.abs(ratio - Math.round(ratio)) > 0.15) { return false; }
@@ -3844,8 +4572,88 @@ export class Input {
     }
 
     /**
+     * Whether a wheel event is one detent of a macOS mouse wheel. macOS
+     * reports a wheel's turn in lines, as 16.16 fixed point, scaled by how
+     * fast it spins: 0.1 of a line for a detent after a pause, up to ten for
+     * one in a spin, and no two alike. Blink and WebKit hand that to the page
+     * as pixels at 40 a line, so a detent is 4.0002 px or 380 and the deltas
+     * share no quantum for `_isDiscreteWheel` to find; what marks one is the
+     * fraction, a touchpad there scrolling in whole pixels at any page zoom.
+     * Gecko hands it over as whole lines, 1 to 10 a detent, and divides a
+     * touchpad's pixels by the page zoom, so a fraction there says nothing.
+     * Under Shift the system turns the wheel sideways and rounds it to whole
+     * lines, which Blink and WebKit report as a sideways multiple of
+     * `MAC_WHEEL_LINE_PX` with no fraction left; a touchpad's scroll is not
+     * turned, so only a sideways stroke of exactly that under Shift reads the
+     * same. Either way each event is one report of the wheel, taken as one
+     * notch whatever distance the system's acceleration gave it, a detent
+     * being a notch everywhere else.
+     * @param {WheelEvent} event
+     * @returns {boolean}
+     */
+    _isDetentWheel(event) {
+        if (!browser.isMacDesktop()) return false;
+        if (event.deltaMode !== 0) return event.deltaMode === 1;
+        if (browser.isFirefox()) return false;
+        if (!(Number.isInteger(event.deltaX) && Number.isInteger(event.deltaY))) return true;
+        return event.shiftKey && event.deltaY === 0 && event.deltaX !== 0 &&
+            event.deltaX % MAC_WHEEL_LINE_PX === 0;
+    }
+
+    /**
+     * A WebKitGTK wheel's notches, signed as the deltas are, or null for any
+     * other event. WebKitGTK reports a notch in pixels, the view's height (its
+     * width, sideways) to the 2/3 power: 54 px in a 400 px tall view, 71 in a
+     * 600 px one, 99 in a 1000 px one, so a short view's notch falls under
+     * `WHEEL_NOTCH_MIN_PX` and reads as a touchpad's. It gives each notch a
+     * legacy `wheelDelta` of 120, against the direction, so the pixels per
+     * 120 are that step, whole as WebKit truncates it, and a fraction of 120
+     * is a fraction of a notch. A touchpad's pixels per 120 are 2.5 (GTK 4
+     * scales its travel by that) or 40 (GTK 3), as a synthetic precise
+     * delta's are 40. Under Shift a notch turns sideways at the height's step.
+     * @param {WheelEvent} event
+     * @returns {{x: number, y: number}|null}
+     */
+    _webKitGtkWheelNotches(event) {
+        if (event.deltaMode !== 0 || !browser.isSafari() || !browser.isLinux()) return null;
+        const steps = [window.innerHeight, window.innerWidth].map((size) => Math.floor(Math.pow(size, 2 / 3)));
+        const axis = (delta, wheelDelta) => {
+            if (!delta && !wheelDelta) return 0;
+            if (!delta || !wheelDelta || Math.sign(delta) === Math.sign(wheelDelta)) return null;
+            const notches = Math.abs(wheelDelta) / LEGACY_WHEEL_DELTA_PER_NOTCH;
+            const perNotch = Math.abs(delta) / notches;
+            return steps.some((step) => step > 0 && Math.abs(perNotch - step) <= 1) ? Math.sign(delta) * notches : null;
+        };
+        const y = axis(event.deltaY, event.wheelDeltaY);
+        const x = axis(event.deltaX, event.wheelDeltaX);
+        if (x === null || y === null || (!x && !y)) return null;
+        return { x, y };
+    }
+
+    /**
+     * Adds notches a wheel reported as such, on both axes, to the fractional
+     * carries, and emits the whole ones.
+     * @param {number} y Signed vertical notches, positive down.
+     * @param {number} x Signed horizontal notches, positive right.
+     */
+    _addWheelNotches(y, x) {
+        if (y) {
+            const direction = (y < 0) ? 'up' : 'down';
+            if (direction !== this._wheelDirY) { this._wheelAccumY = 0; this._wheelDirY = direction; }
+            this._wheelAccumY += Math.abs(y);
+            this._emitWheelY();
+        }
+        if (x) {
+            const direction = (x < 0) ? 'left' : 'right';
+            if (direction !== this._wheelDirX) { this._wheelAccumX = 0; this._wheelDirX = direction; }
+            this._wheelAccumX += Math.abs(x);
+            this._emitWheelX();
+        }
+    }
+
+    /**
      * Forgets everything learned about the current scroll device: notch
-     * quantums, classification samples and fractional-notch carries. Called
+     * quantums, classification samples, and fractional-notch carries. Called
      * after a wheel-idle gap, since the learned state only holds for the
      * device that produced it; afterwards behavior matches a fresh page load.
      */
@@ -3853,22 +4661,27 @@ export class Input {
         this._smallestDeltaY = 10000;
         this._smallestLineDeltaY = 10000;
         this._allowThreshold = true;
+        this._wheelClassified = false;
         while (!this._queue.isEmpty()) { this._queue.dequeue(); }
         this._wheelAccumY = 0;
         this._wheelDirY = null;
         this._wheelAccumX = 0;
         this._wheelDirX = null;
+        this._pinchCarry = 0;
     }
 
     /**
      * Wheel handler: ends the scroll session after an idle second, samples
-     * pixel deltas for the device classifier, and routes a trackpad through
-     * the smoothing throttle and a discrete wheel straight to emission. Line
-     * and page mode bypass the classifier, being always a discrete wheel
-     * (trackpads report pixels). The throttle rate-limits emission but drops
-     * no delta: throttled ticks accumulate and flush at the window end. A
-     * discrete wheel emits per event, so a fast spin never collapses to the
-     * throttle rate.
+     * pixel deltas for the device classifier, and emits every event's whole
+     * notches as they accumulate, a trackpad's at its fixed notch size and a
+     * discrete wheel's at its learned one. Line and page mode bypass the
+     * classifier, being always a discrete wheel (trackpads report pixels).
+     *
+     * A wheel event reporting a Control no held key accounts for is a
+     * touchpad pinch, which the engines deliver as Ctrl+wheel, and goes to
+     * `_pinchWheel` instead. A macOS wheel's detent bypasses the classifier
+     * too, as one notch (`_isDetentWheel`), and so do a WebKitGTK wheel's
+     * notches, as many as it reports (`_webKitGtkWheelNotches`).
      */
     _mouseWheelWrapper(event) {
         // One idle second is longer than any intra-gesture gap (momentum
@@ -3878,6 +4691,23 @@ export class Input {
             this._resetWheelLearning();
         }
         this._lastWheelEventTs = nowTs;
+        if (event.ctrlKey && !this._keysymHeld(KeyTable.XK_Control_L, KeyTable.XK_Control_R)) {
+            this._pinchWheel(event);
+            event.preventDefault();
+            return;
+        }
+        if (this._isDetentWheel(event)) {
+            if (event.deltaY !== 0) this._triggerMouseWheel(event.deltaY < 0 ? 'up' : 'down', 1);
+            if (event.deltaX !== 0) this._triggerHorizontalMouseWheel(event.deltaX < 0 ? 'left' : 'right', 1);
+            event.preventDefault();
+            return;
+        }
+        const notches = this._webKitGtkWheelNotches(event);
+        if (notches) {
+            this._addWheelNotches(notches.y, notches.x);
+            event.preventDefault();
+            return;
+        }
         if (event.deltaMode !== 0) {
             this._mouseWheel(event);
             event.preventDefault();
@@ -3887,30 +4717,16 @@ export class Input {
         if (deltaY !== 0 && this._queue.size() < 4) { this._queue.enqueue(deltaY); }
         if (this._queue.size() == 4) {
             this._allowThreshold = !this._isDiscreteWheel();
+            this._wheelClassified = true;
         }
-        if (this._allowThreshold) {
-            if (this._allowTrackpadScrolling) {
-                this._allowTrackpadScrolling = false;
-                this._mouseWheel(event);
-                setTimeout(() => {
-                    this._allowTrackpadScrolling = true;
-                    this._emitWheelY();
-                    this._emitWheelX();
-                }, this._wheelThreshold);
-            } else {
-                this._accumulateWheelY(event);
-                this._accumulateWheelX(event);
-            }
-        } else {
-            this._mouseWheel(event);
-        }
+        this._mouseWheel(event);
         event.preventDefault();
     }
 
     /**
      * Normalizes a vertical wheel delta to a fractional count of notches,
      * learning the per-notch quantum per delta mode (the smallest observed
-     * jump) so mice, high-resolution mice and line-mode wheels all resolve to
+     * jump) so mice, high-resolution mice, and line-mode wheels all resolve to
      * about one notch per detent. Trackpad pixel deltas measure pan distance,
      * not notches, so they take a fixed 100px notch like the horizontal axis
      * (the learned quantum would be the gesture's tiniest ramp-up sample);
@@ -3999,8 +4815,88 @@ export class Input {
         }
     }
 
-    /** Accumulates and emits both axes of one wheel event. */
+    /**
+     * A touchpad pinch, as Ctrl+wheel: Chromium reports each step as a pixel
+     * `deltaY` of -100 ln(scale), taken at one notch per `PINCH_NOTCH_RATIO`
+     * of scale with the fraction carried. A line or page delta, or a pixel
+     * one past `PINCH_STEP_MAX_PX`, is a wheel turned under a Control the page
+     * never saw go down, and zooms by the notches it scrolls.
+     * @param {WheelEvent} event
+     */
+    _pinchWheel(event) {
+        let notches;
+        if (event.deltaMode === 0 && Math.abs(event.deltaY) < PINCH_STEP_MAX_PX) {
+            this._pinchCarry += -event.deltaY / (100 * Math.log(PINCH_NOTCH_RATIO));
+            notches = Math.trunc(this._pinchCarry);
+            this._pinchCarry -= notches;
+        } else {
+            const magnitude = this._wheelNotches(event.deltaY, event.deltaMode);
+            notches = -Math.sign(event.deltaY) * Math.max(1, Math.round(magnitude));
+        }
+        this._sendZoomNotches(notches);
+    }
+
+    /**
+     * Sets whether the session takes a touchpad's scroll as a finger's: the
+     * display config's `finger_scroll`, a Wayland session's. There a wheel
+     * classified as a touchpad sends its travel instead of notches
+     * (`_isFingerScroll`); a wheel's notches, line and page deltas, and X11
+     * stay as they are.
+     * @param {boolean} enabled
+     */
+    setFingerScroll(enabled) {
+        const want = !!enabled;
+        if (this.fingerScroll === want) return;
+        if (!want) this._endFingerScroll();
+        this.fingerScroll = want;
+    }
+
+    /**
+     * Sends a touchpad's scroll as the finger's travel in stream pixels,
+     * `sf,<dx>,<dy>`, and `sfe` once no wheel event has come for
+     * `FINGER_SCROLL_END_MS`, the axis stop a finger's scroll ends with.
+     * @param {WheelEvent} event
+     */
+    _fingerScroll(event) {
+        const scale = this._pointerScale();
+        const dx = event.deltaX * scale.x;
+        const dy = event.deltaY * scale.y;
+        if (dx === 0 && dy === 0) return;
+        this.send(`sf,${dx.toFixed(2)},${dy.toFixed(2)}`);
+        clearTimeout(this._fingerScrollTimer);
+        this._fingerScrollTimer = setTimeout(() => this._endFingerScroll(), FINGER_SCROLL_END_MS);
+    }
+
+    /** Ends a touchpad's scroll still going, if one is. */
+    _endFingerScroll() {
+        if (this._fingerScrollTimer === null) return;
+        clearTimeout(this._fingerScrollTimer);
+        this._fingerScrollTimer = null;
+        this.send('sfe');
+    }
+
+    /**
+     * Whether a wheel event goes out as a finger's: pixel deltas, on a session
+     * that takes one, from a device the detector calls a touchpad or, before
+     * it has its samples, smaller than a notch's, so a wheel's first notches
+     * stay notches. A stroke under way stays one until it pauses, whatever its
+     * momentum reports.
+     * @param {WheelEvent} event
+     * @returns {boolean}
+     */
+    _isFingerScroll(event) {
+        if (!this.fingerScroll || event.deltaMode !== 0) return false;
+        if (this._fingerScrollTimer !== null) return true;
+        if (this._wheelClassified) return this._allowThreshold;
+        return Math.abs(event.deltaX) < WHEEL_NOTCH_MIN_PX && Math.abs(event.deltaY) < WHEEL_NOTCH_MIN_PX;
+    }
+
+    /** Accumulates and emits both axes of one wheel event, or sends a touchpad's as a finger's. */
     _mouseWheel(event) {
+        if (this._isFingerScroll(event)) {
+            this._fingerScroll(event);
+            return;
+        }
         this._accumulateWheelY(event);
         this._emitWheelY();
         this._accumulateWheelX(event);
@@ -4103,7 +4999,7 @@ export class Input {
      * @returns {string} Base64 of the Latin-1-safe name.
      */
     _encodeGamepadId(id) {
-        const safeId = String(id || 'Gamepad').replace(/[^\x00-\xFF]/g, '?');
+        const safeId = String(id || 'Gamepad').replace(/[\u0100-\uffff]/g, '?');
         try {
             return btoa(safeId);
         } catch (e) {
@@ -4112,52 +5008,129 @@ export class Input {
     }
 
     /**
-     * Announces a pad (`js,c`) on this client's slot and creates the shared
-     * manager. A negative slot (a controller slot of 0) is refused, as the
-     * button and axis sends refuse it, so no phantom slot is created. The
-     * axis and button counts are advisory: the server presents a fixed Xbox
-     * pad, and Firefox's non-standard axis layout is normalized on the way.
+     * The zero-based server slot the pad at `position` among this client's
+     * drives: its controller slot there, else (position 0, no slot assigned)
+     * its player index; null where it holds no such slot, which every gamepad
+     * send refuses, so no phantom slot is created.
+     * @param {number} [position=0]
+     * @returns {number|null}
      */
+    _gamepadIndex(position = 0) {
+        const slots = this.controllerSlots;
+        const index = slots ? slots[position] - 1 : (position === 0 ? this.playerIndex : null);
+        return (Number.isInteger(index) && index >= 0) ? index : null;
+    }
+
+    /**
+     * The zero-based server slot browser pad `gp_num` drives, or null.
+     * @param {number} gp_num
+     * @returns {number|null}
+     */
+    _gamepadIndexOf(gp_num) {
+        const position = this.gamepadManager ? this.gamepadManager.drivenPosition(gp_num) : 0;
+        return position < 0 ? null : this._gamepadIndex(position);
+    }
+
+    /** Creates the shared manager on the first pad; which pads drive the slots is its call (`_gamepadActive`). */
     _gamepadConnected(event) {
-        const server_gp_index = (this.controllerSlot !== null) ? this.controllerSlot - 1 : this.playerIndex;
-        if (!Number.isInteger(server_gp_index) || server_gp_index < 0) return;
+        if (this._gamepadIndex() === null) return;
         if (!this.gamepadManager) {
-            this.gamepadManager = new GamepadManager(event.gamepad, this._gamepadButton.bind(this), this._gamepadAxis.bind(this), this._gamepadHeartbeat.bind(this));
+            this.gamepadManager = new GamepadManager(event.gamepad, this._gamepadButton.bind(this), this._gamepadAxis.bind(this),
+                this._gamepadHeartbeat.bind(this), this._gamepadActive.bind(this));
+            this.gamepadManager.setSlotCount(this.controllerSlots ? this.controllerSlots.length : 1);
+            this.gamepadManager.setRumbleEnabled(this.gamepadRumble);
         }
-        const connectMsg = "js,c," + server_gp_index + "," + this._encodeGamepadId(event.gamepad.id) + "," + event.gamepad.axes.length + "," + event.gamepad.buttons.length;
-        this.send(connectMsg);
         if (this.ongamepadconnected !== null) { this.ongamepadconnected(event.gamepad.id); }
     }
 
-    /** Announces a pad's disconnection (`js,d`). */
+    /**
+     * Announces the pad that now drives the slot at `position` (`js,c`). The
+     * slot drops what it held (`js,d`) first when another pad drove it, when
+     * none drives it any more, or when the slot itself moved. The axis and
+     * button counts are advisory: the server presents a fixed Xbox pad, and
+     * Firefox's non-standard axis layout is normalized on the way.
+     * @param {Gamepad|null} gamepad
+     * @param {boolean} switched
+     * @param {number} [position=0]
+     */
+    _gamepadActive(gamepad, switched, position = 0) {
+        const index = this._gamepadIndex(position);
+        const announced = this._gamepadAnnounced[position];
+        delete this._gamepadAnnounced[position];
+        if (announced !== undefined && (switched || !gamepad || announced !== index)) {
+            this.send("js,d," + announced);
+        }
+        if (!gamepad || index === null) return;
+        this.send("js,c," + index + "," + this._encodeGamepadId(gamepad.id) + "," + gamepad.axes.length + "," + gamepad.buttons.length);
+        this._gamepadAnnounced[position] = index;
+    }
+
+    /** A pad gone: the slot is released only if that pad drove it. */
     _gamepadDisconnect(event) {
-         if (this.ongamepaddisconnected !== null) { this.ongamepaddisconnected(); }
-         const server_gp_index = (this.controllerSlot !== null) ? this.controllerSlot - 1 : this.playerIndex;
-         if (!Number.isInteger(server_gp_index) || server_gp_index < 0) return;
-         this.send("js,d," + server_gp_index);
+        if (this.ongamepaddisconnected !== null) { this.ongamepaddisconnected(); }
+        if (this.gamepadManager && event && event.gamepad) this.gamepadManager.padGone(event.gamepad.index);
     }
 
     /** Sends a button change (`js,b`) and mirrors it to the dashboard while the sidebar is open. */
     _gamepadButton(gp_num, btn_num, val) {
-        const server_gp_index = (this.controllerSlot !== null) ? this.controllerSlot - 1 : this.playerIndex;
-        if (!Number.isInteger(server_gp_index) || server_gp_index < 0) return;
+        const server_gp_index = this._gamepadIndexOf(gp_num);
+        if (server_gp_index === null) return;
         this.send("js,b," + server_gp_index + "," + btn_num + "," + val);
         if (this._isSidebarOpen) {
             window.postMessage({ type: 'gamepadButtonUpdate', gamepadIndex: server_gp_index, buttonIndex: btn_num, value: val }, window.location.origin);
         }
     }
 
-    /** Sends the held-pad heartbeat (`js,h`). */
+    /**
+     * Plays the rumble the server relays for a pad slot, on this client's
+     * pads when the slot is the one they drive (`GamepadManager.rumble`); a
+     * client holding several slots plays it on the pad driving that one.
+     * @param {number} slot Zero-based server slot.
+     * @param {number} strong Strong motor level, 0 to 1.
+     * @param {number} weak Weak motor level, 0 to 1.
+     * @param {number} durationMs How long to hold it.
+     */
+    rumble(slot, strong, weak, durationMs) {
+        if (!this.gamepadManager) return;
+        const slots = this.controllerSlots;
+        if (slots && slots.length > 1) {
+            const pad = this.gamepadManager.drivers[slots.indexOf(slot + 1)];
+            if (pad !== undefined && pad !== null) this.gamepadManager.rumble(strong, weak, durationMs, pad);
+            return;
+        }
+        if (slot !== this._gamepadIndex()) return;
+        this.gamepadManager.rumble(strong, weak, durationMs);
+    }
+
+    /**
+     * Turns rumble on this client's pads on or off (the dashboards' toggle,
+     * persisted by the core as `gamepad_rumble`); off stops one playing.
+     * @param {boolean} on
+     */
+    setGamepadRumble(on) {
+        this.gamepadRumble = !!on;
+        if (this.gamepadManager) this.gamepadManager.setRumbleEnabled(this.gamepadRumble);
+    }
+
+    /** Stops a rumble playing on this client's pads: its connection is gone. */
+    stopRumble() {
+        if (this.gamepadManager) this.gamepadManager.stopRumble();
+    }
+
+    /** Sends the held-pad heartbeat (`js,h`) on each slot a pad drives, the first outside a token that names several. */
     _gamepadHeartbeat() {
-        const server_gp_index = (this.controllerSlot !== null) ? this.controllerSlot - 1 : this.playerIndex;
-        if (!Number.isInteger(server_gp_index) || server_gp_index < 0) return;
-        this.send("js,h," + server_gp_index);
+        const positions = this.gamepadManager ? this.gamepadManager.drivers.length : 1;
+        for (let position = 0; position < positions; position++) {
+            if (position > 0 && this.gamepadManager.drivers[position] === null) continue;
+            const server_gp_index = this._gamepadIndex(position);
+            if (server_gp_index !== null) this.send("js,h," + server_gp_index);
+        }
     }
 
     /** Sends an axis change (`js,a`); Firefox's non-standard layout reports the triggers on axes 4 and 5, sent as buttons 6 and 7. */
     _gamepadAxis(gp_num, axis_num, val) {
-        const server_gp_index = (this.controllerSlot !== null) ? this.controllerSlot - 1 : this.playerIndex;
-        if (!Number.isInteger(server_gp_index) || server_gp_index < 0) return;
+        const server_gp_index = this._gamepadIndexOf(gp_num);
+        if (server_gp_index === null) return;
         if (navigator.userAgent.toLowerCase().includes('firefox')) {
             if (axis_num === 4) {
                 const buttonVal = (val + 1.0) / 2.0;
@@ -4231,14 +5204,23 @@ export class Input {
      * input authority was handed away -- must not capture the pointer for
      * motion nothing would receive. Chrome rejects a request made while the
      * fullscreen transition is still settling (WrongDocumentError), so it
-     * retries over a few short intervals.
+     * retries over a few short intervals. Gecko grants one then, and measures
+     * the first locked movement from where its transition had yet to place the
+     * viewport, so the request waits a frame at a time until the viewport sits
+     * where fullscreen puts it (`_viewportSettled`).
+     * @param {number} [attempt] Refused requests so far.
+     * @param {number} [frames] Frames waited so far for the viewport.
      */
-    _armPointerLock(attempt = 0) {
+    _armPointerLock(attempt = 0, frames = 0) {
         if (!this.inputAttached || !this.gamingMode || !this._isStreamFullscreen()) return;
         if (this._isStreamLocked()) return;
-        this._requestPointerLock(this.element, () => this._armPointerLock(attempt), (err) => {
+        if (frames < LOCK_SETTLE_FRAMES && !Input._viewportSettled()) {
+            requestAnimationFrame(() => this._armPointerLock(attempt, frames + 1));
+            return;
+        }
+        this._requestPointerLock(this.element, () => this._armPointerLock(attempt, frames), (err) => {
             if (attempt < 5) {
-                setTimeout(() => this._armPointerLock(attempt + 1), 60);
+                setTimeout(() => this._armPointerLock(attempt + 1, frames), 60);
             } else {
                 console.warn("Pointer lock failed on fullscreen:", err);
             }
@@ -4258,6 +5240,7 @@ export class Input {
                 this.requestKeyboardLock();
             }
         } else {
+            this._fullscreenKeyboardLock = false;
             this._setGamingMode(false);
             if (this._isStreamLocked()) document.exitPointerLock();
         }
@@ -4316,11 +5299,13 @@ export class Input {
             try { Input._attachedInstance.detach(); } catch (e) { /* already torn down */ }
         }
         Input._attachedInstance = this;
+        this._watchCursorScale();
         this._focusCompositionHost();
         this.listeners.push(addListener(this.element, 'resize', this._windowMath, this));
         this.listeners.push(addListener(document, 'pointerlockchange', this._pointerLock, this));
         this.listeners.push(addListener(document, 'fullscreenchange', this._onFullscreenChange, this));
         this.listeners.push(addListener(window, 'resize', this._windowMath, this));
+        this.listeners.push(addListener(window, 'resize', this._placeEchoCursor, this));
         this.listeners.push(addListener(window, 'gamepadconnected', this._gamepadConnected, this));
         this.listeners.push(addListener(window, 'gamepaddisconnected', this._gamepadDisconnect, this));
         this.listeners.push(addListener(window, 'message', this._handleVisibilityMessage, this));
@@ -4345,7 +5330,7 @@ export class Input {
         this.resyncGamepads();
     }
 
-    /** Attaches the keyboard, pointer, touch, wheel and composition listeners and shows the cursor. */
+    /** Attaches the keyboard, pointer, touch, wheel, and composition listeners and shows the cursor. */
     attach_context() {
         if (this.inputAttached) return;
         this._windowMath();
@@ -4393,6 +5378,9 @@ export class Input {
             this.listeners_context.push(addListener(this.element, 'touchcancel', this._handleTouchEvent, this, false));
         }
         this.listeners_context.push(addListener(this.element, 'mousedown', this._mouseButtonMovement, this));
+        if ('onpointerrawupdate' in window) {
+            this.listeners_context.push(addListener(window, 'pointerrawupdate', this._handleRawPointerUpdate, this));
+        }
         this.listeners_context.push(addListener(window, 'mousemove', this._mouseButtonMovement, this));
         this.listeners_context.push(addListener(window, 'mouseup', this._mouseButtonMovement, this));
         // Set before the locks below, which take it as the grant to hold the pointer.
@@ -4405,6 +5393,7 @@ export class Input {
              this._pointerLock();
         }
         this._windowMath();
+        this._placeEchoCursor();
     }
 
     /**
@@ -4415,7 +5404,13 @@ export class Input {
      * dropped, leaving the server no association to release when the peer goes.
      */
     resyncGamepads() {
-        let pads = [];
+        if (this.gamepadManager) {
+            // The association was the dead channel's, and the server released it.
+            this._gamepadAnnounced = {};
+            this.gamepadManager.reannounce();
+            return;
+        }
+        let pads;
         try {
             pads = navigator.getGamepads ? Array.from(navigator.getGamepads()) : [];
         } catch (e) {
@@ -4423,8 +5418,8 @@ export class Input {
         }
         for (const pad of pads) {
             if (pad && pad.connected) {
+                // One manager polls all pads and announces the one that drives the slot.
                 this._gamepadConnected({ gamepad: pad });
-                // One manager polls all pads; the connect message is per-slot.
                 break;
             }
         }
@@ -4435,12 +5430,16 @@ export class Input {
         if (Input._attachedInstance === this) {
             Input._attachedInstance = null;
         }
+        if (this._cursorResizeObserver) this._cursorResizeObserver.disconnect();
+        if (this._cursorMutationObserver) this._cursorMutationObserver.disconnect();
+        this._lastCursorDensity = null;
         removeListeners(this.listeners);
         this.listeners = [];
         if (this.gamepadManager) {
             this.gamepadManager.destroy();
             this.gamepadManager = null;
         }
+        this._gamepadAnnounced = {};
         this._watchScreenGeometry(false);
         this.detach_context();
     }
@@ -4457,8 +5456,14 @@ export class Input {
         this._activeTouches.clear();
         this._activeTouchIdentifier = null;
         this._isTwoFingerGesture = false;
+        clearTimeout(this._trackpadReleaseTimer);
+        this._trackpadReleaseTimer = null;
+        this._trackpadTouches.clear();
+        this._trackpadGestureMode = null;
         // A queued move must not send after detach; the scheduled flush then no-ops.
         this._pendingMove = null;
+        this._rawMotionSeen = false;
+        this._endFingerScroll();
         this._relCarryX = 0;
         this._relCarryY = 0;
         if ((this.buttonMask & 1) === 1) {
@@ -4511,7 +5516,7 @@ export class Input {
 
     /**
      * Enters gaming mode: fullscreen that also holds the pointer and the
-     * keyboard, so a game sees Escape, Alt+Tab and raw motion instead of the
+     * keyboard, so a game sees Escape, Alt+Tab, and raw motion instead of the
      * browser. A locked keyboard delivers a short Escape to the session, so
      * holding it is what leaves this mode.
      *
@@ -4519,12 +5524,17 @@ export class Input {
      * fullscreenchange handler arms both once fullscreen lands, still inside
      * the gesture's transient-activation window. A refused request takes the
      * mode back down with it: left set, the next transition from any source
-     * would arm the locks.
+     * would arm the locks. From a fullscreen the page holds already, an engine
+     * without the Keyboard Lock API asks for the same element again with the
+     * gaming options: by the Fullscreen spec that sets the element's keyboard
+     * lock with no transition (Firefox 156 holds Escape after it); it comes
+     * after the pointer lock request, since a fullscreen request consumes the
+     * gesture's transient activation.
      */
     enterGamingMode() {
         this._setGamingMode(true);
         if (document.fullscreenElement === null) {
-            document.documentElement.requestFullscreen()
+            document.documentElement.requestFullscreen(this._gamingFullscreenOptions())
                 .catch(err => {
                     console.error("Fullscreen request failed:", err);
                     this._setGamingMode(false);
@@ -4532,7 +5542,33 @@ export class Input {
             return;
         }
         this._armPointerLock();
+        if (!(navigator.keyboard && 'lock' in navigator.keyboard)) {
+            document.fullscreenElement.requestFullscreen(this._gamingFullscreenOptions())
+                .catch(() => {
+                    this._fullscreenKeyboardLock = false;
+                    this.requestKeyboardLock();
+                });
+        }
         this.requestKeyboardLock();
+    }
+
+    /**
+     * The fullscreen options gaming mode asks with: `keyboardLock: "browser"`
+     * has the browser itself hold Escape and its own shortcuts for as long as
+     * the fullscreen lasts, where the engine takes the member (Firefox 156,
+     * Safari 26.4). An engine reads only the members it knows, so the getter
+     * records whether this one did (`_fullscreenKeyboardLock`).
+     * @returns {object} Options for `requestFullscreen`.
+     */
+    _gamingFullscreenOptions() {
+        this._fullscreenKeyboardLock = false;
+        const input = this;
+        return {
+            get keyboardLock() {
+                input._fullscreenKeyboardLock = true;
+                return 'browser';
+            },
+        };
     }
 
     /** Publishes the mode to `ongamingmode`, releasing the keyboard as it ends. */
@@ -4547,14 +5583,21 @@ export class Input {
         }
     }
 
-    /** Locks the system keys the browser would otherwise intercept, for gaming mode alone, where the Keyboard Lock API exists. */
+    /**
+     * Locks every key the browser or the system would otherwise take, its own
+     * shortcuts (Ctrl+W, Ctrl+T) among them, for gaming mode alone: through the
+     * Keyboard Lock API where it exists, else by the fullscreen request's own
+     * `keyboardLock` where the engine took it (`_gamingFullscreenOptions`),
+     * which holds the same keys. Only where neither holds the keys does the
+     * user hear that one Escape leaves the mode.
+     */
     requestKeyboardLock() {
         if (!this.gamingMode || !document.fullscreenElement) return;
         if (navigator.keyboard && 'lock' in navigator.keyboard) {
-            const keys = [ "AltLeft", "AltRight", "Tab", "Escape", "MetaLeft", "MetaRight", "ContextMenu" ];
-            navigator.keyboard.lock(keys).catch(() => {});
+            navigator.keyboard.lock().catch(() => {});
             return;
         }
+        if (this._fullscreenKeyboardLock) return;
         this._noticeKeyboardLockUnavailable();
     }
 

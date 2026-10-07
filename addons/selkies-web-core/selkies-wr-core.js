@@ -45,7 +45,8 @@
  * cursor and display-config updates, stats, and system actions (`reload`,
  * `mk_access,0|1`, `command_error,text`, `auth_success,{json}` /
  * `role_update,{json}`, `resolution,WxH`, `video_declined,mime`,
- * `capture_demand,<subject>,0|1`).
+ * `capture_demand,<subject>,0|1`, and the `pointer,` echo trackpad mode asks
+ * for with `_pointer_echo,0|1`, lib/input.js).
  *
  * The page hash selects the role: none is the controller, `#shared` a strict
  * viewer, `#playerN` a viewer with gamepad slot N, and `#display2-<position>`
@@ -55,22 +56,27 @@
  * runs one pipeline per display, and the position rides the connect metadata.
  *
  * Contract with the dashboards. Globals published on `window`: `selkiesLogs`
- * (capped log ring buffers), `fps`, `stream_info`, `stream_client` and
+ * (capped log ring buffers), `fps`, `displayRefreshRate` (the display's
+ * measured refresh, lib/display-refresh.js; null until measured),
+ * `stream_info`, `stream_client`, and
  * `stream_stats` (lib/stream-stats.js), `currentAudioBufferSize`, `manualResolution`,
  * `enable_resize`, `streamResolutionDiverged`, `webrtcInput`, and every server
  * setting as `window[key]`. Window messages handled (same origin):
  * `setScaleLocally`, `resetResolutionToWindow`, `setManualResolution`,
  * `setUseCssScaling`, `settings`, `command`, `pipelineControl`,
  * `gamepadControl`, `clipboardUpdateFromUI`, `clipboardImageUpdate`,
- * `audioDeviceSelected`, `requestFullscreen`, `setSynth`,
+ * `clipboardCopySecret`, `audioDeviceSelected`, `requestFullscreen`, `setSynth`,
  * `showVirtualKeyboard`, `setAntiAliasing`, `setUseBrowserCursors`, `setRawPointerMotion`,
- * `touchinput:trackpad`, `touchinput:touch`, `statsOpen`, plus the `requestFileUpload` DOM
+ * `setTrackpadSpeed`, `setGamepadRumble`, `touchinput:trackpad`, `touchinput:touch`, `statsOpen`, plus the `requestFileUpload` DOM
  * event. Window messages posted: `sidebarButtonStatusUpdate`,
  * `pipelineStatusUpdate`, `effectiveCursorState`, `scalingDpiFollowed`,
  * `serverSettings`, `clipboardContentUpdate`, `fileUpload` warnings, `trackpadModeUpdate`,
- * `clientRoleUpdate`, `toggleDashboard`, `toggleTouchGamepad`. Flags read:
- * `window.__selkiesModeSwitching` (a mode switch in progress suppresses
- * alerts and recovery reloads), `window.__selkiesAuthProbe` (re-presents the
+ * `clientRoleUpdate`, `displayRefresh` (the same refresh), `toggleDashboard`,
+ * `toggleTouchGamepad`, `transportAdvice`. The frame rate asked for follows the display's refresh
+ * where the stored choice is `display` or where there is none
+ * (`requestedStreamFramerate`). Flags read:
+ * `window.__selkiesModeSwitching` (a mode switch in progress suppresses the
+ * recovery reconnects), `window.__selkiesAuthProbe` (re-presents the
  * login after an auth drop), `window.clipboard_enabled`.
  * @module
  */
@@ -79,18 +85,22 @@ import { WebRTCClient } from "./lib/webrtc";
 import { WebRTCSignaling } from "./lib/signaling";
 import { Input } from "./lib/input";
 import { streamDensity as streamDensityOf, autoScalingDpi, resolutionScalingDpi, publishedScale } from "./lib/stream-density.js";
-import { createClipboardSync, createClipboardGestures, createDeferredClipboardWriter, createLocalClipboardSender, createMultipartClipboardState, createTaggedClipboardFetch, clipboardPreviewMessage, reencodeBlobAsPng, localClipboardBlocker, writeImageToLocalClipboard, clipboardItemForFlavours, unpackClipboardFlavours, CLIPBOARD_FLAVOURS_MIME, digestedPayload } from "./lib/clipboard-sync.js";
+import { createClipboardSync, createClipboardGestures, createDeferredClipboardWriter, createIncomingClipboard, createLocalClipboardSender, createTaggedClipboardFetch, clipboardPreviewMessage, reencodeBlobAsPng, localClipboardBlocker, digestedPayload } from "./lib/clipboard-sync.js";
 import { createFileUploader } from "./lib/file-upload.js";
 import { ClipboardWorkerBridge, sendClipboardChunked } from './lib/clipboard-worker-bridge.js'
 import { detectKeyboardLayout } from './lib/keyboard-layout.js';
 import { installAuthGuard } from './lib/auth-guard.js';
-import { installSessionCookie, sessionAuthHeaders } from './lib/session-token.js';
+import { getSessionToken, installSessionCookie, sessionAuthHeaders } from './lib/session-token.js';
+import { urlFragmentKeyword } from './lib/page-url.js';
 import { storageKeyForServerKey, resolveSpec, HIDPI_SPEC, RAW_POINTER_MOTION_SPEC, MAC_CMD_AS_CTRL_SPEC } from './lib/conditional-settings.js';
-import { getRoutePrefix, getStorageAppName, canDecodeFullColor, canReceiveEncoder, isCaptureRefusal, isMacDesktop, displayLabel } from './lib/util.js';
-import { codecOfEncoder, codecCarriesFullColor } from './lib/wire-codecs.js';
+import { getRoutePrefix, getStorageAppName, canDecodeFullColor, canDecodeTenBit, tenBitFormat, canReceiveEncoder, isCaptureRefusal, isMacDesktop, displayLabel, entryPageTag, serverAnswers, rememberCcStart, forgetCcStart } from './lib/util.js';
+import { codecOfEncoder, codecCarriesFullColor, codecCarriesTenBit } from './lib/wire-codecs.js';
 import { WEBCAM_ENCODER_PREFERENCES } from './lib/webcam-capture.js';
 import { createPrintJobs, printDocument } from './lib/print-jobs.js';
-import { StreamStats, webrtcDecoder } from './lib/stream-stats.js';
+import { StreamStats, DecodeCapability, webrtcDecoder, FIRST_SAMPLE_MS } from './lib/stream-stats.js';
+import { createPresentMeter, watchVideo } from './lib/present-meter.js';
+import { FRAMERATE_DISPLAY, requestedFramerate, watchDisplayRefresh } from './lib/display-refresh.js';
+import { DISPLAY_SETTINGS, holdDisplaySettings, releaseHeldSettings, restoreHeldPicks } from './lib/held-settings.js';
 
 installAuthGuard();
 installSessionCookie();
@@ -119,7 +129,7 @@ let __clipboardTransferCounter = 0;
 /** The server's `command_enabled`; true until a server advertises otherwise. */
 let serverCommandEnabled = true;
 
-/** Injects the stylesheet for the video container, overlay and status bar. */
+/** Injects the stylesheet for the video container, overlay, and status bar. */
 function InitUI() {
 	let style = document.createElement('style');
 	style.textContent = `
@@ -226,15 +236,21 @@ function InitUI() {
 /**
  * Builds the WebRTC core.
  * @returns {{initialize: () => void, cleanup: () => void}} `initialize`
- *     builds the DOM, connects signaling and opens the peer connection;
+ *     builds the DOM, connects signaling, and opens the peer connection;
  *     `cleanup` tears the session down and resets every session-scoped value.
  */
 export default function webrtc() {
 	let appName;
-	let crf = 23;
+	let crf = 25;
 	/** Video bitrate in kbps. */
 	let videoBitRate = 8000;
 	let videoFramerate = 60;
+	/** The server's framerate setting (`min`, `max`, `default`, `overridden`), once its settings arrived. */
+	let framerateSpan = null;
+	/** The measurement of this page's display (lib/display-refresh.js); null on a shared viewer. */
+	let displayRefresh = null;
+	/** The frame rate this peer last asked for, null where it named none. */
+	let framerateAsked = null;
 	/** Audio bitrate in bps. */
 	let audioBitRate = 128000;
 	let showStart = false;
@@ -258,7 +274,6 @@ export default function webrtc() {
 	/** Whether the clipboard follows every change on its own, or only when asked. */
 	let clipboard_seamless = true;
 	let windowResolution = [];
-	let encoderLabel = "";
 	let encoder = "";
 	let rateControlMode = "cbr";
 	let gamepad = {
@@ -286,13 +301,34 @@ export default function webrtc() {
 	};
 
 	var videoElement = null;
-	var audioElement = null;
 	/**
 	 * Set on a fatal server verdict (close 4000/4001): blocks every recovery
 	 * reload, the peer connection's and the resume watchdog's, so a superseded
 	 * page cannot re-enter the takeover loop.
 	 */
 	let fatalConnectionHalt = false;
+	/** The entry page's validators when the first session connected (`entryPageTag`). */
+	let entryPageBaseline = null;
+	/**
+	 * How long a peer connection may stay `failed` or `disconnected` before a
+	 * new session replaces it: `failed` is final, and its short grace only lets
+	 * a signaling drop arriving with it take the reconnect instead;
+	 * `disconnected` heals by itself when the path comes back in time.
+	 */
+	const PC_FAILED_GRACE_MS = 400;
+	const PC_DISCONNECTED_GRACE_MS = 8000;
+	/**
+	 * Sessions that ended `failed` in a row while the signaling socket stayed
+	 * up, and whether one ever connected. A socket to this page's server that
+	 * works beside a media path that does not is what WebSockets streams over,
+	 * so the page's first session failing, or two in a row after one that
+	 * connected, posts `transportAdvice` offering it; a connected session
+	 * withdraws the offer.
+	 */
+	let failedSessions = 0;
+	let sessionEverConnected = false;
+	let transportAdvised = false;
+	const ADVICE_FAILED_SESSIONS = 2;
 	/**
 	 * Last stream resolution asked of the server, in physical pixels; compared
 	 * with the track's intrinsic size to detect a realized size that differs
@@ -321,13 +357,25 @@ export default function webrtc() {
 	let enableWebrtcStatics = false;
 
 	var videoConnected = "";
-	var audioConnected = "";
 	var statWatchEnabled = false;
 	var webrtc = null;
 	/** The cumulative counters of the last stats tick, null until one ran with the stats open. */
 	let statsBaseline = null;
 	/** `MediaCapabilities` on the stream's configuration, asked once per configuration. */
-	let decodeCapable = { key: '', efficient: null };
+	const decodeCapable = new DecodeCapability();
+	/**
+	 * What the received video decodes to (`readDecodedFrame`): the format of a
+	 * frame read from the track or of the element's picture, undefined until
+	 * one is read, and whether it was read since the stats last opened.
+	 */
+	let decodedFrame = { key: '', track: undefined, element: undefined, current: false, reading: false };
+	/**
+	 * What reaches the screen, counted off the `<video>` from the stats'
+	 * baseline tick until they shut (`lib/present-meter.js`), each frame dated
+	 * by the engine's own `receiveTime` where it has one.
+	 */
+	const presentMeter = createPresentMeter(null);
+	let presentWatch = null, videoNotShown = 0;
 	const streamStats = new StreamStats({
 		transport: 'webrtc',
 		send: (message) => {
@@ -336,11 +384,24 @@ export default function webrtc() {
 			webrtc.sendDataChannelMessage(message);
 		},
 		isViewer: () => isSharedMode,
-		onOpenChange: () => { statsBaseline = null; },
+		onOpenChange: (open) => {
+			statsBaseline = null;
+			if (presentWatch) presentWatch.stop();
+			presentWatch = null;
+			if (!open) return;
+			decodedFrame.current = false;
+			tickStatsNow();
+		},
 	});
 	var input = null;
-	/** Interval ids, cleared on cleanup so a reconnect never double-starts a loop. */
-	let statsLoopId = null;
+	/** How often the stats loop reads the peer connection while the stats are shut, in ms. */
+	const STATS_SHUT_MS = 5000;
+	/**
+	 * The stats loop's next tick and the tick itself, and the metrics loop's
+	 * interval, cleared on cleanup so a reconnect never double-starts a loop.
+	 */
+	let statsTimer = null;
+	let statsTick = null;
 	let metricsLoopId = null;
 	/**
 	 * CSS scaling on means dpr 1 everywhere; off, the resolution senders and the
@@ -436,9 +497,7 @@ export default function webrtc() {
 
 	let enable_binary_clipboard = true;
 	let clipboardWorker = new ClipboardWorkerBridge();
-	/** Multipart download state and connect-time cache-only fetch tracking (`lib/clipboard-sync.js`). */
-	const multipartClipboard = createMultipartClipboardState(
-		(mime) => clipboardWorker.decodeStream(mime));
+	/** Connect-time cache-only fetch tracking (`lib/clipboard-sync.js`). */
 	const taggedClipboardFetch = createTaggedClipboardFetch();
 	const armTaggedClipboardReply = () => taggedClipboardFetch.arm();
 	const consumeInitClipboardFetch = () => taggedClipboardFetch.consume();
@@ -454,7 +513,7 @@ export default function webrtc() {
 	/**
 	 * Chromium-engine detection: userAgentData brands are authoritative and
 	 * `window.chrome` a fallback for older engines that expose no brands; iOS,
-	 * Firefox and CriOS are excluded.
+	 * Firefox, and CriOS are excluded.
 	 */
 	const isChromium = (() => {
 		const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
@@ -476,13 +535,33 @@ export default function webrtc() {
 		}
 	});
 	/**
-	 * Retry queue for local clipboard writes of server pushes, which carry no
-	 * user activation: Firefox and WebKit reject the write until the next real
+	 * Retry queue for local clipboard writes of server pushes: a write the
+	 * engine refuses (no focus, no user activation) waits for the next real
 	 * gesture.
 	 */
 	const deferredClipboardWriter = createDeferredClipboardWriter();
+	/** The server-to-client clipboard, shared with the WebSocket core (`lib/clipboard-sync.js`). */
+	const incomingClipboard = createIncomingClipboard({
+		worker: clipboardWorker,
+		clipboardSync,
+		writer: deferredClipboardWriter,
+		toPng: reencodePngOffThread,
+		canWriteLocal: () => clipboard_seamless && clipboardStatus === 'enabled' && clipboard_out_enabled,
+		binaryEnabled: () => enable_binary_clipboard,
+		isChromium,
+		onPreview: (text, secret) => window.postMessage(clipboardPreviewMessage(text, secret), window.location.origin),
+		onImageWritten: (mime) => {
+			console.log(`Successfully wrote image (${mime}) from server to local clipboard.`);
+			window.postMessage({
+				type: 'clipboardContentUpdate',
+				text: `Image (${mime}) received from session and copied to clipboard.`,
+			}, window.location.origin);
+			return clipboardSync.captureLocalImageSig();
+		},
+		onImageWriteFailed: (err) => notifyClipboardImageWriteFailed(err),
+	});
 
-	const hash = window.location.hash;
+	const hash = urlFragmentKeyword();
 	if (hash === '#shared') {
         clientRole = CLIENT_VIEWER;
         clientSlot = -1;
@@ -508,6 +587,8 @@ export default function webrtc() {
 	let collabInputGranted = false;
 
 	const storageAppName = getStorageAppName();
+	/** The last server_settings payload, posted again when the display's settings change under the dashboards. */
+	let lastServerSettings = null;
 	/** Writes a key, degrading a full or unavailable store to a warning. */
 	const safeSetItem = (key, value) => {
 		try {
@@ -522,11 +603,13 @@ export default function webrtc() {
 	 * two displays' picks never share a key; must match the dashboards'
 	 * `getPrefixedKey` and the WebSocket core.
 	 */
-	const storageDisplayId = window.location.hash.startsWith('#display2') ? 'display2' : 'primary';
+	const storageDisplayId = urlFragmentKeyword().startsWith('#display2') ? 'display2' : 'primary';
 	/** Display rectangles (+ per-page scale) from the last display-config update. */
 	let latestDisplayLayouts = null;
 	/** Whether the server runs on Wayland, as the last display-config update named it. */
 	let serverWayland = false;
+	/** Whether the session takes a touchpad's scroll as a finger's (the display config's `finger_scroll`). */
+	let serverFingerScroll = false;
 	/** Stream pixels per CSS pixel this page requests and draws at (lib/stream-density.js). */
 	function streamDensity() {
 		return streamDensityOf({ useCssScaling, localScale: scalingDPI / 96, manual: window.manualResolution,
@@ -555,7 +638,7 @@ export default function webrtc() {
 		}
 	}
 	const PER_DISPLAY_SETTINGS = [
-		'framerate', 'video_crf', 'video_fullcolor',
+		'framerate', 'video_crf', 'video_fullcolor', 'video_10bit',
 		'video_streaming_mode', 'use_cpu',
 		'video_paintover_crf', 'video_paintover_burst_frames', 'use_paint_over_quality',
 		'manual_resolution', 'manual_width', 'manual_height',
@@ -569,6 +652,8 @@ export default function webrtc() {
 		}
 		return prefixedKey;
 	};
+	// A tab that holds nothing gets its picks back (lib/held-settings.js).
+	restoreHeldPicks(storageKeyFor, storageAppName);
 
 	const getIntParam = (key, default_value) => {
 		const prefixedKey = storageKeyFor(key);
@@ -642,7 +727,7 @@ export default function webrtc() {
 	 */
 	function applyEffectiveCursorSetting() {
 		const userPreference = useBrowserCursors;
-		const isDisplay2 = window.location.hash.startsWith('#display2');
+		const isDisplay2 = urlFragmentKeyword().startsWith('#display2');
 		const isMultiMonitorActive = (isDisplay2 || isSecondaryDisplayConnected);
 		const finalSetting = isMultiMonitorActive ? true : userPreference;
 		if (input && typeof input.setUseBrowserCursors === 'function') {
@@ -658,6 +743,24 @@ export default function webrtc() {
 	function applyRawPointerMotion() {
 		if (input && typeof input.setRawPointerMotion === 'function') {
 			input.setRawPointerMotion(rawPointerMotion);
+		}
+	}
+
+	/** How far the trackpad moves the pointer: the dashboards' pick, persisted here. */
+	let trackpadSpeed = 1;
+	/** Applies the trackpad speed to the input handler. */
+	function applyTrackpadSpeed() {
+		if (input && typeof input.setTrackpadSpeed === 'function') {
+			input.setTrackpadSpeed(trackpadSpeed);
+		}
+	}
+
+	/** Whether pads play a game's rumble: the dashboards' toggle, persisted here. */
+	let gamepadRumble = true;
+	/** Applies the rumble toggle to the input handler. */
+	function applyGamepadRumble() {
+		if (input && typeof input.setGamepadRumble === 'function') {
+			input.setGamepadRumble(gamepadRumble);
 		}
 	}
 
@@ -780,11 +883,14 @@ export default function webrtc() {
 	}
 
 	/**
-	 * Verifies that frames follow a START_VIDEO. The resume is one message on
-	 * a data channel that can close at that very moment, and a lost one is
-	 * answered with nothing: the peer would stay subscribed to a feed nobody
-	 * encodes. The element's playback clock is the signal WebRTC has, so the
-	 * check is whether it advanced past the mark taken here.
+	 * Verifies that frames follow a START_VIDEO or a connect. The resume is one
+	 * message on a data channel that can close at that very moment, and a lost
+	 * one is answered with nothing: the peer would stay subscribed to a feed
+	 * nobody encodes. A player can also miss a session's only key frame (WebKit's
+	 * GStreamer player sometimes never prerolls on it), and a still screen sends
+	 * no other: the resend's IDR is one. The element's playback clock is the
+	 * signal WebRTC has, so the check is whether it advanced past the mark taken
+	 * here with a picture to show: WebKit's player runs its clock with none.
 	 */
 	function armResumeWatchdog() {
 		if (resumeWatchdogTimer !== null) clearTimeout(resumeWatchdogTimer);
@@ -794,25 +900,31 @@ export default function webrtc() {
 
 	/**
 	 * Watchdog tick: resends START_VIDEO while the playback clock has not moved
-	 * past `mark`, up to RESUME_WATCHDOG_MAX_ATTEMPTS, then reloads to
-	 * reconnect unless a fatal verdict or a mode switch forbids it. A tab
+	 * past `mark`, up to RESUME_WATCHDOG_MAX_ATTEMPTS, then reconnects in place
+	 * unless a fatal verdict or a mode switch forbids it. A tab
 	 * hidden again stands the watchdog down, the visibility path owning that
 	 * state, and so does a stream the server declined, which no resend brings
-	 * back. Each attempt also replays the element, since one the browser
-	 * paused while the tab was away plays nothing however much RTP arrives.
+	 * back, a play button waiting on the user's gesture, or video the page has
+	 * off (its `video_on_start` setting, or the user's toggle). Each attempt
+	 * also replays the element, since one the browser paused while the tab was
+	 * away plays nothing however much RTP arrives.
 	 * @param {number} mark Playback time when the watchdog was armed.
 	 */
 	function checkResumed(mark) {
 		resumeWatchdogTimer = null;
-		if (document.hidden || !webrtc || videoDeclined) { resumeWatchdogAttempts = 0; return; }
-		if (videoElement && videoElement.currentTime > mark) {
+		if (document.hidden || !webrtc || videoDeclined || showStart || !isVideoPipelineActive) {
+			resumeWatchdogAttempts = 0;
+			return;
+		}
+		if (videoElement && videoElement.currentTime > mark
+				&& videoElement.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
 			resumeWatchdogAttempts = 0;
 			return;
 		}
 		if (videoElement && videoElement.paused) videoElement.play().catch(() => {});
 		resumeWatchdogAttempts++;
 		if (resumeWatchdogAttempts <= RESUME_WATCHDOG_MAX_ATTEMPTS) {
-			console.warn(`No video after resuming; resend attempt ${resumeWatchdogAttempts}/${RESUME_WATCHDOG_MAX_ATTEMPTS}.`);
+			console.warn(`No video after connecting or resuming; resend attempt ${resumeWatchdogAttempts}/${RESUME_WATCHDOG_MAX_ATTEMPTS}.`);
 			try { webrtc.sendDataChannelMessage('START_VIDEO'); } catch (_) {}
 			armResumeWatchdog();
 			return;
@@ -820,8 +932,8 @@ export default function webrtc() {
 		resumeWatchdogAttempts = 0;
 		if (fatalConnectionHalt) return;
 		if (typeof window !== 'undefined' && window.__selkiesModeSwitching) return;
-		console.warn('[webrtc] no video after resuming; reloading to reconnect.');
-		location.reload();
+		console.warn('[webrtc] no video after connecting or resuming; reconnecting in place.');
+		webrtc.signaling.reconnect();
 	}
 
 	/**
@@ -913,7 +1025,13 @@ export default function webrtc() {
 
 	/**
 	 * Picks the video's `image-rendering`: pixelated with anti-aliasing off or
-	 * at 1:1, `auto` (smoothed) when CSS-scaled above 1 dpr.
+	 * at 1:1, `auto` (smoothed) when scaled. 1:1 is the stream's own size
+	 * matching the box in device pixels to within the resize alignment (a
+	 * mode's cell, the 16-pixel aligned request), so a pinned resolution, one
+	 * not yet realized, or a manual one scaled to fit stays smoothed. Only
+	 * Chromium takes it: its compositor resamples a smoothed video every frame,
+	 * which costs a software compositor a frame of latency, while Firefox's
+	 * draws a nearest-sampled video slower than a smoothed one.
 	 */
 	function updateVideoImageRendering(){
 		if (!videoElement) return;
@@ -924,7 +1042,10 @@ export default function webrtc() {
 			}
 			return;
 		}
-		const isOneToOne = Math.abs(streamDensity() - (window.devicePixelRatio || 1)) < 1e-6;
+		const dpr = window.devicePixelRatio || 1;
+		const box = videoElement.getBoundingClientRect();
+		const isOneToOne = isChromium && Math.abs(videoElement.videoWidth - box.width * dpr) <= 16
+			&& Math.abs(videoElement.videoHeight - box.height * dpr) <= 16;
 		if (isOneToOne) {
 			if (videoElement.style.imageRendering !== 'pixelated') {
 				console.log("Setting video rendering to 'pixelated' for sharp display.");
@@ -962,7 +1083,7 @@ export default function webrtc() {
 		const changes = {};
 
 		for (const key in serverSettings) {
-			if (!serverSettings.hasOwnProperty(key)) continue;
+			if (!Object.prototype.hasOwnProperty.call(serverSettings, key)) continue;
 			const setting = serverSettings[key];
 			const storeKey = storageKeyForServerKey(key);
 			const finalKey = storageKeyFor(storeKey);
@@ -1091,6 +1212,90 @@ export default function webrtc() {
 	}
 
 	/**
+	 * Whether this engine's RTP receiver lists `codec` at an SDP `profile-id`.
+	 * @param {string} codec A codec name.
+	 * @param {number} profile The profile id.
+	 * @returns {boolean}
+	 */
+	function receiverTakesProfile(codec, profile) {
+		const mime = new RegExp(`^video/${codec}$`, 'i');
+		const fmtp = new RegExp(`(^|;)profile-id=${profile}(;|$)`);
+		try {
+			return RTCRtpReceiver.getCapabilities('video').codecs.some((c) =>
+				mime.test(c.mimeType) && fmtp.test(c.sdpFmtpLine || ''));
+		} catch (e) {
+			return false;
+		}
+	}
+
+	/**
+	 * Whether this engine decodes the codec at 10 bits over WebRTC: the
+	 * receiver's capabilities where the profile is one RTP negotiates (VP9
+	 * profile 2, or 3 at 4:4:4, H.265 Main 10, and H.264 High 10), the decode of
+	 * a 10-bit key frame for AV1, whose main profile carries both depths, and
+	 * for H.264 and H.265 4:4:4, which full color is answered the same way for.
+	 * Chromium decodes WebRTC AV1 in libwebrtc's dav1d wrapper, which drops every
+	 * picture deeper than 8 bits ("unhandled bit depth") whatever WebCodecs
+	 * decodes, so a stream opening at 10 bits never showed a frame there.
+	 * @param {string} codec A codec name.
+	 * @param {boolean} fullcolor Whether the stream is 4:4:4.
+	 * @returns {Promise<boolean>}
+	 */
+	async function tenBitDecodable(codec, fullcolor) {
+		if (codec === 'av1' && isChromium) return false;
+		if (codec === 'vp9') return receiverTakesProfile('vp9', fullcolor ? 3 : 2);
+		if (codec === 'h265' && !fullcolor) return receiverTakesProfile('h265', 2);
+		if (codec === 'h264' && !fullcolor) {
+			try {
+				return RTCRtpReceiver.getCapabilities('video').codecs.some((c) =>
+					/^video\/h264$/i.test(c.mimeType) && /profile-level-id=6e/i.test(c.sdpFmtpLine || ''));
+			} catch (e) {
+				return false;
+			}
+		}
+		return await canDecodeTenBit(codec, fullcolor);
+	}
+
+	/** Whether the stream on `codec` is 4:4:4 as far as this page asked for it. */
+	const streamsFullColor = (codec) => !!window.video_fullcolor && codecCarriesFullColor(codec);
+
+	/**
+	 * Turns 10-bit off in storage where this engine cannot decode the codec at
+	 * 10 bits over RTP, before the first SETTINGS payload, as
+	 * `settleFullColorSupport` does for full color.
+	 */
+	async function settleTenBitSupport() {
+		const codec = codecOfEncoder(encoder);
+		if (!codecCarriesTenBit(codec) || !getBoolParam('video_10bit', false)) return;
+		if (await tenBitDecodable(codec, getBoolParam('video_fullcolor', false) && codecCarriesFullColor(codec))) return;
+		console.warn(`[Selkies] 10-bit is off: this browser decodes ${codec} at 8 bits only over WebRTC.`);
+		setBoolParam('video_10bit', false);
+	}
+
+	/** Whether the server holds 10-bit: a locked `video_10bit`. */
+	let tenBitLocked = false;
+
+	/**
+	 * Turns a 10-bit the server announced off again where this engine cannot
+	 * decode it over WebRTC, so the stream comes back at 8 bits on the same
+	 * codec. A locked setting cannot be turned off and is reported once.
+	 */
+	async function declineUndecodableTenBit() {
+		if (!window.video_10bit || isSharedMode) return;
+		const codec = codecOfEncoder(encoder);
+		if (!codecCarriesTenBit(codec) || await tenBitDecodable(codec, streamsFullColor(codec))) return;
+		if (!window.video_10bit) return;
+		if (tenBitLocked) {
+			console.error(`This session streams 10-bit ${codec}, which this browser cannot decode over WebRTC.`);
+			return;
+		}
+		console.warn(`[Selkies] 10-bit is off: this browser decodes ${codec} at 8 bits only over WebRTC.`);
+		window.video_10bit = false;
+		setBoolParam('video_10bit', false);
+		handleSettingsMessage({ video_10bit: false }, false);
+	}
+
+	/**
 	 * Sends the persisted settings as the session's initial SETTINGS payload.
 	 *
 	 * Every display page sends its own: the server applies a payload to the
@@ -1121,6 +1326,28 @@ export default function webrtc() {
 		});
 	}
 
+	/**
+	 * The frame rate this page asks the server for: the stored choice, or the
+	 * display's own refresh where that is chosen or nothing is
+	 * (lib/display-refresh.js); null asks for nothing.
+	 * @returns {?number}
+	 */
+	function requestedStreamFramerate() {
+		return requestedFramerate(window.localStorage.getItem(storageKeyFor('framerate')),
+			displayRefresh ? displayRefresh.rate() : null, framerateSpan);
+	}
+
+	/**
+	 * Asks the server for the rate `requestedStreamFramerate` names where it
+	 * moved: the display measured or remeasured, or the server's span arrived.
+	 */
+	function followDisplayFramerate() {
+		const rate = requestedStreamFramerate();
+		if (rate === null || rate === framerateAsked || !persistentSettingsSent) return;
+		videoFramerate = framerateAsked = rate;
+		webrtc.sendDataChannelMessage(`_arg_fps,${rate}`);
+	}
+
 	function sendClientPersistedSettings() {
 		if (isSharedMode) {
 			console.log("Skipping sending client persisted settings in shared mode.");
@@ -1132,19 +1359,19 @@ export default function webrtc() {
 		reportedStreamDensity = dpr;
 
 		const knownSettings = [
-			'framerate', 'encoder', 'manual_resolution',
+			'encoder', 'manual_resolution',
 			'audio_bitrate', 'video_bitrate', 'scaling_dpi', 'enable_binary_clipboard',
 			'rate_control_mode', 'video_crf', 'use_cpu', 'force_aligned_resolution',
-			'video_fullcolor', 'video_streaming_mode', 'use_paint_over_quality',
+			'video_fullcolor', 'video_10bit', 'video_streaming_mode', 'use_paint_over_quality',
 			'video_paintover_crf', 'video_paintover_burst_frames'
 		];
 		const booleanSettingKeys = [
 			'manual_resolution', 'enable_binary_clipboard', 'use_cpu',
-			'video_fullcolor', 'video_streaming_mode', 'use_paint_over_quality',
+			'video_fullcolor', 'video_10bit', 'video_streaming_mode', 'use_paint_over_quality',
 			'force_aligned_resolution'
 		];
 		const integerSettingKeys = [
-			'framerate', 'audio_bitrate', 'scaling_dpi', 'video_crf',
+			'audio_bitrate', 'scaling_dpi', 'video_crf',
 			'video_paintover_crf', 'video_paintover_burst_frames', 'video_bitrate'
 		];
 
@@ -1159,6 +1386,13 @@ export default function webrtc() {
 					continue;
 				}
 				if (knownSettings.includes(baseKey)) {
+					// Sent only beside the explicit-choice marker: the core stores every
+					// value it applies, so an unmarked paint-over may be the echo of the
+					// off an older dashboard derived under Turbo.
+					if (baseKey === 'use_paint_over_quality'
+						&& localStorage.getItem(`${key}_explicit_choice`) !== 'true') {
+						continue;
+					}
 					let value = localStorage.getItem(key);
 					if (booleanSettingKeys.includes(baseKey)) {
 						value = (value === 'true');
@@ -1188,6 +1422,8 @@ export default function webrtc() {
 		if (settingsToSend['scaling_dpi'] === undefined) {
 			settingsToSend['scaling_dpi'] = effectiveScalingDpi();
 		}
+		framerateAsked = requestedStreamFramerate();
+		if (framerateAsked !== null) settingsToSend['framerate'] = framerateAsked;
 		if (detectedKeyboardLayout) {
 			settingsToSend['keyboardLayout'] = detectedKeyboardLayout;
 		}
@@ -1272,7 +1508,11 @@ export default function webrtc() {
 	/**
 	 * Sizes the video element to the window: the buffer hint in physical
 	 * pixels, the on-screen box in CSS pixels (styling it with physical pixels
-	 * overflows the viewport by dpr squared on HiDPI displays).
+	 * overflows the viewport by dpr squared on HiDPI displays), and its
+	 * `image-rendering` for the density. The stream the server realizes can
+	 * be a few pixels off the box (a mode's cell alignment), so the browser
+	 * scales every frame, a resample Chromium's software compositor pays a
+	 * frame of latency for when it is smoothed.
 	 * @param {number} targetWidth Window width in CSS pixels.
 	 * @param {number} targetHeight Window height in CSS pixels.
 	 */
@@ -1295,6 +1535,7 @@ export default function webrtc() {
 		videoElement.style.top = '0px';
 		videoElement.style.left = '0px';
 		videoElement.style.objectFit = 'fill';
+		updateVideoImageRendering();
 		console.log(`Resized to window resolution: ${logicalWidth}x${logicalHeight} (css ${targetWidth}x${targetHeight})`);
 	}
 
@@ -1353,15 +1594,30 @@ export default function webrtc() {
 	/**
 	 * Follows a live devicePixelRatio change while `scaling_dpi` sits on its
 	 * automatic default, re-deriving and pushing it so the remote UI density
-	 * matches the display the window is on. Called from both the resize
-	 * handler and the matchMedia density watcher: an OS scaling change can
-	 * surface as either, and emulated density changes fire only the resize.
+	 * matches the display the window is on. Called from the resize handler
+	 * and the density watcher: an OS scaling change can surface as either,
+	 * and an emulated one as neither, which only the watcher's poll sees.
+	 * The video's rendering follows too, since the same stream now meets the
+	 * box at another scale.
 	 */
 	function maybeFollowDpr() {
 		const dpr = window.devicePixelRatio || 1;
 		if (dpr === lastFollowedDpr) return;
 		lastFollowedDpr = dpr;
 		if (followDerivedDpi('devicePixelRatio changed')) pushScalingDpi();
+		if (!isSharedMode) updateVideoImageRendering();
+	}
+
+	/**
+	 * The stream resolution `sendResolutionToServer` asks for `width` x `height`,
+	 * with the density it multiplied them by.
+	 * @param {number} width
+	 * @param {number} height
+	 * @returns {number[]} The width, the height, and the density.
+	 */
+	function streamResolution(width, height) {
+		const dpr = window.manualResolution ? 1 : streamDensity();
+		return [Math.min(alignResolution(width * dpr), 4080), Math.min(alignResolution(height * dpr), 4080), dpr];
 	}
 
 	/**
@@ -1380,24 +1636,15 @@ export default function webrtc() {
 			console.log("Skipping sending resolution in shared mode.");
 			return;
 		}
-		let realWidth, realHeight, dpr;
-		if (window.manualResolution) {
-			dpr = 1;
-			realWidth = alignResolution(width);
-			realHeight = alignResolution(height);
-		} else {
-			dpr = streamDensity();
+		const [realWidth, realHeight, dpr] = streamResolution(width, height);
+		if (!window.manualResolution) {
 			appliedStreamDensity = dpr;
-			realWidth = alignResolution(width * dpr);
 			// A request at a density the last SETTINGS did not report: the layout
 			// carries the reported scale to the other pages, so it is sent again.
 			if (reportedStreamDensity > 0 && Math.abs(dpr - reportedStreamDensity) > 1e-6) {
 				setTimeout(() => sendClientPersistedSettings(), 0);
 			}
-			realHeight = alignResolution(height * dpr);
 		}
-		if (realWidth > 4080) realWidth = 4080;
-		if (realHeight > 4080) realHeight = 4080;
 		const resString = `${realWidth}x${realHeight}`;
 		lastRequestedStreamRes = [realWidth, realHeight];
 		console.log(`Sending resolution to server: ${resString}, Pixel Ratio Used: ${dpr}, useCssScaling: ${useCssScaling}`);
@@ -1502,7 +1749,7 @@ export default function webrtc() {
 		arm();
 		// An emulated density change fires neither the query nor a resize;
 		// a slow poll of the live value catches those too.
-		setInterval(maybeFollowDpr, 1000);
+		setInterval(() => { if ((window.devicePixelRatio || 1) !== lastFollowedDpr) onDprChange(); }, 1000);
 	};
 	watchDevicePixelRatio();
 
@@ -1511,7 +1758,7 @@ export default function webrtc() {
 	 *
 	 * The DPI goes through the server's idempotent `set_dpi` path, the same one
 	 * the initial SETTINGS seed takes, so whichever lands first wins. Persisted
-	 * trackpad mode re-asserts cursor compositing (touch has no hover cursor).
+	 * trackpad mode asks the new channel for the pointer echo it draws from.
 	 * A manual-mode secondary display reports its size on connect because a
 	 * secondary lays out from what it reports; a pinned primary
 	 * (`enable_resize` false) is styled to the window but keeps the server's
@@ -1523,13 +1770,11 @@ export default function webrtc() {
 			return;
 		}
 		if (webrtc) pushScalingDpi();
-		if (trackpadMode && webrtc) {
-			try { webrtc.sendDataChannelMessage('SET_NATIVE_CURSOR_RENDERING,1'); } catch (_) {}
-		}
+		if (input) input.resumePointerEcho();
 		if (window.manualResolution && manualWidth && manualHeight) {
 			console.log(`Applying manual resolution: ${manualWidth}x${manualHeight}`);
 			applyManualStyle(manualWidth, manualHeight, scaleLocal);
-			if (window.location.hash.startsWith('#display2')) {
+			if (urlFragmentKeyword().startsWith('#display2')) {
 				sendResolutionToServer(manualWidth, manualHeight);
 			}
 		} else {
@@ -1564,8 +1809,8 @@ export default function webrtc() {
 	 * @param {boolean} [askedByServer] The session asked rather than the user, so a refusal latches.
 	 */
 	function setMicrophone(on, askedByServer = false) {
-		webrtc.setMicrophone(on, preferredInputDeviceId).then(() => {
-			isMicrophoneActive = on;
+		webrtc.setMicrophone(on, preferredInputDeviceId).then((started) => {
+			isMicrophoneActive = on && started === true;
 			postSidebarButtonUpdate();
 		}).catch((e) => {
 			console.error('Microphone toggle failed:', e);
@@ -1578,7 +1823,7 @@ export default function webrtc() {
 	/**
 	 * Starts the webcam uplink: the camera track rides the sendonly video
 	 * transceiver the server reserved in the bundled SDP (the mirror of the
-	 * microphone), so the browser's own encoder produces the H.264, VP8, VP9, H.265 or AV1 the
+	 * microphone), so the browser's own encoder produces the H.264, VP8, VP9, H.265, or AV1 the
 	 * server's virtual camera decodes, with RTP congestion control and no
 	 * data-channel framing.
 	 *
@@ -1602,8 +1847,9 @@ export default function webrtc() {
 				isWebcamActive = true;
 			} else {
 				isWebcamActive = false;
-				// The only falsy return is an engine with no getUserMedia at all.
-				if (askedByServer) webcamDemandRefused = true;
+				// False is an engine with no getUserMedia at all; null, a stop
+				// that withdrew this start, is no refusal.
+				if (ok === false && askedByServer) webcamDemandRefused = true;
 			}
 		} catch (error) {
 			console.error('Webcam capture error:', error);
@@ -1654,9 +1900,11 @@ export default function webrtc() {
 
 	/**
 	 * Handles a same-origin dashboard window message; the module docblock
-	 * lists the types. A shared page ignores the resolution, command and
+	 * lists the types. A shared page ignores the resolution, command, and
 	 * clipboard cases: a viewer never drives resolution policy, never reaches
-	 * the server's command execution path and never writes its clipboard.
+	 * the server's command execution path, and never writes its clipboard. A
+	 * primary whose size the server keeps (`enable_resize` false) ignores a
+	 * manual resolution, which the server would refuse.
 	 * @param {MessageEvent} event
 	 */
 	function handleMessage(event) {
@@ -1699,8 +1947,12 @@ export default function webrtc() {
 				handleResizeUI();
 				pushScalingDpi();
 				break;
-			case "setManualResolution":
+			case "setManualResolution": {
 				if (isSharedMode) { break; }
+				if (window.enable_resize === false && storageDisplayId !== 'display2') {
+					console.log("setManualResolution ignored: the server keeps this display's size (enable_resize=false).");
+					break;
+				}
 				const width = parseInt(message.width, 10);
 				const height = parseInt(message.height, 10);
 				if (isNaN(width) || width <= 0 || isNaN(height) || height <= 0) {
@@ -1725,6 +1977,7 @@ export default function webrtc() {
 				pushScalingDpi();
 				applyManualStyle(manualWidth, manualHeight, scaleLocal);
 				break;
+			}
 			case "setUseCssScaling":
 				if (isSharedMode) { break; }
 				if (typeof message.value === 'boolean') {
@@ -1824,14 +2077,14 @@ export default function webrtc() {
 					}
 					pipelinesToggledByUser.add('webcam');
 					webcamDemandRefused = false;
-					if (!!message.enabled) {
+					if (message.enabled) {
 						startWebcamCapture();
 					} else {
 						stopWebcamCapture();
 					}
 				}
 				break;
-			case 'gamepadControl':
+			case 'gamepadControl': {
 				console.log(`Received gamepad control message: enabled=${message.enabled}`);
 				const newGamepadState = message.enabled;
 				pipelinesToggledByUser.add('gamepad');
@@ -1842,6 +2095,7 @@ export default function webrtc() {
 					toggleGamepadConnection()
 				}
 				break;
+			}
 			case 'clipboardUpdateFromUI':
 				console.log('Received clipboardUpdateFromUI message.');
 				if (isSharedMode) {
@@ -1852,6 +2106,9 @@ export default function webrtc() {
 				break;
 			case 'printRequest':
 				printDocument(message.url);
+				break;
+			case 'clipboardCopySecret':
+				incomingClipboard.copySecret();
 				break;
 			case 'clipboardImageUpdate': {
 				// Every skip surfaces a notification: a dead click reads as a bug.
@@ -1906,7 +2163,10 @@ export default function webrtc() {
 				} else if (input) {
 					input.enterFullscreen();
 				} else if (document.fullscreenElement === null) {
-					document.documentElement.requestFullscreen().catch(() => {});
+					// Gaming mode before the input handler exists: the browser's
+					// own keyboard lock, where it has one, is all that can be asked for.
+					document.documentElement.requestFullscreen(gaming ? { keyboardLock: 'browser' } : undefined)
+						.catch(() => {});
 				}
 				break;
 			}
@@ -1959,6 +2219,24 @@ export default function webrtc() {
 					console.warn("Invalid value received for setRawPointerMotion:", message.value);
 				}
 				break;
+			case 'setTrackpadSpeed':
+				if (typeof message.value === 'number' && Number.isFinite(message.value)) {
+					trackpadSpeed = message.value;
+					setStringParam('trackpad_speed', String(message.value));
+					applyTrackpadSpeed();
+				} else {
+					console.warn("Invalid value received for setTrackpadSpeed:", message.value);
+				}
+				break;
+			case 'setGamepadRumble':
+				if (typeof message.value === 'boolean') {
+					gamepadRumble = message.value;
+					setBoolParam('gamepad_rumble', message.value);
+					applyGamepadRumble();
+				} else {
+					console.warn("Invalid value received for setGamepadRumble:", message.value);
+				}
+				break;
 			case 'setMacCmdAsCtrl':
 				if (typeof message.value === 'boolean') {
 					macCmdAsCtrl = message.value;
@@ -1973,10 +2251,6 @@ export default function webrtc() {
 					trackpadMode = true;
 					setBoolParam('trackpadMode', true);
 					input.setTrackpadMode(true);
-					// Touch has no hover cursor: the pointer is composited into the video.
-					if (webrtc) {
-						try { webrtc.sendDataChannelMessage('SET_NATIVE_CURSOR_RENDERING,1'); } catch (_) {}
-					}
 				}
 				break;
 			case 'touchinput:touch':
@@ -1984,9 +2258,6 @@ export default function webrtc() {
 					trackpadMode = false;
 					setBoolParam('trackpadMode', false);
 					input.setTrackpadMode(false);
-					if (webrtc) {
-						try { webrtc.sendDataChannelMessage('SET_NATIVE_CURSOR_RENDERING,0'); } catch (_) {}
-					}
 				}
 				break;
 			default:
@@ -2011,6 +2282,7 @@ export default function webrtc() {
 		const storeInt = fromServer ? () => {} : setIntParam;
 		const storeBool = fromServer ? () => {} : setBoolParam;
 		const storeString = fromServer ? () => {} : setStringParam;
+		if (!fromServer) releaseHeldSettings(storageKeyFor, Object.keys(settings));
 		if (settings.webcam_encoder !== undefined) {
 			const preference = String(settings.webcam_encoder);
 			if (WEBCAM_ENCODER_PREFERENCES.includes(preference) && preference !== webcamEncoderPreference) {
@@ -2029,6 +2301,7 @@ export default function webrtc() {
 		}
 		const passthrough = {};
 		if (settings.video_fullcolor !== undefined) passthrough.video_fullcolor = !!settings.video_fullcolor;
+		if (settings.video_10bit !== undefined) passthrough.video_10bit = !!settings.video_10bit;
 		if (settings.video_streaming_mode !== undefined) passthrough.video_streaming_mode = !!settings.video_streaming_mode;
 		if (settings.use_paint_over_quality !== undefined) passthrough.use_paint_over_quality = !!settings.use_paint_over_quality;
 		if (settings.video_paintover_crf !== undefined) passthrough.video_paintover_crf = parseInt(settings.video_paintover_crf, 10);
@@ -2037,18 +2310,20 @@ export default function webrtc() {
 		if (settings.use_cpu !== undefined) passthrough.use_cpu = !!settings.use_cpu;
 		if (settings.encoder !== undefined) passthrough.encoder = settings.encoder;
 	if (settings.displayPosition !== undefined) passthrough.displayPosition = settings.displayPosition;
-		if (Object.keys(passthrough).length > 0) {
-			webrtc.sendDataChannelMessage(`SETTINGS,${JSON.stringify(passthrough)}`);
-		}
 		if (settings.video_bitrate !== undefined) {
 			videoBitRate = parseInt(settings.video_bitrate, 10);
 			webrtc.sendDataChannelMessage(`vb,${videoBitRate}`);
 			storeInt('video_bitrate', videoBitRate);
+			if (!fromServer) forgetCcStart(storageDisplayId);
 		}
 		if (settings.framerate !== undefined) {
-			videoFramerate = parseInt(settings.framerate);
-			webrtc.sendDataChannelMessage(`_arg_fps,${videoFramerate}`);
-			storeInt('framerate', videoFramerate);
+			const followsDisplay = settings.framerate === FRAMERATE_DISPLAY;
+			storeString('framerate', followsDisplay ? FRAMERATE_DISPLAY : String(parseFloat(settings.framerate)));
+			const rate = followsDisplay ? requestedStreamFramerate() : parseFloat(settings.framerate);
+			if (Number.isFinite(rate)) {
+				videoFramerate = framerateAsked = rate;
+				webrtc.sendDataChannelMessage(`_arg_fps,${rate}`);
+			}
 		}
 		if (settings.audio_bitrate !== undefined) {
 			audioBitRate = parseInt(settings.audio_bitrate);
@@ -2147,6 +2422,46 @@ export default function webrtc() {
 				sendResolutionToServer(currentWindowRes[0], currentWindowRes[1]);
 			}
 		}
+		// A pick also rides the SETTINGS, the live verbs' values with it, marked
+		// as the user's: a page beside the display's owner changes it by that.
+		if (!fromServer) {
+			const picked = Object.keys(settings).filter((key) => DISPLAY_SETTINGS.includes(key));
+			const live = { framerate: videoFramerate, video_bitrate: videoBitRate, audio_bitrate: audioBitRate,
+				video_crf: crf, rate_control_mode: rateControlMode };
+			for (const key of picked) {
+				if (passthrough[key] === undefined && live[key] !== undefined) passthrough[key] = live[key];
+			}
+			if (picked.length > 0) passthrough.picked = picked;
+		}
+		if (Object.keys(passthrough).length > 0) {
+			webrtc.sendDataChannelMessage(`SETTINGS,${JSON.stringify(passthrough)}`);
+		}
+	}
+
+	/**
+	 * Takes what this page's display streams with (`display_settings`), which
+	 * the server sends a page joining a display beside its owner, and the pages
+	 * of a display another one's pick changed: held for the tab, taken as what
+	 * this page asks for, and shown in the dashboards.
+	 * @param {Object<string, *>} values
+	 */
+	function followDisplaySettings(values) {
+		if (isSharedMode) return;
+		const changed = holdDisplaySettings(storageKeyFor, storageAppName, values,
+			`${new Date().toISOString()} the settings of a display it shares`);
+		if (Object.keys(changed).length === 0) return;
+		console.log('[display] Streaming with what the display does:', changed);
+		for (const [name, value] of Object.entries(changed)) window[name] = value;
+		if (changed.encoder !== undefined) encoder = changed.encoder;
+		if (changed.video_crf !== undefined) crf = parseInt(changed.video_crf, 10);
+		if (changed.video_bitrate !== undefined) videoBitRate = parseInt(changed.video_bitrate, 10);
+		if (changed.audio_bitrate !== undefined) audioBitRate = parseInt(changed.audio_bitrate, 10);
+		if (changed.rate_control_mode !== undefined) rateControlMode = changed.rate_control_mode;
+		const rate = parseFloat(changed.framerate);
+		if (Number.isFinite(rate)) videoFramerate = framerateAsked = rate;
+		if (lastServerSettings) {
+			window.postMessage({ type: 'serverSettings', payload: { ...lastServerSettings } }, window.location.origin);
+		}
 	}
 
 	/** Re-sends the parameter the new rate-control mode reads: the bitrate for CBR, the CRF for CRF. */
@@ -2166,113 +2481,172 @@ export default function webrtc() {
 	const handleDrop = fileUploader.handleDrop;
 
 	/**
-	 * Starts the once-a-second stats loop: the essentials are published on
-	 * `window` (`fps`, `currentAudioBufferSize`) for the dashboards, a tick
-	 * with the stats open feeds lib/stream-stats.js (`sampleStreamStats`),
-	 * the full `connectionStat` stays readable here, and
-	 * `enableWebrtcStatics` streams the raw reports to the server as
-	 * `_stats_video`.
-	 *
-	 * A tick whose predecessor still awaits `getStats()` is skipped, since
-	 * overlapping ticks would double-update the byte baselines, and the time
-	 * window is re-anchored only on success, alongside those baselines, so
-	 * both cover the same interval. The bandwidth reported is the received
-	 * throughput (video plus audio), matching the WebSocket server's stat:
-	 * `availableReceiveBandwidth` is only the congestion-control estimate and
-	 * reads far below the real rate on a relay. The audio-buffer gauge is a
-	 * proxy: the de-jitter depth over the 20 ms Opus frame approximates the
-	 * frames buffered ahead of playout, since browser-managed audio exposes no
-	 * frame count. The audio concealment counters (NetEQ) are the RED
-	 * acceptance metric.
+	 * Reads the pixel format the received video decodes to (`webrtcDecoder`):
+	 * a `VideoFrame` of the element's current picture at once, and where the
+	 * page has `MediaStreamTrackProcessor`, one frame of a clone of the track,
+	 * the decoder's own. Once per configuration and again at each opening of
+	 * the stats, since a decoder can fall back mid-stream; a still screen
+	 * delivers no frame to the track, so its read is bounded and retried on the
+	 * next tick.
+	 * @param {string} key The configuration, `codec:WxH`.
 	 */
-	/**
-	 * Whether the engine decodes the stream's configuration efficiently, which
-	 * stands in for the decoder's name where the engine withholds it.
-	 * @param {string} codec
-	 * @param {number} width
-	 * @param {number} height
-	 * @param {number} fps
-	 */
-	function askDecodeCapable(codec, width, height, fps) {
-		const key = `${codec}:${width}x${height}`;
-		if (key === decodeCapable.key || !codec || codec === 'NA' || !(width > 0)) return;
-		decodeCapable = { key, efficient: null };
-		if (!navigator.mediaCapabilities || !navigator.mediaCapabilities.decodingInfo) return;
-		navigator.mediaCapabilities.decodingInfo({
-			type: 'webrtc',
-			video: { contentType: `video/${codec}`, width, height, bitrate: 8000000, framerate: fps > 0 ? fps : 60 },
-		}).then((info) => {
-			if (decodeCapable.key === key) decodeCapable.efficient = info.supported ? !!info.powerEfficient : null;
-		}).catch(() => {});
+	function readDecodedFrame(key) {
+		if (decodedFrame.reading || (decodedFrame.current && decodedFrame.key === key)) return;
+		const element = webrtc && webrtc.element;
+		const track = element && element.srcObject && element.srcObject.getVideoTracks()[0];
+		if (!track || track.readyState !== 'live') return;
+		if (key !== decodedFrame.key) decodedFrame = { key, track: undefined, element: undefined, current: false, reading: false };
+		try {
+			const frame = new VideoFrame(element);
+			decodedFrame.element = frame.format;
+			frame.close();
+		} catch (_) { /* no picture yet, or no WebCodecs */ }
+		if (typeof MediaStreamTrackProcessor !== 'function') {
+			decodedFrame.current = decodedFrame.element !== undefined;
+			return;
+		}
+		const clone = track.clone();
+		const reader = new MediaStreamTrackProcessor({ track: clone }).readable.getReader();
+		decodedFrame.reading = true;
+		Promise.race([reader.read(), new Promise((resolve) => setTimeout(resolve, 2000))]).then((got) => {
+			const frame = got && got.value;
+			if (!frame) return;
+			if (decodedFrame.key === key) {
+				decodedFrame.track = frame.format;
+				decodedFrame.current = true;
+			}
+			frame.close();
+		}).catch(() => {}).finally(() => {
+			decodedFrame.reading = false;
+			reader.cancel().catch(() => {});
+			clone.stop();
+		});
 	}
 
 	/**
-	 * One second of this page's figures for lib/stream-stats.js, from the same
-	 * `getStats()` snapshot the stat watch took: rates are the change in a
-	 * cumulative counter since the last tick, and the repair counters read
-	 * from zero at the moment the stats opened.
+	 * This page's half of the stream (`window.stream_client`) from one
+	 * `getStats()` snapshot. It moves only with the stream and costs a few
+	 * reads, so every tick keeps it current, shut stats included, and a
+	 * dashboard opening them draws it at once. The path is the pair's kind,
+	 * `relay` where either end relays and else the server's candidate type,
+	 * with the protocol this page reaches its peer or its relay over. The
+	 * engine is asked about the stream as negotiated, its fmtp line included:
+	 * its answer for the codec's default profile says nothing of a 4:4:4
+	 * profile, which no hardware decoder takes.
 	 * @param {Object} stats `WebRTCClient.getConnectionStats`'s result.
-	 * @param {number} rtt Round trip in ms.
-	 * @param {number} mbps Received video and audio.
 	 */
-	function sampleStreamStats(stats, rtt, mbps) {
+	function describeClient(stats) {
 		const video = stats.reports.videoRTP || {};
-		const audio = stats.reports.audioRTP || {};
 		const pair = stats.reports.candidatePairs[stats.reports.selectedCandidatePairId] || {};
 		const local = stats.reports.localCandidates[pair.localCandidateId] || {};
+		const remote = stats.reports.remoteCandidates[pair.remoteCandidateId] || {};
+		const codec = stats.video.codecName === 'NA' ? '' : stats.video.codecName;
+		const width = stats.video.frameWidth, height = stats.video.frameHeight;
+		const fmtp = ((stats.reports.codecs[video.codecId] || {}).sdpFmtpLine || '').replace(/\s/g, '');
+		const contentType = `video/${codec}${fmtp ? `;${fmtp}` : ''}`;
+		const key = `${contentType}:${width}x${height}`;
+		if (codec && width > 0) {
+			const fps = stats.video.framesPerSecond;
+			decodeCapable.ask({ type: 'webrtc', video: { contentType, width, height,
+				bitrate: 8000000, framerate: fps > 0 ? fps : 60 } }, key);
+			readDecodedFrame(key);
+		}
+		const read = decodedFrame.key === key ? decodedFrame : {};
+		const kind = local.candidateType === 'relay' || remote.candidateType === 'relay' ? 'relay' : remote.candidateType;
+		streamStats.setClient(Object.assign({
+			// The engine decodes the remote track and composites the element itself;
+			// there is no sink ladder here, which is the WebSockets path's own.
+			sink: '<video> element',
+			codec,
+			resolution: width > 0 ? `${width}x${height}` : '',
+			path: kind ? `${kind} ${local.relayProtocol || local.protocol || ''}`.trim() : '',
+		}, webrtcDecoder({
+			implementation: video.decoderImplementation,
+			powerEfficient: video.powerEfficientDecoder,
+			trackFormat: read.track,
+			elementFormat: read.element,
+			capable: decodeCapable.efficient,
+		})));
+	}
+
+	/**
+	 * One sample of this page's figures for lib/stream-stats.js, from the same
+	 * `getStats()` snapshot the stat watch took: a rate is the change in a
+	 * cumulative counter since the last sample, a count is counted from the
+	 * opening, and the first tick after an opening only takes the baseline. A
+	 * reconnect that replaced the peer connection starts its counters again
+	 * from zero, so what the old one counted since the opening is carried
+	 * into the baseline and its first tick only takes the rates' baseline.
+	 * @param {Object} stats `WebRTCClient.getConnectionStats`'s result.
+	 * @param {number} rtt Round trip in ms.
+	 * @param {RTCPeerConnection} pc The peer connection `stats` was read from.
+	 */
+	function sampleStreamStats(stats, rtt, pc) {
+		const video = stats.reports.videoRTP || {};
+		const audio = stats.reports.audioRTP || {};
 		const now = {
 			at: performance.now(),
+			bytes: (video.bytesReceived || 0) + (audio.bytesReceived || 0),
 			framesDecoded: video.framesDecoded || 0,
 			totalDecodeTime: video.totalDecodeTime || 0,
 			jitterBufferDelay: video.jitterBufferDelay || 0,
 			jitterBufferEmittedCount: video.jitterBufferEmittedCount || 0,
 			audioJitterBufferDelay: audio.jitterBufferDelay || 0,
 			audioJitterBufferEmittedCount: audio.jitterBufferEmittedCount || 0,
-			received: (video.packetsReceived || 0) + (audio.packetsReceived || 0),
-			lost: (video.packetsLost || 0) + (audio.packetsLost || 0),
 			micBytes: (stats.reports.outbound.audio || {}).bytesSent || 0,
 			webcamBytes: (stats.reports.outbound.video || {}).bytesSent || 0,
 		};
-		const opened = {
+		const counts = {
 			framesDropped: video.framesDropped || 0,
 			nack: video.nackCount || 0,
 			pli: video.pliCount || 0,
 			freezes: video.freezeCount || 0,
+			received: (video.packetsReceived || 0) + (audio.packetsReceived || 0),
+			lost: (video.packetsLost || 0) + (audio.packetsLost || 0),
 		};
 		const last = statsBaseline;
-		statsBaseline = Object.assign({ opened: last ? last.opened : opened }, now);
-		askDecodeCapable(stats.video.codecName, stats.video.frameWidth, stats.video.frameHeight, stats.video.framesPerSecond);
-		streamStats.setClient(Object.assign({
-			// The engine decodes the remote track and composites the element itself;
-			// there is no sink ladder here, which is the WebSockets path's own.
-			sink: '<video> element',
-			codec: stats.video.codecName === 'NA' ? '' : stats.video.codecName,
-			resolution: stats.video.frameWidth > 0 ? `${stats.video.frameWidth}x${stats.video.frameHeight}` : '',
-			path: [stats.general.connectionType === 'NA' ? '' : stats.general.connectionType,
-				local.relayProtocol ? `${local.relayProtocol} relay` : (local.protocol || '')].filter(Boolean).join(' '),
-		}, webrtcDecoder({
-			implementation: video.decoderImplementation,
-			powerEfficient: video.powerEfficientDecoder,
-			capable: decodeCapable.efficient,
-		})));
-		if (!last) return;
+		const replaced = !!last && last.pc !== pc;
+		const opened = !last ? counts : !replaced ? last.opened
+			: Object.fromEntries(Object.keys(counts).map((key) => [key, last.opened[key] - last.counts[key]]));
+		statsBaseline = Object.assign({ pc, counts, opened }, now);
+		if (!last) {
+			if (!presentWatch && videoElement) {
+				presentMeter.reset();
+				videoNotShown = 0;
+				presentWatch = watchVideo(videoElement, presentMeter,
+					(frame) => (typeof frame.receiveTime === 'number' ? frame.presentationTime - frame.receiveTime : NaN));
+			}
+			return;
+		}
+		streamStats.noteBytes(replaced ? now.bytes : Math.max(0, now.bytes - last.bytes));
+		if (replaced) {
+			presentMeter.take();
+			if (presentWatch) videoNotShown += presentWatch.read().dropped;
+			return;
+		}
 		const seconds = (now.at - last.at) / 1000;
 		const per = (total, count) => (count > 0 ? Math.round((1000 * total / count) * 100) / 100 : 0);
 		const share = (part, whole) => (whole > 0 ? Math.round((100 * part / whole) * 100) / 100 : 0);
 		const kbps = (bytes) => (seconds > 0 ? Math.round(bytes * 8 / 1000 / seconds) : 0);
+		const lost = counts.lost - opened.lost;
+		const shown = presentMeter.take();
+		const onScreen = presentWatch ? presentWatch.read() : { shown: 0, dropped: 0 };
+		videoNotShown += onScreen.dropped;
 		const figures = {
-			fps: stats.video.framesPerSecond || 0,
-			mbps: Math.round(mbps * 100) / 100,
+			fps: presentWatch && presentWatch.reported() && seconds > 0
+				? Math.round(onScreen.shown / seconds * 10) / 10 : stats.video.framesPerSecond || 0,
 			rtt_ms: Math.round(rtt * 10) / 10,
 			decode_ms: per(now.totalDecodeTime - last.totalDecodeTime, now.framesDecoded - last.framesDecoded),
 			jitter_buffer_ms: per(now.jitterBufferDelay - last.jitterBufferDelay, now.jitterBufferEmittedCount - last.jitterBufferEmittedCount),
 			audio_buffer_ms: per(now.audioJitterBufferDelay - last.audioJitterBufferDelay, now.audioJitterBufferEmittedCount - last.audioJitterBufferEmittedCount),
-			packet_loss_percent: share(now.lost - last.lost, (now.received - last.received) + (now.lost - last.lost)),
-			frames_dropped: opened.framesDropped - statsBaseline.opened.framesDropped,
-			nacks: opened.nack - statsBaseline.opened.nack,
-			keyframe_requests: opened.pli - statsBaseline.opened.pli,
-			freezes: opened.freezes - statsBaseline.opened.freezes,
+			packet_loss_percent: share(lost, counts.received - opened.received + lost),
+			frames_dropped: counts.framesDropped - opened.framesDropped,
+			frames_not_shown: videoNotShown,
+			nacks: counts.nack - opened.nack,
+			keyframe_requests: counts.pli - opened.pli,
+			freezes: counts.freezes - opened.freezes,
 		};
+		if (shown.delays > 0) figures.present_ms = Math.round(shown.delaySum / shown.delays * 100) / 100;
 		const mic = stats.reports.outbound.audio;
 		if (mic && now.micBytes > last.micBytes) figures.mic = `Opus, ${kbps(now.micBytes - last.micBytes)} kbps`;
 		const webcam = stats.reports.outbound.video;
@@ -2285,6 +2659,27 @@ export default function webrtc() {
 		streamStats.clientSample(figures);
 	}
 
+	/**
+	 * Starts the stats loop, which reads the peer connection once a second
+	 * while a dashboard has its stats open or `enableWebrtcStatics` streams the
+	 * raw reports to the server as `_stats_video`, and every `STATS_SHUT_MS`
+	 * otherwise, for what it keeps without them: `window.fps` and
+	 * `currentAudioBufferSize`, the figures the metrics loop reports (`_f`,
+	 * `_l`), and `window.stream_client` (`describeClient`). An opening is read
+	 * at once (`tickStatsNow`) for the baseline, and its first sample follows
+	 * `FIRST_SAMPLE_MS` later (`sampleStreamStats`).
+	 *
+	 * Each tick schedules the next when it ends, so ticks never overlap and
+	 * double-update the byte baselines; the time window is re-anchored only on
+	 * success, alongside those baselines, so both cover the same interval. The
+	 * bandwidth reported is the received throughput (video plus audio),
+	 * matching the WebSocket server's stat: `availableReceiveBandwidth` is only
+	 * the congestion-control estimate and reads far below the real rate on a
+	 * relay. The audio-buffer gauge is a proxy: the de-jitter depth over the
+	 * 20 ms Opus frame approximates the frames buffered ahead of playout, since
+	 * browser-managed audio exposes no frame count. The audio concealment
+	 * counters (NetEQ) are the RED acceptance metric.
+	 */
 	function enableStatWatch() {
 		if (isSharedMode) {
 			console.log("Shared mode detected, skipping stats watch setup.");
@@ -2297,14 +2692,17 @@ export default function webrtc() {
 		var previousAudioJitterBufferDelay = 0.0;
 		var previousAudioJitterBufferEmittedCount = 0;
 		var statsStart = new Date().getTime() / 1000;
-		if (statsLoopId !== null) return;
+		if (statsTick !== null) return;
 		statWatchEnabled = true;
-		let statsTickBusy = false;
-		statsLoopId = setInterval(async () => {
-			if (statsTickBusy) return;
-			statsTickBusy = true;
+		let busy = false;
+		const tick = async () => {
+			statsTimer = null;
+			if (busy) return;
+			busy = true;
+			let tookBaseline = false;
 			var now = new Date().getTime() / 1000;
 			try {
+				const pc = webrtc.peerConnection;
 				const stats = await webrtc.getConnectionStats();
 				connectionStat = {};
 
@@ -2345,24 +2743,42 @@ export default function webrtc() {
 				connectionStat.connectionLatency =  Math.max(connectionStat.connectionVideoLatency, connectionStat.connectionAudioLatency);
 
 				window.fps = connectionStat.connectionFrameRate;
+				describeClient(stats);
 				if (streamStats.open) {
-					sampleStreamStats(stats, rtt, (parseFloat(connectionStat.connectionVideoBitrate) || 0)
-						+ (parseFloat(connectionStat.connectionAudioBitrate) || 0) / 1000);
+					tookBaseline = statsBaseline === null;
+					sampleStreamStats(stats, rtt, pc);
 				}
 				if (enableWebrtcStatics) webrtc.sendDataChannelMessage(`_stats_video,${JSON.stringify(stats.allReports)}`);
 			} catch (e) {
 				if (webrtc !== null) console.warn("Error collecting connection stats:", e);
 			} finally {
-				statsTickBusy = false;
+				busy = false;
+				if (statsTick === tick && statsTimer === null) {
+					let next = enableWebrtcStatics ? 1000 : STATS_SHUT_MS;
+					if (streamStats.open) next = statsBaseline === null ? 0 : tookBaseline ? FIRST_SAMPLE_MS : 1000;
+					statsTimer = setTimeout(tick, next);
+				}
 			}
-		}, 1000);
+		};
+		statsTick = tick;
+		statsTimer = setTimeout(tick, 1000);
+	}
+
+	/** Reads the peer connection now, for a dashboard that just opened its stats. */
+	function tickStatsNow() {
+		if (statsTick === null) return;
+		if (statsTimer !== null) {
+			clearTimeout(statsTimer);
+			statsTimer = null;
+		}
+		statsTick();
 	}
 
 	/**
 	 * Focus and gesture local-to-server clipboard sync (`lib/clipboard-sync.js`),
-	 * with text re-sends deduped. Every read is gated on the server's clipboard
-	 * policy as well as browser capability, so a clipboard-disabled server never
-	 * arms the focus read or its permission prompt.
+	 * sending only what changed locally. Every read is gated on the server's
+	 * clipboard policy as well as browser capability, so a clipboard-disabled
+	 * server never arms the focus read or its permission prompt.
 	 */
 	const localClipboardSender = createLocalClipboardSender({
 		isChromium,
@@ -2372,7 +2788,7 @@ export default function webrtc() {
 		canRead: () => !!clipboard_in_enabled,
 		binaryEnabled: () => !!enable_binary_clipboard,
 		sendClipboardData: (data, mime, onSkip) => sendClipboardData(data, mime, onSkip),
-		dedupeText: true,
+		clipboardSync,
 	});
 	const readLocalClipboardAndSend = () => localClipboardSender.readAndSend();
 	const maybeSendInitialClipboard = () => localClipboardSender.maybeInitial();
@@ -2387,7 +2803,8 @@ export default function webrtc() {
 		canWrite: () => !!clipboard_out_enabled,
 		binaryEnabled: () => !!enable_binary_clipboard,
 		getSendInFlight: () => localClipboardSender.getSendInFlight(),
-		getDeferredWriteInFlight: () => deferredClipboardWriter.getInFlight(),
+		getDeferredWriteLanding: () => deferredClipboardWriter.getLanding(),
+		hasPendingServerWrite: () => deferredClipboardWriter.hasPending(),
 	});
 
 	/**
@@ -2525,100 +2942,9 @@ export default function webrtc() {
 		}
 	}
 
-	/**
-	 * Decodes a server clipboard message, assembling multipart transfers.
-	 * @param {{type: string, data: object}} msg The `clipboard-msg*` message.
-	 * @returns {Promise<{isMultipart: boolean, mimeType: ?string, content: ?(string|ClipboardItem)}>}
-	 *     `content` is null while a multipart transfer is in progress, on
-	 *     failure, and for images on insecure origins, which have no
-	 *     ClipboardItem. `preview` carries a flavour set's text, which the
-	 *     item itself does not hand back synchronously.
-	 */
-	async function handleClipboardData(msg) {
-		if (!msg.data) {
-			console.warn("Received clipboard message with null data");
-			return { isMultipart: false, mimeType: null, content: null };
-		}
-	
-		let mimeType = msg.data.mime_type || multipartClipboard.mimeType;
-		let is_text =  mimeType === 'text/plain' ? true : false;
-		let content = null;
-		let preview = null;
-		let isMultipart = false;
-		switch (msg.type) {
-			case "clipboard-msg":
-				let blob;
-				try {
-					const { result } = await clipboardWorker.decode(msg.data.content, mimeType);
-					if (is_text) {
-						return { isMultipart, mimeType, content: result };
-					}
-					if (mimeType === CLIPBOARD_FLAVOURS_MIME) {
-						if (typeof ClipboardItem === 'undefined') return { isMultipart, mimeType, content: null };
-						const flavours = unpackClipboardFlavours(result);
-						return { isMultipart, mimeType, content: clipboardItemForFlavours(flavours),
-							preview: flavours.text || flavours.html };
-					}
-					blob = new Blob([result], { type: mimeType });
-					if (mimeType.startsWith('image/') && mimeType !== 'image/png') {
-						// ClipboardItem accepts only image/png on write.
-						blob = await reencodePngOffThread(blob);
-						mimeType = 'image/png';
-					}
-				} catch (err) {
-					console.error("Image conversion failed for clipboard message:", err);
-					return { isMultipart, mimeType, content: null };
-				}
-				if (typeof ClipboardItem === 'undefined') return { isMultipart, mimeType, content: null };
-				return { isMultipart, mimeType, content: new ClipboardItem({ [mimeType]: blob }) };
-			case "clipboard-msg-start":
-				multipartClipboard.begin(mimeType, msg.data.total_size);
-				console.log(`Starting multi-part download: ${mimeType}, expected raw size: ${msg.data.total_size}`);
-				return { isMultipart: true, mimeType, content: null };
-			case "clipboard-msg-data":
-				multipartClipboard.push(msg.data.content);
-				return { isMultipart: true, mimeType, content: null };
-			case "clipboard-msg-end":
-				if (!multipartClipboard.inProgress) {
-					return { isMultipart: false, mimeType, content: null };
-				}
-				mimeType = multipartClipboard.mimeType;
-				const declared = multipartClipboard.totalSize;
-				try {
-					const { result, byteLength } = await multipartClipboard.finish();
-					if (byteLength !== declared) {
-						console.warn(`Size mismatch! Expected ${declared}, got ${byteLength}`);
-						return { isMultipart: false, mimeType, content: null };
-					}
-					if (mimeType === 'text/plain') {
-						content = result;
-					} else if (typeof ClipboardItem === 'undefined') {
-						content = null;
-					} else if (mimeType === CLIPBOARD_FLAVOURS_MIME) {
-						const flavours = unpackClipboardFlavours(result);
-						content = clipboardItemForFlavours(flavours);
-						preview = flavours.text || flavours.html;
-					} else {
-						let blob = new Blob([result], { type: mimeType });
-						if (mimeType.startsWith('image/') && mimeType !== 'image/png') {
-							blob = await reencodePngOffThread(blob);
-							mimeType = 'image/png';
-						}
-						content = new ClipboardItem({ [mimeType]: blob });
-					}
-				} catch (err) {
-					console.error("Worker decoding failed:", err);
-				}
-				return { isMultipart: false, mimeType, content, preview };
-			default:
-				console.warn("Unknown clipboard cmd received");
-		}
-	}
-
-
 	return {
 		/**
-		 * Builds the DOM, reads the persisted settings, connects signaling and
+		 * Builds the DOM, reads the persisted settings, connects signaling, and
 		 * opens the peer connection. Settings are read with fallbacks and never
 		 * written back, so a fresh profile keeps every key unset and
 		 * server-pushed defaults stay re-pushable.
@@ -2668,6 +2994,7 @@ export default function webrtc() {
 					window.streamResolutionDiverged =
 						(vw !== lastRequestedStreamRes[0] || vh !== lastRequestedStreamRes[1]);
 				}
+				if (!isSharedMode) updateVideoImageRendering();
 				// The realized buffer just settled. A resize that did not change the
 				// requested density (a window dragged to a screen of another density)
 				// left the last SETTINGS a scale measured off the old buffer, so the
@@ -2719,8 +3046,16 @@ export default function webrtc() {
 			resizeRemote = getBoolParam('resize_remote', resizeRemote);
 			scaleLocal = getBoolParam('scaleLocallyManual', !resizeRemote);
 			videoBitRate = getIntParam('video_bitrate', videoBitRate);
-			videoFramerate = getIntParam('framerate', videoFramerate);
+			videoFramerate = getFloatParam('framerate', videoFramerate);
 			audioBitRate = getIntParam('audio_bitrate', audioBitRate);
+			if (!isSharedMode && !displayRefresh) {
+				window.displayRefreshRate = null;
+				displayRefresh = watchDisplayRefresh((rate) => {
+					window.displayRefreshRate = rate;
+					window.postMessage({ type: 'displayRefresh', rate }, window.location.origin);
+					followDisplayFramerate();
+				});
+			}
 			window.manualResolution = getBoolParam('manual_resolution', false);
 			isGamepadEnabled = getBoolParam('isGamepadEnabled', true);
 			manualWidth = getIntParam('manual_width', null);
@@ -2740,6 +3075,8 @@ export default function webrtc() {
 			trackpadMode = getBoolParam('trackpadMode', false);
 			useBrowserCursors = getBoolParam('use_browser_cursors', true);
 			rawPointerMotion = getBoolParam('raw_pointer_motion', Input.rawPointerMotion);
+			trackpadSpeed = getFloatParam('trackpad_speed', 1);
+			gamepadRumble = getBoolParam('gamepad_rumble', true);
 			force_aligned_resolution = getBoolParam('force_aligned_resolution', false);
 
 			if (!isSharedMode) {
@@ -2763,7 +3100,7 @@ export default function webrtc() {
 			var protocol = (location.protocol == "http:" ? "ws://" : "wss://");
 			var url = new URL(protocol + window.location.host + pathname + "api/" + appName + "/signaling/");
 			// Secure-mode token, matched against the active mk token to grant collaboration.
-			var authToken = new URLSearchParams(window.location.search).get('token') || undefined;
+			var authToken = getSessionToken() || undefined;
 			fatalConnectionHalt = false;
 			let pcRecoveryTimer = null;
 			var signaling = new WebRTCSignaling(url, clientRole, clientSlot, isStrictViewer, authToken, displayId, displayPosition);
@@ -2775,25 +3112,46 @@ export default function webrtc() {
 				}
 				return codecs;
 			};
+			// And the size its first resize will ask for, which a primary's capture starts at
+			// (`loadLastSessionSettings`); none where that resize is not sent.
+			signaling.pageSize = () => {
+				if (isSharedMode || window.manualResolution || storageDisplayId === 'display2' || !input) return null;
+				const [width, height] = streamResolution(...input.getWindowResolution());
+				return [width, height];
+			};
+			// And the 10 bits it decodes, by format.
+			signaling.tenBitCapabilities = async () => {
+				const formats = [];
+				for (const codec of ['h264', 'h265', 'vp9', 'av1']) {
+					for (const fullcolor of [false, true]) {
+						if (fullcolor && !codecCarriesFullColor(codec)) continue;
+						if (await tenBitDecodable(codec, fullcolor)) formats.push(tenBitFormat(codec, fullcolor));
+					}
+				}
+				return formats;
+			};
 			/**
-			 * A plain GET on the signaling endpoint returns 409 exactly when the
-			 * server is serving WebSockets: after repeated connect failures, probe
-			 * once and converge the stored mode instead of reload-looping.
+			 * After repeated connect failures the signaling endpoint is probed with
+			 * a plain GET before the page reloads. No answer (`serverAnswers`) is a
+			 * server stopping or starting, and a reload would land on the browser's
+			 * error page with nothing left to retry, so the retries go on instead.
+			 * A 409 means the server is serving WebSockets, and the stored mode
+			 * converges on it rather than reload-looping.
 			 */
 			signaling.onfatalretry = async () => {
+				const probeURL = new URL(url.href);
+				probeURL.protocol = (location.protocol === 'http:' ? 'http:' : 'https:');
+				const res = await serverAnswers(probeURL.href, sessionAuthHeaders());
+				if (!res) {
+					signaling.retry();
+					return;
+				}
 				let flipGuard = null;
 				try { flipGuard = sessionStorage.getItem('selkies_mode_flip'); } catch (e) { /* ignore */ }
-				if (!flipGuard) {
-					try {
-						const probeURL = new URL(url.href);
-						probeURL.protocol = (location.protocol === 'http:' ? 'http:' : 'https:');
-						const res = await fetch(probeURL.href, { cache: 'no-store', headers: sessionAuthHeaders() });
-						if (res.status === 409) {
-							try { sessionStorage.setItem('selkies_mode_flip', '1'); } catch (e) { /* ignore */ }
-							setStringParam('stream_mode', 'websockets');
-							console.warn('[signaling] Server is serving WebSockets (endpoint 409); switching stored mode.');
-						}
-					} catch (e) { /* unreachable server: plain reload keeps retrying */ }
+				if (!flipGuard && res.status === 409) {
+					try { sessionStorage.setItem('selkies_mode_flip', '1'); } catch (e) { /* ignore */ }
+					setStringParam('stream_mode', 'websockets');
+					console.warn('[signaling] Server is serving WebSockets (endpoint 409); switching stored mode.');
 				}
 				location.reload();
 			};
@@ -2805,10 +3163,13 @@ export default function webrtc() {
 				webrtc.sendDataChannelMessage(data);
 			}
 			input = new Input(overlayInput, send, isSharedMode, playerInputTargetIndex, useCssScaling);
+			input.displayId = displayId;
+			input.setFingerScroll(serverFingerScroll);
 			input.sendMotion = (data) => {
 				if (isSharedMode && isStrictViewer && !collabInputGranted) return;
 				webrtc.sendMotionMessage(data);
 			};
+			input.motionBacklog = () => webrtc.motionBufferedAmount();
 			input.setShortcutsEnabled(keyboardShortcuts);
 			input.setDisplayLayouts(latestDisplayLayouts, displayId);
 			/**
@@ -2857,6 +3218,8 @@ export default function webrtc() {
 			applyEffectiveCursorSetting();
 			applyRawPointerMotion();
 			applyMacCmdAsCtrl();
+			applyTrackpadSpeed();
+			applyGamepadRumble();
 			window.postMessage({ type: 'trackpadModeUpdate', enabled: trackpadMode }, window.location.origin);
 			window.postMessage({ type: 'clientRoleUpdate', role: clientRole }, window.location.origin);
 
@@ -2870,8 +3233,15 @@ export default function webrtc() {
 			};
 
 			signaling.ondisconnect = (reconnect) => {
+				if (pcRecoveryTimer !== null) {
+					clearTimeout(pcRecoveryTimer);
+					pcRecoveryTimer = null;
+				}
 				videoElement.style.cursor = "auto";
+				incomingClipboard.reset();
 				releaseWakeLock();
+				// No renewal will come; a rumble playing stops now rather than at its lease.
+				if (input) input.stopRumble();
 				if (window.__selkiesAuthProbe) window.__selkiesAuthProbe();
 				if (reconnect) {
 					status = 'connecting';
@@ -2892,13 +3262,12 @@ export default function webrtc() {
 			/**
 			 * A fatal server verdict (invalid slot, superseded takeover): stay
 			 * down. The peer connection goes `failed` shortly after, and the
-			 * recovery timer must not reload into an eviction ping-pong. The
-			 * alert is suppressed during a mode switch, which closes the peer
-			 * (code 4000) before the page reloads.
+			 * recovery timer must not reload into an eviction ping-pong. A
+			 * server going away, a mode switch included, is no verdict: it
+			 * closes as 1001 and takes the reconnect path.
 			 */
 			signaling.onshowalert = (msg) => {
 				fatalConnectionHalt = true;
-				if (typeof window !== 'undefined' && window.__selkiesModeSwitching) return;
 				alert("Disconnected: " + msg + " Please try again.");
 			}
 
@@ -2918,18 +3287,34 @@ export default function webrtc() {
 
 			webrtc.onstreaminfo = (info) => streamStats.setInfo(info);
 			webrtc.onstreamstats = (stats) => streamStats.serverSample(stats);
+			webrtc.onconnection = (poor) => streamStats.setConnection(poor);
 
 			/**
 			 * Once the server tears the pipeline down only a fresh SDP exchange
-			 * brings the picture back, so `failed` and `disconnected` reload to
-			 * reconnect after a grace: `disconnected` can self-heal and gets the
-			 * longer one, `failed` is final.
+			 * brings the picture back, so `failed` and `disconnected` start a new
+			 * session in place (`WebRTCSignaling.reconnect`) after a grace:
+			 * `disconnected` can self-heal and gets the longer one, `failed` is
+			 * final. A signaling socket that dropped reconnects on its own. The
+			 * page reloads only when a session reconnected to a server whose
+			 * entry page changed (`entryPageTag`): a new build these scripts may
+			 * not speak.
 			 */
 			webrtc.onconnectionstatechange = (state) => {
 				videoConnected = state;
 				if (videoConnected === "connected") {
 					status = state;
+					failedSessions = 0;
+					sessionEverConnected = true;
+					if (transportAdvised) {
+						transportAdvised = false;
+						window.postMessage({ type: 'transportAdvice', offer: null }, window.location.origin);
+					}
 					try { sessionStorage.removeItem('selkies_mode_flip'); } catch (e) { /* ignore */ }
+					entryPageTag(sessionAuthHeaders()).then((tag) => {
+						if (tag === null) return;
+						if (entryPageBaseline === null) entryPageBaseline = tag;
+						else if (tag !== entryPageBaseline) location.reload();
+					});
 					if (pcRecoveryTimer !== null) {
 						clearTimeout(pcRecoveryTimer);
 						pcRecoveryTimer = null;
@@ -2939,16 +3324,29 @@ export default function webrtc() {
 					}
 					requestWakeLock();
 					applyOutputDevice();
+					armResumeWatchdog();
 				} else if (state === "failed" || state === "disconnected") {
+					if (input) input.stopRumble();
+					if (state === "failed" && !fatalConnectionHalt && signaling.state === 'connected'
+							&& !window.__selkiesModeSwitching) {
+						failedSessions++;
+						if (!transportAdvised
+								&& failedSessions >= (sessionEverConnected ? ADVICE_FAILED_SESSIONS : 1)) {
+							transportAdvised = true;
+							console.warn(`[webrtc] ${failedSessions} session(s) failed with signaling up; offering WebSockets.`);
+							window.postMessage({ type: 'transportAdvice', offer: 'websockets' }, window.location.origin);
+						}
+					}
 					if (!fatalConnectionHalt && pcRecoveryTimer === null) {
-						const graceMs = state === "failed" ? 1500 : 8000;
+						const graceMs = state === "failed" ? PC_FAILED_GRACE_MS : PC_DISCONNECTED_GRACE_MS;
 						pcRecoveryTimer = setTimeout(() => {
 							pcRecoveryTimer = null;
 							const st = webrtc.peerConnection && webrtc.peerConnection.connectionState;
 							if (st === "connected" || fatalConnectionHalt) return;
 							if (typeof window !== 'undefined' && window.__selkiesModeSwitching) return;
-							console.warn(`[webrtc] connection ${st}; reloading to reconnect.`);
-							location.reload();
+							if (signaling.state !== 'connected') return;
+							console.warn(`[webrtc] connection ${st}; reconnecting in place.`);
+							signaling.reconnect();
 						}, graceMs);
 					}
 				}
@@ -2981,7 +3379,7 @@ export default function webrtc() {
 				}
 
 				loadLastSessionSettings();
-				settleFullColorSupport().then(sendClientPersistedSettings);
+				settleFullColorSupport().then(settleTenBitSupport).then(sendClientPersistedSettings);
 
 				// One loop per channel: a reopened channel restarts it.
 				if (metricsLoopId !== null) clearInterval(metricsLoopId);
@@ -3020,85 +3418,42 @@ export default function webrtc() {
 			}
 
 			/**
-			 * Caches server clipboard content and writes it locally when policy
-			 * allows. A tagging server marks the payload answering this client's
-			 * own `cr` with `reply_to`, which retires the timed heuristic for the
-			 * session; it is armed before the shared-mode return so the state is
-			 * consistent either way. Caching is unconditional, since gating it on
-			 * clipboardStatus made the first payload depend on message ordering;
-			 * only the local write is gated, on enablement, direction policy and
-			 * the connect-time reply being cache-only. The fetch flag is consumed
-			 * before the decode, so arrival order decides which payload settles
-			 * the init fetch.
+			 * Hands server clipboard messages to the shared receive path
+			 * (`createIncomingClipboard`), which caches them, previews them,
+			 * and writes them locally when policy allows. A tagging server
+			 * marks the payload answering this client's own `cr` with
+			 * `reply_to`, which retires the timed heuristic for the session;
+			 * it is armed before the shared-mode return so the state is
+			 * consistent either way. The fetch flag is consumed once per
+			 * payload, at its first message, so arrival order decides which
+			 * payload settles the init fetch.
 			 */
-			webrtc.onclipboardcontent = async (msg) => {
-				if (msg.data && msg.data.reply_to === 'cr') armTaggedClipboardReply();
+			webrtc.onclipboardcontent = (msg) => {
+				if (!msg.data) {
+					console.warn("Received clipboard message with null data");
+					return;
+				}
+				if (msg.data.reply_to === 'cr') armTaggedClipboardReply();
 				if (isSharedMode) {
 					return;
 				}
-				const isInitClipboardFetch = consumeInitClipboardFetch();
-				const {isMultipart, mimeType, content, preview} = await handleClipboardData(msg);
-				const isText = mimeType === "text/plain";
-				const isFlavours = mimeType === CLIPBOARD_FLAVOURS_MIME;
-				if (isMultipart || content === null) {
-					return;
-				}
-				const canWriteLocal = !isInitClipboardFetch && clipboard_seamless &&
-					clipboardStatus === 'enabled' && clipboard_out_enabled;
-
-				if (isText) {
-					// Freshness is computed before resolveServer records the signature.
-					const isFreshContent = clipboardSync.shouldSend(content, 'text/plain');
-					clipboardSync.resolveServer(content, null, 'text/plain');
-					window.postMessage(clipboardPreviewMessage(content),
-						window.location.origin);
-					if (canWriteLocal && isFreshContent) {
-						deferredClipboardWriter.write(
-							() => navigator.clipboard.writeText(content), {
-								onSuccess: () => console.log('Successfully wrote text from server to local clipboard.'),
-								onFailure: (err) => console.log('Could not copy text to clipboard: ', err),
-							});
-					}
-				} else if (isFlavours) {
-					const digest = digestedPayload(preview.length, preview);
-					const isFresh = clipboardSync.shouldSend(digest, mimeType);
-					clipboardSync.resolveServer(preview, null, mimeType, digest);
-					window.postMessage(clipboardPreviewMessage(preview), window.location.origin);
-					if (canWriteLocal && isFresh) {
-						deferredClipboardWriter.write(
-							() => navigator.clipboard.write([content]), {
-								onFailure: (err) => console.log('Could not copy session markup to clipboard: ', err),
-							});
-					}
-				} else if (enable_binary_clipboard) {
-					let isFreshImage = true;
-					try {
-						const b = await content.getType(mimeType);
-						const { byteLength, hash } = await clipboardWorker.hashBytes(await b.arrayBuffer());
-						const digest = digestedPayload(byteLength, hash);
-						isFreshImage = clipboardSync.shouldSend(digest, mimeType);
-						clipboardSync.resolveServer(undefined, b, mimeType, digest);
-					} catch (_) {}
-					if (canWriteLocal && isFreshImage) {
-						deferredClipboardWriter.write(
-							() => navigator.clipboard.write([content]), {
-								onSuccess: () => {
-									console.log(`Successfully wrote image (${mimeType}) from server to local clipboard.`);
-									clipboardSync.captureLocalImageSig();
-									window.postMessage({
-										type: 'clipboardContentUpdate',
-										text: `Image (${mimeType}) received from session and copied to clipboard.`,
-									}, window.location.origin);
-								},
-								onFailure: notifyClipboardImageWriteFailed,
-							});
-					} else if (isFreshImage && !isInitClipboardFetch && clipboard_out_enabled) {
-						// Everything but the browser allows the write, so this is
-						// a page with no clipboard to write to. An image has no
-						// other way of showing up, and silence reads as the
-						// session never having sent one.
-						notifyClipboardImageWriteFailed(new Error('the local clipboard is unavailable'));
-					}
+				switch (msg.type) {
+					case 'clipboard-msg':
+						incomingClipboard.single(msg.data.mime_type || 'text/plain', msg.data.content,
+							consumeInitClipboardFetch(), msg.data.secret === true);
+						break;
+					case 'clipboard-msg-start':
+						incomingClipboard.begin(msg.data.mime_type, msg.data.total_size,
+							consumeInitClipboardFetch(), msg.data.secret === true);
+						break;
+					case 'clipboard-msg-data':
+						incomingClipboard.push(msg.data.content);
+						break;
+					case 'clipboard-msg-end':
+						incomingClipboard.finish();
+						break;
+					default:
+						console.warn("Unknown clipboard cmd received");
 				}
 			}
 
@@ -3111,6 +3466,8 @@ export default function webrtc() {
 				const displays = (config && config.displays) || [];
 				latestDisplayLayouts = (config && config.layouts) || null;
 				serverWayland = !!(config && config.wayland);
+				serverFingerScroll = !!(config && config.finger_scroll);
+				if (input && input.setFingerScroll) input.setFingerScroll(serverFingerScroll);
 				if (input && input.setDisplayLayouts) {
 					input.setDisplayLayouts(latestDisplayLayouts, displayId);
 				}
@@ -3130,11 +3487,21 @@ export default function webrtc() {
 			 * (snapped or clamped), which manual-mode bookkeeping follows so the UI
 			 * stops re-requesting a size the server cannot produce.
 			 */
+			webrtc.onccrate = (kbps) => rememberCcStart(storageDisplayId, kbps);
 			webrtc.onprintdocument = (doc) => {
 				// A second display page is the same browser as the primary one.
-				if (printJobs && !window.location.hash.startsWith('#display2')) printJobs.announce(doc.name, doc.size_bytes);
+				if (printJobs && !urlFragmentKeyword().startsWith('#display2')) printJobs.announce(doc.name, doc.size_bytes);
 			};
 			webrtc.onsystemaction = (action) => {
+				if (action.startsWith('rumble,')) {
+					const [slot, strong, weak, ms] = action.split(',').slice(1).map(Number);
+					if (input) input.rumble(slot, strong, weak, ms);
+					return;
+				}
+				if (action.startsWith('pointer,')) {
+					if (input) input.onPointerEcho(action);
+					return;
+				}
 				if (action.startsWith('video_declined,')) {
 					const codec = action.slice('video_declined,'.length).split('/').pop().toLowerCase();
 					videoDeclined = true;
@@ -3202,7 +3569,8 @@ export default function webrtc() {
 					const previousSlot = clientSlot;
 					clientRole = perms.role === CLIENT_CONTROLLER ? CLIENT_CONTROLLER : CLIENT_VIEWER;
 					clientSlot = (perms.slot === null || perms.slot === undefined) ? null : perms.slot;
-					playerInputTargetIndex = (clientSlot !== null && clientSlot > 0) ? clientSlot - 1 : undefined;
+					const firstSlot = Array.isArray(clientSlot) ? clientSlot[0] : clientSlot;
+					playerInputTargetIndex = (firstSlot !== null && firstSlot > 0) ? firstSlot - 1 : undefined;
 					console.log(`Server role verdict: role=${clientRole}, slot=${clientSlot}`);
 					if (input) {
 						input.updateControllerSlot(clientSlot);
@@ -3315,18 +3683,32 @@ export default function webrtc() {
 			 * choice governs unless locked), applies the session's start policy on
 			 * a connection's first payload, pushes the pre-copied local clipboard
 			 * once the gates are in place, and switches between the manual and
-			 * auto resize handlers.
+			 * auto resize handlers. The CRF and bitrate a rate-control switch
+			 * restates (`sendRespectiveRCvalue`) are taken from the sanitized
+			 * values, the stored pick else the operator's default, which the
+			 * dashboards show and the server already applies; the core's own
+			 * defaults would move the stream off both.
 			 */
+			webrtc.ondisplaysettings = (obj) => followDisplaySettings((obj && obj.settings) || {});
 			webrtc.onserversettings = (obj) => {
 				if (obj.settings === undefined || obj.settings === null) {
 					console.warn("Received invalid server settings paylod");
 					return;
 				}
 				console.log("Received server settings payload:", obj.settings);
+				lastServerSettings = obj.settings;
 				const changes = sanitizeAndStoreSettings(obj.settings);
+				if (Number.isFinite(window.video_crf)) crf = Math.round(window.video_crf);
+				if (Number.isFinite(window.video_bitrate)) videoBitRate = Math.round(window.video_bitrate);
+				const fr = obj.settings.framerate;
+				framerateSpan = fr && fr.min !== undefined ? { min: fr.min, max: fr.max } : null;
+				followDisplayFramerate();
 				const fcEntry = obj.settings && obj.settings.video_fullcolor;
 				fullColorLocked = !!(fcEntry && fcEntry.locked);
 				if (fcEntry) declineUndecodableFullColor();
+				const tbEntry = obj.settings && obj.settings.video_10bit;
+				tenBitLocked = !!(tbEntry && tbEntry.locked);
+				if (tbEntry) declineUndecodableTenBit();
 				const wce = obj.settings && obj.settings.webcam_encoder;
 				if (wce && WEBCAM_ENCODER_PREFERENCES.includes(wce.value)) {
 					const stored = getStringParam('webcam_encoder', wce.value);
@@ -3481,6 +3863,8 @@ export default function webrtc() {
 			appName = null;
 			videoBitRate = 8000;
 			videoFramerate = 60;
+			if (displayRefresh) displayRefresh.stop();
+			displayRefresh = framerateSpan = framerateAsked = null;
 			audioBitRate = 128000;
 			showStart = false;
 			showDrawer = false;
@@ -3489,7 +3873,6 @@ export default function webrtc() {
 			status = 'connecting';
 			clipboardStatus = 'disabled';
 			windowResolution = [];
-			encoderLabel = "";
 			encoder = ""
 			gamepad = {
 					gamepadState: 'disconnected',
@@ -3528,11 +3911,11 @@ export default function webrtc() {
 			pipelinesToggledByUser.clear();
 			startPolicyApplied = false;
 			videoConnected = "";
-			audioConnected = "";
 			statWatchEnabled = false;
 			streamStats.disconnected();
 			statsBaseline = null;
-			if (statsLoopId !== null) { clearInterval(statsLoopId); statsLoopId = null; }
+			statsTick = null;
+			if (statsTimer !== null) { clearTimeout(statsTimer); statsTimer = null; }
 			if (metricsLoopId !== null) { clearInterval(metricsLoopId); metricsLoopId = null; }
 			clearResumeWatchdog();
 			webrtc = null;
@@ -3544,7 +3927,7 @@ export default function webrtc() {
 			enableWebrtcStatics = false;
 			enable_binary_clipboard = true;
 			serverCommandEnabled = true;
-			multipartClipboard.reset();
+			incomingClipboard.reset();
 
 		}
 	}

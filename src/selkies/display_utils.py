@@ -31,15 +31,36 @@ would show them and need no knowledge of the framebuffer
 the primary publishes the move first (`output_layout_stage`). Anywhere else
 the server has one CRTC covering the framebuffer and each display is a RandR
 1.5 logical monitor over it, which consumers that build their screens from
-CRTCs do not follow; that layout, the window-manager restart it needs and the
+CRTCs do not follow; that layout, the window-manager restart it needs, and the
 subprocess fallbacks are `display_utils_xrandr`, which this module imports
 only at the point it falls back.
+
+Either way RandR moves a screen and leaves every window at its root
+coordinates: the primary moves back to the origin when the display on its left
+leaves, or aside when one is added there, and takes none of its windows along,
+so they end up beyond the screen or on the other display. Openbox and xfwm4
+carry an unmaximized window along with its monitor by themselves; Marco,
+Metacity, and KWin leave it where it was, and xfwm4 maximizes a window again
+on the monitor its restored geometry falls on. Every layout change therefore
+reads the manager's client list before it moves anything and asks the manager
+afterwards, through `_NET_MOVERESIZE_WINDOW`, to move each window by its own
+display's move and each window of a display that is gone onto the primary
+(`window_moves`, `_sync_follow_display_moves`), once the framebuffer holds the
+layout, since a manager constrains a move against the screen it has; the
+desktop window and panels place themselves and are left alone, except that a
+desktop window its manager left reaching past the screen is asked back to the
+origin (`_sync_seat_desktop_windows`).
 
 DPI handling here is X11-only by design: on the Wayland backend a DPI is an
 output scale on the session compositor (applied in-process through
 wlr-output-management), never Xft resources — XWayland runs in the
 compositor's logical space and is scaled with it, so Xft resources merged
-there would scale applications twice.
+there would scale applications twice. On X11 a density or cursor size
+reaches only the session on this display: the daemons told to reload and
+the settings stores written through a session bus are found by the DISPLAY
+their processes run with (`_pids_on_display`, `_session_env`), never through
+whatever bus Selkies inherited, since another display's session may share
+the home and would apply the change live.
 """
 
 import base64
@@ -51,12 +72,14 @@ import stat
 import struct
 import sys
 import tempfile
+import time
 import zlib
 from asyncio import subprocess
 import asyncio
 import threading
+from collections import deque
 from shutil import which
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple, Union
 
 from PIL import Image, ImageMath
 
@@ -65,6 +88,7 @@ from .Xlib import Xatom as x11_Xatom
 from .Xlib import display as x11_display
 from .Xlib import error as x11_error
 from .Xlib.ext import randr
+from .Xlib.protocol import event as x11_event
 from .Xlib.protocol import request as x11_request
 
 import logging
@@ -183,6 +207,7 @@ def _module_display() -> x11_display.Display:
         conn = x11_display.Display(blocking_timeout=15.0)
         conn.set_close_down_mode(x11_X.RetainTemporary)
         conn.sync()
+        _note_configured_refresh(conn)
         _reap_retained_predecessors(conn)
         _x11_conn = conn
     return _x11_conn
@@ -269,6 +294,141 @@ def _first_connected_output(d: x11_display.Display) -> Optional[int]:
         return None
 
 
+#: The refresh the display ran at when a Selkies process first reached this X
+#: server: the one it was configured with, which every mode it is given keeps
+#: (`_target_refresh`). None where the mode carried no timings to read, as a
+#: framebuffer server's first mode does.
+_configured_refresh: Optional[float] = None
+#: The root window property keeping `_configured_refresh`, in millihertz, for
+#: every later process on the same server: by then the display may run at a
+#: rate an earlier stream raised it to, which is no configuration.
+_CONFIGURED_REFRESH_PROP = "_SELKIES_CONFIGURED_REFRESH"
+#: How far a mode's refresh may sit from the one asked for and still serve:
+#: the room a driver's and CVT's clock rounding take (119.88 for 120), short
+#: of the step to the next common rate.
+_REFRESH_SLACK = 0.01
+
+
+def _mode_refresh(mode: Any) -> float:
+    """A RandR mode's refresh in Hz as xrandr reports it (the field rate of an
+    interlaced mode), or 0 for a mode without timings."""
+    v_total = float(mode.v_total)
+    if mode.flags & randr.DoubleScan:
+        v_total *= 2
+    if mode.flags & randr.Interlace:
+        v_total /= 2
+    if not mode.h_total or not v_total:
+        return 0.0
+    return mode.dot_clock / (mode.h_total * v_total)
+
+
+def _note_configured_refresh(d: x11_display.Display) -> None:
+    """Learn the configured refresh once per process: from the root window
+    where an earlier process on this server recorded it, else from the mode
+    the display shows before anything has changed it, then recorded there."""
+    global _configured_refresh
+    if _configured_refresh is not None:
+        return
+    try:
+        root = d.screen().root
+        atom = d.intern_atom(_CONFIGURED_REFRESH_PROP)
+        prop = root.get_full_property(atom, x11_Xatom.CARDINAL)
+        if prop is not None and len(prop.value) and prop.value[0] > 0:
+            _configured_refresh = prop.value[0] / 1000.0
+            return
+        _, res, _, oi, _ = _connected_output_state(d)
+        if not oi.crtc:
+            return
+        mode = randr.get_crtc_info(d, oi.crtc, res.config_timestamp).mode
+        rate = next((_mode_refresh(m) for m in res.modes if m.id == mode), 0.0)
+        if rate > 0:
+            _configured_refresh = rate
+            root.change_property(atom, x11_Xatom.CARDINAL, 32, [int(round(rate * 1000))])
+            d.sync()
+    except Exception as e:
+        logger_app_resize.debug(f"Configured refresh not read: {e}")
+
+
+def _target_refresh(stream_fps: Optional[float]) -> float:
+    """The refresh a display mode is chosen or made at.
+
+    The configured refresh, or the stream's frame rate where that is higher:
+    a vsynced application presents at the refresh and no faster, so a display
+    slower than the stream caps what the stream can show, and one slower than
+    configured drops what the operator asked for. 60 where neither is known.
+    A framebuffer server paces its vblank by the stream on its own
+    (`_FAKE_SCREEN_MILLIHZ`), so there the rate only names the mode.
+    """
+    return max(_configured_refresh or 0.0, float(stream_fps or 0.0)) or 60.0
+
+
+def _mode_at(
+    d: x11_display.Display,
+    root: Any,
+    res: Any,
+    oi: Any,
+    out_id: int,
+    names: Dict[int, str],
+    w: int,
+    h: int,
+    refresh: float,
+    name: str,
+) -> Tuple[int, float]:
+    """Resolve or create a ``w`` x ``h`` mode at ``refresh`` on output ``out_id``.
+
+    A mode is chosen by its geometry and refresh, never by name: a driver lists
+    several modes under one name, and the first of them is whatever it sorted
+    first (NVIDIA's pool holds most sizes at 60 Hz beside the configured mode,
+    and 1024x768 at 43 Hz ahead of the rest). Interlaced and doublescan modes
+    never serve; one without timings, a framebuffer server's, serves any
+    refresh. A mode on the output is preferred, and one elsewhere serves only
+    under a name this made for the purpose. A missing mode is made from CVT-RB
+    timings at ``refresh``, exactly ``w`` wide, and named ``name`` unless a mode
+    holds that name already, then with its rate appended, since RandR refuses a
+    user mode under a name that exists. Modes are owned by the creating
+    connection, so this must run on the retained module connection for the
+    mode to outlive the call.
+
+    Returns:
+        The mode's id, attached to the output, and its refresh.
+    """
+    on_output = set(oi.modes)
+    fits = []
+    for m in res.modes:
+        if (m.width, m.height) != (w, h) or m.flags & (randr.Interlace | randr.DoubleScan):
+            continue
+        if m.id not in on_output and names.get(m.id, "").split("_")[0] != name:
+            continue
+        rate = _mode_refresh(m)
+        off = abs(rate - refresh) if rate > 0 else 0.0
+        if off <= refresh * _REFRESH_SLACK:
+            fits.append((m.id not in on_output, off, m.id, rate or refresh))
+    if fits:
+        detached, _, mode_id, rate = min(fits)
+        if detached:
+            randr.add_output_mode(d, out_id, mode_id)
+        return mode_id, rate
+    taken = set(names.values())
+    mode_name = next((n for n in (name, f"{name}_{refresh:.0f}", f"{name}_{refresh:.2f}")
+                      if n not in taken), None)
+    if mode_name is None:
+        raise RuntimeError(f"no free name for a {w}x{h} mode at {refresh:.2f} Hz")
+    info = _cvt_rb_mode_info(w, h, refresh)
+    # CVT rounds the clock down to its quarter-megahertz step, which leaves the
+    # mode slower than asked, and a quarter megahertz up runs a small mode fast
+    # (60.21 Hz at 1280x720), so vsynced frames beat against the stream's rate.
+    # The next 10 kHz up, an EDID timing's step, keeps it neither slower than
+    # asked nor faster by more than 0.01 Hz.
+    info["dot_clock"] = -(-int(info["h_total"] * info["v_total"] * refresh) // 10_000) * 10_000
+    info["width"] = w
+    info["id"] = 0
+    info["name_length"] = len(mode_name)
+    mode_id = randr.create_mode(root, info, mode_name).mode
+    names[mode_id] = mode_name
+    randr.add_output_mode(d, out_id, mode_id)
+    return mode_id, info["dot_clock"] / (info["h_total"] * info["v_total"])
+
+
 def _sync_query_randr() -> Tuple[str, List[str], str]:
     """Blocking RandR query on the module connection.
 
@@ -300,44 +460,7 @@ def _sync_query_randr() -> Tuple[str, List[str], str]:
             raise
 
 
-def _ensure_mode_on_display(
-    d: x11_display.Display,
-    root: Any,
-    res: Any,
-    oi: Any,
-    out_id: int,
-    names: Dict[int, str],
-    res_str: str,
-    w_req: int,
-    h_req: int,
-) -> Tuple[int, int, int]:
-    """Resolve or create the mode named ``res_str`` on output ``out_id``.
-
-    Creates the mode from CVT-RB timings and attaches it to the output when
-    absent. Modes are owned by the creating connection, so this must run on
-    the retained module connection for the mode to outlive the call.
-
-    Returns:
-        ``(mode_id, width, height)`` of the resolved mode.
-    """
-    mode_id = next((m for m in oi.modes if names.get(m) == res_str), None)
-    if mode_id is not None:
-        w, h = next((m.width, m.height) for m in res.modes if m.id == mode_id)
-        return mode_id, w, h
-    mode_id = next((mid for mid, n in names.items() if n == res_str), None)
-    if mode_id is None:
-        info = _cvt_rb_mode_info(w_req, h_req)
-        info["id"] = 0
-        info["name_length"] = len(res_str)
-        mode_id = randr.create_mode(root, info, res_str).mode
-        randr.add_output_mode(d, out_id, mode_id)
-        return mode_id, info["width"], info["height"]
-    randr.add_output_mode(d, out_id, mode_id)
-    w, h = next((m.width, m.height) for m in res.modes if m.id == mode_id)
-    return mode_id, w, h
-
-
-def _sync_ensure_mode(res_str: str) -> None:
+def _sync_ensure_mode(res_str: str, refresh: Optional[float] = None) -> None:
     """Blocking ensure-mode on the module connection (no CRTC/screen change).
 
     Raises:
@@ -351,9 +474,9 @@ def _sync_ensure_mode(res_str: str) -> None:
         try:
             d = _module_display()
             root, res, out_id, oi, names = _connected_output_state(d)
-            mode_id, _, _ = _ensure_mode_on_display(
-                d, root, res, oi, out_id, names, res_str, w_req, h_req
-            )
+            w_cell = -(-w_req // 8) * 8
+            mode_id, _ = _mode_at(d, root, res, oi, out_id, names, w_cell, h_req,
+                                  _target_refresh(refresh), f"{w_cell}x{h_req}")
             d.sync()
             _, _, _, oi, _ = _connected_output_state(d)
             if mode_id not in oi.modes:
@@ -364,38 +487,101 @@ def _sync_ensure_mode(res_str: str) -> None:
             raise
 
 
-async def ensure_mode(res_str: str) -> bool:
-    """Ensure a RandR mode named ``res_str`` is attached to the connected output.
-
-    Later xrandr calls can then reference the mode by name.
+async def ensure_mode(res_str: str, refresh: Optional[float] = None) -> bool:
+    """Ensure a ``res_str`` mode is attached to the connected output, at the
+    refresh `_target_refresh` makes of ``refresh`` (the stream's frame rate).
 
     Returns:
         True on success; False leaves the caller to its subprocess fallback.
     """
     try:
-        await asyncio.to_thread(_sync_ensure_mode, res_str)
+        await asyncio.to_thread(_sync_ensure_mode, res_str, refresh)
         return True
     except Exception as e:
         logger_app_resize.info(f"Native RandR ensure-mode for '{res_str}' failed ({e}).")
         return False
 
 
-def _sync_resize_randr(res_str: str) -> Tuple[int, int]:
-    """Blocking RandR resize on the module connection.
-
-    Ensures a mode named ``res_str`` exists on the first connected output
-    (creating CVT-RB timings when absent), activates it, and sizes the screen
-    to match. Raises on any failure so the caller can fall back to xrandr.
+def _sync_refresh_output_mode(refresh: Optional[float]) -> List[float]:
+    """Blocking `refresh_output_mode` on the module connection.
 
     Returns:
-        The ``(width, height)`` actually applied.
+        The refresh of each mode set; empty where every output's mode already
+        runs at the target or carries no timings to change.
+    """
+    with _x11_lock:
+        try:
+            d = _module_display()
+            root, res, _, _, names = _connected_output_state(d)
+            target = _target_refresh(refresh)
+            modes = {m.id: m for m in res.modes}
+            rates = []
+            for out_id in res.outputs:
+                oi = randr.get_output_info(d, out_id, res.config_timestamp)
+                if oi.connection != randr.Connected or not oi.crtc:
+                    continue
+                ci = randr.get_crtc_info(d, oi.crtc, res.config_timestamp)
+                mode = modes.get(ci.mode)
+                rate = _mode_refresh(mode) if mode is not None else 0.0
+                if not rate or abs(rate - target) <= target * _REFRESH_SLACK:
+                    continue
+                w, h = mode.width, mode.height
+                prefix = "selkies-" if names.get(mode.id, "").startswith("selkies-") else ""
+                mode_id, rate = _mode_at(d, root, res, oi, out_id, names, w, h, target,
+                                         f"{prefix}{w}x{h}")
+                status = randr.set_crtc_config(
+                    d, oi.crtc, res.config_timestamp, ci.x, ci.y, mode_id,
+                    ci.rotation or randr.Rotate_0, list(ci.outputs),
+                ).status
+                if status != randr.SetConfigSuccess:
+                    raise RuntimeError(f"SetCrtcConfig returned status {status}")
+                rates.append(rate)
+            d.sync()
+            return rates
+        except Exception as e:
+            if not isinstance(e, x11_error.XError):
+                _drop_module_display()
+            raise
+
+
+async def refresh_output_mode(refresh: Optional[float]) -> None:
+    """Keep every connected output at the refresh `_target_refresh` makes of
+    ``refresh``, the stream's new frame rate, where the rate changes without
+    a resize.
+
+    Each output keeps its geometry and position and takes a mode of the same
+    size at the new refresh (`_mode_at`), so the screen, the monitors, and
+    every capture stay as they are.
+    """
+    try:
+        rates = await asyncio.to_thread(_sync_refresh_output_mode, refresh)
+    except Exception as e:
+        logger_app_resize.warning(f"Display refresh not changed for {refresh:g} fps ({e}).")
+        return
+    if rates:
+        logger_app_resize.info(
+            f"Display refresh set to {', '.join(f'{r:.2f}' for r in rates)} Hz "
+            f"for a {refresh:g} fps stream.")
+
+
+def _sync_resize_randr(
+    res_str: str, refresh: Optional[float] = None,
+    output_size: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int, float]:
+    """Blocking RandR resize on the module connection (`_resize_on_display`).
+
+    Raises on any failure so the caller can fall back to xrandr.
+
+    Returns:
+        The ``(width, height, refresh)`` actually applied.
     """
     w_req, h_req = (int(p) for p in res_str.split("x"))
     if w_req <= 0 or h_req <= 0:
         raise ValueError(f"invalid resolution '{res_str}'")
     with _x11_lock:
         try:
-            return _resize_on_display(_module_display(), res_str, w_req, h_req)
+            return _resize_on_display(
+                _module_display(), res_str, w_req, h_req, refresh, output_size)
         except Exception as e:
             if not isinstance(e, x11_error.XError):
                 _drop_module_display()
@@ -403,24 +589,42 @@ def _sync_resize_randr(res_str: str) -> Tuple[int, int]:
 
 
 def _resize_on_display(
-    d: x11_display.Display, res_str: str, w_req: int, h_req: int
-) -> Tuple[int, int]:
+    d: x11_display.Display, res_str: str, w_req: int, h_req: int,
+    refresh: Optional[float] = None, output_size: Optional[Tuple[int, int]] = None,
+) -> Tuple[int, int, float]:
     """The RandR mode-create/activate/screen-size sequence on connection ``d``.
 
-    CVT-RB snaps the width up to its 8-pixel cell, so the realized mode can be
-    wider than requested; the mode is named for its real geometry because a
-    name that disagrees with the pixel size breaks later xrandr calls that
-    derive framebuffer dimensions from it. The physical size follows the DPI
-    the last ``set_dpi`` stamped (96 when never retargeted): xdpyinfo and the
-    toolkit paths reading RandR's physical size would otherwise un-scale after
-    every resize. The screen may not shrink under an active CRTC, so a CRTC
-    that would poke out of the new screen is disabled first, as xrandr does.
+    The screen takes the width rounded up to the 8-pixel CVT cell, which is
+    what the modes created for it carry; they are named for that geometry
+    because a name that disagrees with the pixel size breaks later xrandr calls
+    that derive framebuffer dimensions from it. The mode is chosen or made at
+    the refresh `_target_refresh` makes of ``refresh``, the stream's frame
+    rate (`_mode_at`). ``output_size``, the one display of a logical-monitor
+    layout, has the output show exactly that rectangle from the origin instead
+    of the whole screen: Qt takes a monitor's geometry from its CRTC and
+    announces a change only where the two agree, so a monitor narrower than its
+    CRTC leaves a Qt desktop at the size it had (`display_utils_xrandr`). The
+    physical size follows the DPI the last ``set_dpi`` stamped (96 when never
+    retargeted): xdpyinfo and the toolkit paths reading RandR's physical size
+    would otherwise un-scale after every resize. The screen may not shrink
+    under an active CRTC, so a CRTC that would poke out of the new screen is
+    disabled first, as xrandr does.
+
+    Returns:
+        The screen's ``(width, height)`` and the refresh of the mode set.
     """
     root, res, out_id, oi, names = _connected_output_state(d)
-    mode_name = f"{-(-w_req // 8) * 8}x{h_req}"
-    mode_id, mode_w, mode_h = _ensure_mode_on_display(
-        d, root, res, oi, out_id, names, mode_name, w_req, h_req
-    )
+    screen_w, screen_h = -(-w_req // 8) * 8, h_req
+    target = _target_refresh(refresh)
+    out_w, out_h = output_size or (screen_w, screen_h)
+    if out_w > screen_w or out_h > screen_h:
+        out_w, out_h = screen_w, screen_h
+    if (out_w, out_h) == (screen_w, screen_h):
+        mode_id, rate = _mode_at(d, root, res, oi, out_id, names, screen_w, screen_h,
+                                 target, f"{screen_w}x{screen_h}")
+    else:
+        mode_id, rate = _mode_at(d, root, res, oi, out_id, names, out_w, out_h,
+                                 target, f"selkies-{out_w}x{out_h}")
     crtc = oi.crtc or (oi.crtcs[0] if oi.crtcs else 0)
     if not crtc:
         raise RuntimeError("output has no usable CRTC")
@@ -428,10 +632,11 @@ def _resize_on_display(
     outputs = list(ci.outputs) or [out_id]
     geom = root.get_geometry()
     dpi_hint = _APPLIED_DPI if _APPLIED_DPI is not None else 96
-    mm_w = max(1, round(mode_w * 25.4 / dpi_hint))
-    mm_h = max(1, round(mode_h * 25.4 / dpi_hint))
+    mm_w = max(1, round(screen_w * 25.4 / dpi_hint))
+    mm_h = max(1, round(screen_h * 25.4 / dpi_hint))
     rotation = ci.rotation or randr.Rotate_0
-    crtc_fits = ci.x + ci.width <= mode_w and ci.y + ci.height <= mode_h
+    crtc_x, crtc_y = (ci.x, ci.y) if output_size is None else (0, 0)
+    crtc_fits = ci.x + ci.width <= screen_w and ci.y + ci.height <= screen_h
     d.grab_server()
     try:
         if ci.mode and not crtc_fits:
@@ -440,10 +645,10 @@ def _resize_on_display(
             ).status
             if status != randr.SetConfigSuccess:
                 raise RuntimeError(f"CRTC disable returned status {status}")
-        if (geom.width, geom.height) != (mode_w, mode_h):
-            randr.set_screen_size(root, mode_w, mode_h, mm_w, mm_h)
+        if (geom.width, geom.height) != (screen_w, screen_h):
+            randr.set_screen_size(root, screen_w, screen_h, mm_w, mm_h)
         status = randr.set_crtc_config(
-            d, crtc, res.config_timestamp, ci.x, ci.y, mode_id,
+            d, crtc, res.config_timestamp, crtc_x, crtc_y, mode_id,
             rotation, outputs,
         ).status
         if status != randr.SetConfigSuccess:
@@ -458,11 +663,11 @@ def _resize_on_display(
             pass
     d.sync()
     geom = root.get_geometry()
-    if (geom.width, geom.height) != (mode_w, mode_h):
+    if (geom.width, geom.height) != (screen_w, screen_h):
         raise RuntimeError(
             f"screen is {geom.width}x{geom.height} after applying '{res_str}'"
         )
-    return mode_w, mode_h
+    return screen_w, screen_h, rate
 
 
 #: The output property a server offers on an output a client may plug in and
@@ -507,31 +712,19 @@ async def has_pluggable_outputs() -> bool:
 
 def _exact_mode(
     d: x11_display.Display, root: Any, res: Any, out_id: int,
-    names: Dict[int, str], w: int, h: int,
+    names: Dict[int, str], w: int, h: int, refresh: float,
 ) -> int:
-    """Resolve or create a mode of exactly ``w`` x ``h`` on ``out_id``.
+    """Resolve or create a mode of exactly ``w`` x ``h`` at ``refresh`` on ``out_id``.
 
     A display's output is the rectangle its client streams, so the width is
-    not rounded up to the CVT cell as `_ensure_mode_on_display` does for a
+    not rounded up to the CVT cell as `_resize_on_display` does for a
     mode covering the whole framebuffer: two outputs side by side would
     overlap by the difference. The name says which kind it is, because a
-    "WxH" name is looked up by both.
+    "WxH" name is looked up by both. The refresh is chosen as for any mode
+    (`_mode_at`).
     """
-    name = f"selkies-{w}x{h}"
     oi = randr.get_output_info(d, out_id, res.config_timestamp)
-    mode_id = next((m for m in oi.modes if names.get(m) == name), None)
-    if mode_id is not None:
-        return mode_id
-    mode_id = next((mid for mid, n in names.items() if n == name), None)
-    if mode_id is None:
-        info = _cvt_rb_mode_info(w, h)
-        info["width"] = w
-        info["id"] = 0
-        info["name_length"] = len(name)
-        mode_id = randr.create_mode(root, info, name).mode
-        names[mode_id] = name
-    randr.add_output_mode(d, out_id, mode_id)
-    return mode_id
+    return _mode_at(d, root, res, oi, out_id, names, w, h, refresh, f"selkies-{w}x{h}")[0]
 
 
 def _set_crtc(
@@ -554,8 +747,272 @@ def _plug(d: x11_display.Display, out_id: int, plugged: bool) -> None:
         x11_X.PropModeReplace, (32, [1 if plugged else 0]))
 
 
+#: A display's rectangle, ``(x, y, w, h)`` in root coordinates.
+Rect = Tuple[int, int, int, int]
+
+#: Window types a layout leaves where they are: the desktop window covers the
+#: root whatever the layout, and a panel places itself on its monitor's edge.
+_SELF_PLACING_WINDOW_TYPES = ("_NET_WM_WINDOW_TYPE_DESKTOP", "_NET_WM_WINDOW_TYPE_DOCK")
+
+
+def window_moves(
+    windows: Iterable[Tuple[Any, int, int, int, int]],
+    before: Dict[str, Rect], after: Dict[str, Rect],
+) -> List[Tuple[Any, int, int]]:
+    """Where each window goes when the displays move from ``before`` to ``after``.
+
+    A window belongs to the display whose old rectangle holds its center. One
+    whose display moved goes with it, by the display's own move, so it keeps
+    its place on that screen; one whose display is gone goes onto the primary,
+    at the same place within it. Either is brought inside its new screen where
+    it would poke out of it, so no title bar ends up beyond an edge. A window
+    on no display, or on one that stayed, keeps its place.
+
+    Args:
+        windows: ``(window, x, y, w, h)`` in root coordinates.
+        before: Display id to rectangle as the displays were.
+        after: The same for the layout replacing them.
+
+    Returns:
+        ``(window, x, y)`` for every window that moves.
+    """
+    moves = []
+    primary = after.get("primary")
+    for win, x, y, w, h in windows:
+        cx, cy = x + w // 2, y + h // 2
+        home = next((did for did, (bx, by, bw, bh) in before.items()
+                     if bx <= cx < bx + bw and by <= cy < by + bh), None)
+        if home is None:
+            continue
+        old, new = before[home], after.get(home, primary)
+        if new is None:
+            continue
+        nx, ny = x + new[0] - old[0], y + new[1] - old[1]
+        nx = min(max(nx, new[0]), new[0] + max(new[2] - w, 0))
+        ny = min(max(ny, new[1]), new[1] + max(new[3] - h, 0))
+        if (nx, ny) != (x, y):
+            moves.append((win, nx, ny))
+    return moves
+
+
+def _sync_client_windows(d: x11_display.Display, root: Any) -> List[Tuple[Any, int, int, int, int]]:
+    """The window manager's clients with their rectangles in root coordinates,
+    less the self-placing kinds; empty where no manager publishes
+    ``_NET_CLIENT_LIST``."""
+    listed = root.get_full_property(d.intern_atom("_NET_CLIENT_LIST"), x11_X.AnyPropertyType)
+    if listed is None:
+        return []
+    self_placing = {d.intern_atom(name) for name in _SELF_PLACING_WINDOW_TYPES}
+    kind_atom = d.intern_atom("_NET_WM_WINDOW_TYPE")
+    windows = []
+    for wid in listed.value:
+        win = d.create_resource_object("window", int(wid))
+        try:
+            kind = win.get_full_property(kind_atom, x11_X.AnyPropertyType)
+            if kind is not None and self_placing.intersection(int(a) for a in kind.value):
+                continue
+            geom = win.get_geometry()
+            at = root.translate_coords(win, 0, 0)
+        except x11_error.XError:
+            continue
+        windows.append((win, int(at.x), int(at.y), int(geom.width), int(geom.height)))
+    return windows
+
+
+def _sync_output_rects(d: x11_display.Display, ts: int, outputs: Dict[str, int]) -> Dict[str, Rect]:
+    """Each display's rectangle from its output's CRTC, for the outputs driving one."""
+    rects = {}
+    for did, out_id in outputs.items():
+        oi = randr.get_output_info(d, out_id, ts)
+        if oi.crtc:
+            ci = randr.get_crtc_info(d, oi.crtc, ts)
+            if ci.mode:
+                rects[did] = (ci.x, ci.y, ci.width, ci.height)
+    return rects
+
+
+#: How long a window manager is given to put the windows where they were
+#: asked to go, read back and asked again meanwhile.
+_MANAGER_SETTLE_S = 1.5
+
+#: How far a client may sit from where it was asked to go and count as there.
+_MOVE_SLACK = 2
+
+
+def _sync_set_maximized(d: x11_display.Display, root: Any, win: Any, on: bool) -> None:
+    """Ask the manager to maximize `win` both ways, or to restore it."""
+    root.send_event(
+        x11_event.ClientMessage(
+            window=win, client_type=d.intern_atom("_NET_WM_STATE"),
+            data=(32, [1 if on else 0, d.intern_atom("_NET_WM_STATE_MAXIMIZED_HORZ"),
+                       d.intern_atom("_NET_WM_STATE_MAXIMIZED_VERT"), 2, 0])),
+        event_mask=x11_X.SubstructureRedirectMask | x11_X.SubstructureNotifyMask)
+
+
+def _sync_is_maximized(d: x11_display.Display, win: Any) -> bool:
+    state = win.get_full_property(d.intern_atom("_NET_WM_STATE"), x11_X.AnyPropertyType)
+    if state is None:
+        return False
+    maximized = {d.intern_atom("_NET_WM_STATE_MAXIMIZED_HORZ"), d.intern_atom("_NET_WM_STATE_MAXIMIZED_VERT")}
+    return bool(maximized.intersection(int(a) for a in state.value))
+
+
+def _sync_follow_display_moves(
+    d: x11_display.Display, root: Any, windows: List[Tuple[Any, int, int, int, int]],
+    before: Dict[str, Rect], after: Dict[str, Rect],
+) -> int:
+    """Ask the window manager for every move `window_moves` wants, each an
+    ``_NET_MOVERESIZE_WINDOW`` with static gravity, so the request names the
+    client window's own corner and the frame around it stays the manager's
+    business, from a pager's source indication so it is honored as a user's
+    own move would be.
+
+    The result is read back and a window not where it was asked to go is
+    asked again, for a bounded moment: a manager still taking in the new
+    screen re-places the window by its own rule after the request (KWin does,
+    for a display added above), and the later ask is the one that stands. A
+    maximized window is measured by the screen its center is on, since its
+    corner is the manager's; one the manager kept on the screen it was
+    maximized on (xfwm4 maximizes a window again on the monitor its restored
+    geometry falls on) is restored for the move and maximized again once it
+    has landed.
+
+    Returns:
+        How many windows were asked to move.
+    """
+    moves = window_moves(windows, before, after)
+    if not moves:
+        return 0
+    move_atom = d.intern_atom("_NET_MOVERESIZE_WINDOW")
+    flags = x11_X.StaticGravity | (1 << 8) | (1 << 9) | (2 << 12)
+    sizes = {win.id: (w, h) for win, _, _, w, h in windows}
+
+    def screen_of(x: int, y: int, w: int, h: int) -> Optional[Rect]:
+        cx, cy = x + w // 2, y + h // 2
+        return next((r for r in after.values() if r[0] <= cx < r[0] + r[2] and r[1] <= cy < r[1] + r[3]), None)
+
+    pending = {win.id: (win, x, y) for win, x, y in moves}
+    restored: set = set()
+    deadline = time.monotonic() + _MANAGER_SETTLE_S
+    rounds = 0
+    while pending:
+        for win, x, y in pending.values():
+            root.send_event(
+                x11_event.ClientMessage(window=win, client_type=move_atom, data=(32, [flags, x, y, 0, 0])),
+                event_mask=x11_X.SubstructureRedirectMask | x11_X.SubstructureNotifyMask)
+        d.flush()
+        time.sleep(0.15)
+        rounds += 1
+        for wid, (win, x, y) in list(pending.items()):
+            try:
+                at = root.translate_coords(win, 0, 0)
+                maximized = _sync_is_maximized(d, win)
+            except x11_error.XError:
+                del pending[wid]
+                continue
+            w, h = sizes[wid]
+            landed = (abs(at.x - x) <= _MOVE_SLACK and abs(at.y - y) <= _MOVE_SLACK) or (
+                maximized and screen_of(at.x, at.y, w, h) == screen_of(x, y, w, h))
+            if landed:
+                del pending[wid]
+                if wid in restored:
+                    _sync_set_maximized(d, root, win, True)
+            elif maximized and rounds > 1 and wid not in restored:
+                restored.add(wid)
+                _sync_set_maximized(d, root, win, False)
+        if time.monotonic() >= deadline:
+            break
+    for wid in restored:
+        if wid in pending:
+            _sync_set_maximized(d, root, pending[wid][0], True)
+    d.flush()
+    logger_app_resize.debug(
+        f"Asked the window manager to move {len(moves)} window(s) with their displays; "
+        f"{len(pending)} not there after {rounds} round(s).")
+    return len(moves)
+
+
+#: How long a desktop is given to size its background window to a new
+#: arrangement, watched for one left away from the origin.
+_DESKTOP_SETTLE_S = 3.0
+
+
+def _sync_seat_desktop_windows(settle_s: float = _DESKTOP_SETTLE_S) -> int:
+    """Keep a desktop's background window at the screen's origin while the
+    desktop takes in a new arrangement.
+
+    pcmanfm-qt draws one window over the union of the screens on X11 and,
+    told of the screens one at a time, first moves it to the primary's new
+    place and then grows it to the union; Openbox keeps the top or left edge
+    of a window growing that way on the monitor most of it is on, so a display
+    added above or left of the primary leaves the grown window at the
+    primary's offset with the union's size, blank on the new display and
+    showing it the primary's share of the wallpaper. A desktop window reaching
+    past the screen is asked, as a pager's move of its own corner, to sit at
+    the origin, which a manager grants since nothing grows. The desktop's
+    asks follow the manager's notices by a moment of their own, so the screen
+    is watched for a bounded moment, on a connection of this call's own since
+    it runs beside the layout's thread.
+
+    Returns:
+        How many windows were seated.
+    """
+    try:
+        d = x11_display.Display()
+    except Exception as e:
+        logger_app_resize.debug(f"No X connection to watch the desktop window on ({e}).")
+        return 0
+    seated: set = set()
+    try:
+        root = d.screen().root
+        list_atom = d.intern_atom("_NET_CLIENT_LIST")
+        kind_atom = d.intern_atom("_NET_WM_WINDOW_TYPE")
+        desktop_atom = d.intern_atom("_NET_WM_WINDOW_TYPE_DESKTOP")
+        move_atom = d.intern_atom("_NET_MOVERESIZE_WINDOW")
+        flags = x11_X.StaticGravity | (1 << 8) | (1 << 9) | (2 << 12)
+        deadline = time.monotonic() + settle_s
+        while True:
+            screen = root.get_geometry()
+            listed = root.get_full_property(list_atom, x11_X.AnyPropertyType)
+            for wid in (listed.value if listed is not None else []):
+                win = d.create_resource_object("window", int(wid))
+                try:
+                    kind = win.get_full_property(kind_atom, x11_X.AnyPropertyType)
+                    if kind is None or desktop_atom not in (int(a) for a in kind.value):
+                        continue
+                    geom = win.get_geometry()
+                    at = root.translate_coords(win, 0, 0)
+                except x11_error.XError:
+                    continue
+                if (at.x, at.y) != (0, 0) and (
+                        at.x + geom.width > screen.width or at.y + geom.height > screen.height):
+                    root.send_event(
+                        x11_event.ClientMessage(window=win, client_type=move_atom, data=(32, [flags, 0, 0, 0, 0])),
+                        event_mask=x11_X.SubstructureRedirectMask | x11_X.SubstructureNotifyMask)
+                    d.flush()
+                    seated.add(int(wid))
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.15)
+    except Exception as e:
+        logger_app_resize.debug(f"Stopped watching the desktop window ({e}).")
+    finally:
+        d.close()
+    if seated:
+        logger_app_resize.debug(f"Asked the window manager to seat {len(seated)} desktop window(s) at the origin.")
+    return len(seated)
+
+
+def seat_desktop_windows() -> None:
+    """Watch for a desktop window the arrangement just applied left away from
+    the origin, beside the layout's own thread so no display waits on the
+    desktop's own reaction."""
+    threading.Thread(target=_sync_seat_desktop_windows, name="selkies-desktop-seat", daemon=True).start()
+
+
 def _sync_apply_output_layout(
-    layouts: Dict[str, Dict[str, int]], total_w: int, total_h: int
+    layouts: Dict[str, Dict[str, int]], total_w: int, total_h: int,
+    refresh: Optional[float] = None,
 ) -> None:
     """Blocking layout of every display as an output of its own.
 
@@ -567,7 +1024,8 @@ def _sync_apply_output_layout(
     uses are switched off and unplugged, the screen grows to hold the old and
     the new arrangement at once (a CRTC may never poke out of the screen),
     each display's output is plugged in and its CRTC given the display's
-    exact mode at the display's position, and the screen shrinks to the
+    exact mode, at the refresh `_target_refresh` makes of ``refresh`` (the
+    stream's frame rate), at the display's position, and the screen shrinks to the
     total. Logical monitors a previous layout defined are deleted, since the
     server derives a monitor from every active CRTC once none is defined.
 
@@ -585,6 +1043,8 @@ def _sync_apply_output_layout(
             if len(layouts) > 1 + len(spare):
                 raise RuntimeError(
                     f"{len(layouts)} displays but {1 + len(spare)} outputs")
+            windows = _sync_client_windows(d, root)
+            before = _sync_output_rects(d, res.config_timestamp, {"primary": primary_out, **_output_of})
             held = {did: out for did, out in _output_of.items()
                     if did in layouts and out in spare}
             free = [out for out in spare if out not in held.values()]
@@ -628,7 +1088,8 @@ def _sync_apply_output_layout(
                     crtc = oi.crtc or (oi.crtcs[0] if oi.crtcs else 0)
                     if not crtc:
                         raise RuntimeError(f"output {oi.name} has no usable CRTC")
-                    mode_id = _exact_mode(d, root, res, out_id, names, l["w"], l["h"])
+                    mode_id = _exact_mode(d, root, res, out_id, names, l["w"], l["h"],
+                                          _target_refresh(refresh))
                     _set_crtc(d, crtc, ts, l["x"], l["y"], mode_id, [out_id])
                 size_screen(total_w, total_h)
                 randr.set_output_primary(root, primary_out)
@@ -647,6 +1108,10 @@ def _sync_apply_output_layout(
                 got = (ci.x, ci.y, ci.width, ci.height) if ci else None
                 if got != (l["x"], l["y"], l["w"], l["h"]):
                     raise RuntimeError(f"display '{did}' realized as {got}")
+            _sync_follow_display_moves(
+                d, root, windows, before,
+                {did: (l["x"], l["y"], l["w"], l["h"]) for did, l in layouts.items()})
+            seat_desktop_windows()
         except Exception as e:
             if not isinstance(e, x11_error.XError):
                 _drop_module_display()
@@ -728,14 +1193,16 @@ def _sync_retire_outputs() -> None:
         try:
             d = _module_display()
             try:
-                _, res, primary_out, poi, _ = _connected_output_state(d)
+                root, res, primary_out, poi, _ = _connected_output_state(d)
             except RuntimeError:
                 return
             spare = _pluggable_outputs(d, res, primary_out)
             if not spare:
                 return
-            _output_of.clear()
             ts = res.config_timestamp
+            windows = _sync_client_windows(d, root)
+            before = _sync_output_rects(d, ts, {"primary": primary_out, **_output_of})
+            _output_of.clear()
             d.grab_server()
             try:
                 for out_id in spare:
@@ -755,6 +1222,10 @@ def _sync_retire_outputs() -> None:
                 except Exception:
                     pass
             d.sync()
+            if "primary" in before:
+                _sync_follow_display_moves(
+                    d, root, windows, before, {"primary": (0, 0) + before["primary"][2:]})
+            seat_desktop_windows()
         except Exception as e:
             if not isinstance(e, x11_error.XError):
                 _drop_module_display()
@@ -762,10 +1233,12 @@ def _sync_retire_outputs() -> None:
 
 
 async def apply_output_layout(
-    layouts: Dict[str, Dict[str, int]], total_w: int, total_h: int
+    layouts: Dict[str, Dict[str, int]], total_w: int, total_h: int,
+    refresh: Optional[float] = None,
 ) -> bool:
     """Lay every display out as an output of its own, where the server offers
-    pluggable outputs (`_sync_apply_output_layout`). A layout that adds a
+    pluggable outputs (`_sync_apply_output_layout`), each at a mode keeping
+    ``refresh``, the stream's frame rate, as `resize_display` does. A layout that adds a
     display and moves the primary is published in two steps, the move first
     (`output_layout_stage`).
 
@@ -779,9 +1252,9 @@ async def apply_output_layout(
     try:
         stage = await asyncio.to_thread(_sync_output_stage, layouts)
         if stage:
-            await asyncio.to_thread(_sync_apply_output_layout, stage, total_w, total_h)
+            await asyncio.to_thread(_sync_apply_output_layout, stage, total_w, total_h, refresh)
             await asyncio.sleep(_OUTPUT_SETTLE_S)
-        await asyncio.to_thread(_sync_apply_output_layout, layouts, total_w, total_h)
+        await asyncio.to_thread(_sync_apply_output_layout, layouts, total_w, total_h, refresh)
         return True
     except Exception as e:
         logger_app_resize.warning(
@@ -803,9 +1276,71 @@ FIRST_FRAME_WAIT_S = 5.0
 
 #: How many dropped frame ids a transport remembers, so it can hold back what
 #: would predict from one. A frame predicts from one of the last few its encoder
-#: produced (pixelflux's reference window), so an older id can never be named
-#: again and nothing is lost by forgetting it.
+#: produced (pixelflux's reference window), so nothing is lost by forgetting an
+#: older one; the ids are 16-bit, so one is named again after 65536 frames.
 LOST_FRAME_MEMORY = 64
+
+#: The shortest H.264 frame_num range, which every longer one is a multiple of:
+#: the frames a multiple of it past a keyframe are where a stream's frame_num can
+#: wrap to 0. A decoder that misses that frame cannot be predicted past the gap,
+#: so the encoder answers a loss covering it with a keyframe.
+FRAME_NUM_WRAP = 16
+
+#: The bit of a video header's type byte (offset 1) a delta frame carries where
+#: the encoder keeps it as a long-term reference predicting from a frame every
+#: page holds (`CommonFrames`): every page can decode it, so it goes to each as a
+#: key frame does. pixelflux sets it only once told which frames those are.
+FRAME_ANCHOR = 0x08
+
+
+class CommonFrames:
+    """The frames every page streaming one display holds, each told to the
+    display's encoder once (`acknowledge_reference`).
+
+    A page joins as its transport takes a key frame for it (`join`), holding
+    nothing until it holds that one, and holds each later frame it is sent,
+    which predicts from one it holds (a transport sends no other): over
+    WebSockets once its relay writes the frame, over WebRTC once transport-cc
+    reported every packet of it received. It leaves when it waits for a key
+    frame again, and when it goes. An encoder told which frames every page holds
+    keeps the newest such long-term reference while it marks another, and
+    predicts the next from a frame every page holds (FRAME_ANCHOR), so each page
+    recovers from a loss of any depth on its own and the stream carries no key
+    frame for it.
+    """
+
+    __slots__ = ("_acknowledge", "_pages", "_told", "_key")
+
+    def __init__(self, acknowledge: Callable[[int], None]) -> None:
+        self._acknowledge = acknowledge
+        self._pages: Dict[Any, deque] = {}
+        self._told: deque = deque(maxlen=LOST_FRAME_MEMORY)
+        self._key: Optional[int] = None
+
+    def join(self, page: Any) -> None:
+        """`page` is sent a key frame: no frame is common until it holds that."""
+        self._pages[page] = deque(maxlen=LOST_FRAME_MEMORY)
+
+    def hold(self, page: Any, frame_id: int, key: bool = False) -> None:
+        """`page` holds `frame_id`, a key frame starting its holdings afresh; a
+        frame every page now holds is told to the encoder."""
+        if key:
+            held = self._pages[page] = deque(maxlen=LOST_FRAME_MEMORY)
+            if frame_id != self._key:
+                self._key = frame_id
+                self._told.clear()
+        else:
+            held = self._pages.get(page)
+            if held is None:
+                return
+        held.append(frame_id)
+        if frame_id not in self._told and all(frame_id in other for other in self._pages.values()):
+            self._told.append(frame_id)
+            self._acknowledge(frame_id)
+
+    def leave(self, page: Any) -> None:
+        """`page` waits for a key frame, or is gone."""
+        self._pages.pop(page, None)
 
 
 def no_first_frame(display_id: str, encoder: str) -> str:
@@ -1175,25 +1710,28 @@ async def read_realized_root(fallback: Tuple[int, int]) -> Tuple[int, int]:
 
 
 async def apply_extended_layout(
-    layouts: Dict[str, Dict[str, int]], total_w: int, total_h: int
+    layouts: Dict[str, Dict[str, int]], total_w: int, total_h: int,
+    refresh: Optional[float] = None,
 ) -> bool:
     """Drive the server into an extended desktop covering ``layouts``.
 
     ``layouts`` maps display id to an `{x, y, w, h}` rectangle. Every display
     becomes an output of its own where the server offers pluggable outputs
     (`apply_output_layout`); anywhere else they become logical monitors over
-    its one output (`display_utils_xrandr.apply_monitor_layout`).
+    its one output (`display_utils_xrandr.apply_monitor_layout`). Either way
+    the modes keep ``refresh``, the stream's frame rate, as `resize_display`
+    does.
 
     Returns:
         True when the layout is in place. On the logical-monitor path
         ``layouts`` is fitted in place to the root the server realized, so the
         caller reads the rectangles back rather than reusing what it passed.
     """
-    if await apply_output_layout(layouts, total_w, total_h):
+    if await apply_output_layout(layouts, total_w, total_h, refresh):
         return True
     from .display_utils_xrandr import apply_monitor_layout
 
-    return await apply_monitor_layout(layouts, total_w, total_h)
+    return await apply_monitor_layout(layouts, total_w, total_h, refresh)
 
 
 async def retire_displays() -> None:
@@ -1238,11 +1776,17 @@ async def get_new_res(res_str: str) -> Tuple[str, str, List[str], str, Optional[
     return curr_res, new_res, resolutions, max_res_str, screen_name
 
 
-async def resize_display(res_str: str) -> Optional[Tuple[int, int]]:
+async def resize_display(
+    res_str: str, refresh: Optional[float] = None,
+    output_size: Optional[Tuple[int, int]] = None,
+) -> Optional[Tuple[int, int]]:
     """Resize the display to ``res_str`` (e.g. "2560x1280").
 
-    Native RandR first (mode created from CVT-RB timings when absent), with
-    the xrandr/cvt subprocess chain as fallback.
+    Native RandR first (`_resize_on_display`: the mode chosen by geometry and
+    refresh, ``refresh`` being the stream's frame rate, and made from CVT-RB
+    timings when absent), with the xrandr/cvt subprocess chain as fallback.
+    ``output_size`` is the rectangle the output shows when it is narrower than
+    the screen, which only the logical-monitor layout asks for.
 
     Returns:
         The realized ``(width, height)`` — CVT cell alignment may make it
@@ -1250,7 +1794,7 @@ async def resize_display(res_str: str) -> Optional[Tuple[int, int]]:
         report the realized size, not the request.
     """
     try:
-        w, h = await asyncio.to_thread(_sync_resize_randr, res_str)
+        w, h, rate = await asyncio.to_thread(_sync_resize_randr, res_str, refresh, output_size)
     except RuntimeError as e:
         if "no connected RandR output" in str(e):
             # No mode to set, but the framebuffer itself may still be sized.
@@ -1277,16 +1821,16 @@ async def resize_display(res_str: str) -> Optional[Tuple[int, int]]:
         )
         from .display_utils_xrandr import _resize_display_xrandr
 
-        return await _resize_display_xrandr(res_str)
+        return await _resize_display_xrandr(res_str, refresh)
     except Exception as e:
         logger_app_resize.info(
             f"Native RandR resize for '{res_str}' failed ({e}); falling back to xrandr."
         )
         from .display_utils_xrandr import _resize_display_xrandr
 
-        return await _resize_display_xrandr(res_str)
+        return await _resize_display_xrandr(res_str, refresh)
     logger_app_resize.info(
-        f"Successfully applied RandR mode '{res_str}' ({w}x{h})."
+        f"Successfully applied RandR mode '{res_str}' ({w}x{h} at {rate:.2f} Hz)."
     )
     return w, h
 
@@ -1404,14 +1948,24 @@ def _rewrite_lxqt_font(path: str, dpi_value: int) -> Optional[Tuple[float, int]]
 
 
 async def _run_lxqt_font(dpi_value: int, logger: logging.Logger) -> bool:
-    """Hand the density to a running LXQt session's Qt applications.
+    """Hand the density to the Qt applications of the LXQt session on this display.
 
     The X11 counterpart of the Wayland output scale: there the compositor tells
     clients their scale and they redraw, here the platform theme repolishes them
     from its own configuration. Applications on other toolkits, and any started
     later, take the same density from the Xft resources instead.
+
+    The platform theme of every LXQt application reading that configuration
+    repolishes on the change, whichever display it is on, so the file is
+    rewritten only for a session on this display (`_pids_on_display`), and it
+    is the one the session reads: under its own XDG_CONFIG_HOME, else its home.
     """
-    path = os.path.expanduser("~/.config/lxqt/lxqt.conf")
+    pids = await _pids_on_display("lxqt-session")
+    if not pids:
+        return False
+    env = _process_environ(pids[0])
+    config = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".config")
+    path = os.path.join(config, "lxqt", "lxqt.conf")
     try:
         resolved = await asyncio.to_thread(_rewrite_lxqt_font, path, dpi_value)
     except OSError as e:
@@ -1441,14 +1995,37 @@ def _process_environ(pid: int) -> Dict[str, str]:
     return env
 
 
-async def _pids_of(binary: str) -> List[int]:
-    """PIDs of the processes running ``binary``, in PID order."""
-    if not which("pgrep"):
+def _display_server(name: Optional[str]) -> Optional[Tuple[str, str]]:
+    """The X server a display name reaches, as its host and display number.
+
+    Names read as Xlib reads them, ``[protocol/][host]:number[.screen]``: every
+    local form (``:20``, ``:20.0``, ``unix:20``, ``unix/:20``) reaches host "",
+    and a name over TCP keeps its host, so it matches only a name of that host.
+    None for anything that is not a display name.
+    """
+    match = re.fullmatch(r"(?:(\w+)/)?(.*):(\d+)(?:\.\d+)?", name or "")
+    if not match:
+        return None
+    protocol, host, number = match.groups()
+    return ("" if protocol == "unix" or host in ("", "unix") else host.lower(), number)
+
+
+async def _pids_on_display(binary: str) -> List[int]:
+    """PIDs running ``binary`` on this process's X display, in PID order.
+
+    A process belongs to a display by the DISPLAY it was started with, which is
+    the only way xsettingsd or a session learns its display: one serving another
+    display, a second session of the same user or a test server, is never acted
+    on for this one.
+    """
+    display = _display_server(os.environ.get("DISPLAY"))
+    if display is None or not which("pgrep"):
         return []
     proc = await subprocess.create_subprocess_exec(
         "pgrep", "-x", binary, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     stdout, _ = await _communicate_or_kill(proc)
-    return [int(p) for p in stdout.split() if p.isdigit()]
+    return [pid for pid in (int(p) for p in stdout.split() if p.isdigit())
+            if _display_server(_process_environ(pid).get("DISPLAY")) == display]
 
 
 async def _run_xrdb(dpi_value: int, logger: logging.Logger) -> bool:
@@ -1457,10 +2034,10 @@ async def _run_xrdb(dpi_value: int, logger: logging.Logger) -> bool:
     Writes ``Xft.dpi`` into ~/.Xresources and merges it into the running
     resource database — merged, never loaded wholesale, so the database keeps
     every resource the file does not define — then rewrites ~/.xsettingsd
-    with the matching Xft/DPI value (in 1024ths) and SIGHUPs every running
-    xsettingsd: the one serving this display is not necessarily the oldest,
-    and a daemon that is not ours only re-reads a configuration this write
-    did not touch.
+    with the matching Xft/DPI value (in 1024ths) and SIGHUPs every xsettingsd
+    serving this display (`_pids_on_display`): the one serving it is not
+    necessarily the oldest, and one serving another display from the same
+    home would re-read this file and hand that display this density.
 
     Returns:
         True when the xrdb merge succeeded.
@@ -1507,30 +2084,20 @@ async def _run_xrdb(dpi_value: int, logger: logging.Logger) -> bool:
         )
         logger.debug(f"Wrote font and DPI settings to {xsettingsd_config_path}.")
 
-        if not which("pgrep"):
-            logger.debug("pgrep not found. Skipping xsettingsd reload.")
+        pids = await _pids_on_display("xsettingsd")
+        signaled = []
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGHUP)
+                signaled.append(str(pid))
+            except OSError as e:
+                logger.debug(f"Failed to send SIGHUP to xsettingsd process {pid}: {e}")
+        if signaled:
+            logger.debug(f"Sent SIGHUP to xsettingsd to reload config ({', '.join(signaled)}).")
+        elif pids:
+            logger.warning("No xsettingsd process could be signaled to reload.")
         else:
-            pgrep_proc = await subprocess.create_subprocess_exec(
-                "pgrep", "xsettingsd",
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            pgrep_stdout, _ = await _communicate_or_kill(pgrep_proc)
-
-            if pgrep_proc.returncode == 0:
-                signaled = []
-                for line in pgrep_stdout.decode().split():
-                    try:
-                        os.kill(int(line), signal.SIGHUP)
-                        signaled.append(line)
-                    except (OSError, ValueError) as e:
-                        logger.debug(f"Failed to send SIGHUP to xsettingsd process {line}: {e}")
-                if signaled:
-                    logger.debug(
-                        f"Sent SIGHUP to xsettingsd to reload config ({', '.join(signaled)}).")
-                else:
-                    logger.warning("No xsettingsd process could be signaled to reload.")
-            else:
-                logger.debug("xsettingsd process not found. Skipping reload.")
+            logger.debug("No xsettingsd serves this display. Skipping reload.")
         
         return xrdb_success
 
@@ -1539,29 +2106,32 @@ async def _run_xrdb(dpi_value: int, logger: logging.Logger) -> bool:
         return False
 
 
-async def _get_xfce_session_env(logger: logging.Logger) -> Optional[Dict[str, str]]:
-    """Environment of the running xfce4-session process.
+async def _session_env(binary: str) -> Optional[Dict[str, str]]:
+    """Environment of the ``binary`` session process running on this display.
 
-    xfconf-query must talk to the session's own D-Bus bus, so the variables
-    are lifted from the process's ``/proc/pid/environ``.
+    A desktop keeps its settings behind its own session bus (xfconfd, dconf),
+    so a command writing them runs with the environment read out of that
+    process's ``/proc/pid/environ`` rather than Selkies' own: the bus Selkies
+    inherited may belong to another display's session of the same home,
+    whose settings daemons would apply the change there, live.
 
     Returns:
-        The environment mapping, or None when the session (or its
-        DBUS_SESSION_BUS_ADDRESS) cannot be found.
+        The environment mapping, or None when no such process with a
+        DBUS_SESSION_BUS_ADDRESS runs on this display.
     """
-    pids = await _pids_of("xfce4-session")
-    env = _process_environ(pids[0]) if pids else {}
-    if "DBUS_SESSION_BUS_ADDRESS" not in env:
-        logger.debug("No running xfce4-session with a session bus address.")
-        return None
-    return env
+    for pid in await _pids_on_display(binary):
+        env = _process_environ(pid)
+        if "DBUS_SESSION_BUS_ADDRESS" in env:
+            return env
+    return None
 
 
 async def _run_xfconf(dpi_value: int, logger: logging.Logger) -> bool:
     """Apply DPI and a DPI-scaled cursor size via xfconf-query for XFCE.
 
-    Commands run inside the live XFCE session environment when it can be
-    found, so they reach the session's own D-Bus bus.
+    Commands run in the environment of the XFCE session on this display
+    (`_session_env`), so they reach its own bus; without one nothing is
+    written.
 
     Returns:
         True when both settings were applied.
@@ -1570,11 +2140,10 @@ async def _run_xfconf(dpi_value: int, logger: logging.Logger) -> bool:
         logger.debug("xfconf-query not found. Skipping XFCE DPI setting via xfconf-query.")
         return False
 
-    session_env = await _get_xfce_session_env(logger)
-    if session_env:
-        logger.debug("Found active XFCE session environment. Commands will be executed within this context.")
-    else:
-        logger.warning("Could not obtain XFCE session environment. Falling back to direct execution.")
+    session_env = await _session_env("xfce4-session")
+    if session_env is None:
+        logger.warning("No XFCE session with a session bus runs on this display; xfconf is left as it is.")
+        return False
 
     async def run_command(cmd: List[str], success_msg: str, failure_msg: str) -> bool:
         try:
@@ -1625,13 +2194,19 @@ async def _run_mate_gsettings(dpi_value: int, logger: logging.Logger) -> bool:
     """Apply DPI via MATE gsettings (window-scaling-factor and font DPI).
 
     ``window-scaling-factor`` is integer-only, so it carries whole scales and
-    stays 1 otherwise, the fractional part riding on the font DPI.
+    stays 1 otherwise, the fractional part riding on the font DPI. The
+    commands run in the environment of the MATE session on this display
+    (`_session_env`); without one nothing is written.
 
     Returns:
         True when at least one setting was applied.
     """
     if not which("gsettings"):
         logger.debug("gsettings not found. Skipping MATE gsettings.")
+        return False
+    session_env = await _session_env("mate-session")
+    if session_env is None:
+        logger.debug("No MATE session with a session bus runs on this display; gsettings left alone.")
         return False
 
     mate_settings_succeeded_at_least_once = False
@@ -1652,6 +2227,7 @@ async def _run_mate_gsettings(dpi_value: int, logger: logging.Logger) -> bool:
         ]
         result_mate_window_scale = await subprocess.create_subprocess_exec(
             *cmd_gsettings_mate_window_scale,
+            env=session_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
@@ -1676,6 +2252,7 @@ async def _run_mate_gsettings(dpi_value: int, logger: logging.Logger) -> bool:
         ]
         result_mate_font_dpi = await subprocess.create_subprocess_exec(
             *cmd_gsettings_mate_font_dpi,
+            env=session_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
@@ -1911,9 +2488,12 @@ async def set_cursor_size(size: int) -> bool:
     """Set the X cursor size through every applicable settings channel.
 
     Merges Xcursor.size via xrdb, then tries the XFCE and GNOME settings
-    daemons; desktop-aware toolkits follow their daemon while plain X apps
-    follow the Xcursor resource, so daemon success returns immediately and
-    the xrdb merge alone still counts as success.
+    daemons serving this display, each through its session's own
+    environment (`_session_env`: the session manager for XFCE, the xsettings
+    daemon that publishes the GNOME key); desktop-aware toolkits follow
+    their daemon while plain X apps follow the Xcursor resource, so daemon
+    success returns immediately and the xrdb merge alone still counts as
+    success.
 
     Returns:
         True when any channel applied the size.
@@ -1922,7 +2502,8 @@ async def set_cursor_size(size: int) -> bool:
         logger_app_resize.error(f"Invalid cursor size: {size}")
         return False
     xrdb_ok = await _set_xcursor_resource(size)
-    if which("xfconf-query"):
+    xfce_env = await _session_env("xfce4-session") if which("xfconf-query") else None
+    if xfce_env is not None:
         cmd = [
             "xfconf-query",
             "-c",
@@ -1937,6 +2518,7 @@ async def set_cursor_size(size: int) -> bool:
         ]
         process = await subprocess.create_subprocess_exec(
             *cmd,
+            env=xfce_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )
@@ -1944,7 +2526,8 @@ async def set_cursor_size(size: int) -> bool:
         if process.returncode == 0:
             return True
         logger_app_resize.warning("Failed to set XFCE cursor size.")
-    if which("gsettings"):
+    gnome_env = await _session_env("gsd-xsettings") if which("gsettings") else None
+    if gnome_env is not None:
         try:
             cmd_set = [
                 "gsettings",
@@ -1955,6 +2538,7 @@ async def set_cursor_size(size: int) -> bool:
             ]
             process_set = await subprocess.create_subprocess_exec(
                 *cmd_set,
+                env=gnome_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
@@ -2048,6 +2632,7 @@ def apply_common_capture_settings(
     paintover_crf: int,
     paintover_burst: int,
     fullcolor: bool,
+    ten_bit: bool,
     streaming: bool,
     use_paint_over_quality: bool,
     capture_cursor: bool,
@@ -2094,6 +2679,7 @@ def apply_common_capture_settings(
     cs.video_paintover_crf = paintover_crf
     cs.video_paintover_burst_frames = paintover_burst
     cs.video_fullcolor = fullcolor
+    cs.video_bit_depth = 10 if ten_bit else 8
     cs.video_streaming_mode = streaming
     cs.video_fullframe = encoder != "h264enc-striped"
     cs.video_cbr_mode = cbr
@@ -2142,6 +2728,10 @@ def apply_common_capture_settings(
     if watermark_path and os.path.exists(watermark_path):
         cs.watermark_path = watermark_path.encode("utf-8")
         cs.watermark_location_enum = int(getattr(server, "watermark_location", -1))
+    # Every transport tells the encoder which frames all of a display's pages
+    # hold (`CommonFrames`); a pixelflux that cannot take them has no such field.
+    if hasattr(cs, "acknowledge_references"):
+        cs.acknowledge_references = True
     return cs
 
 

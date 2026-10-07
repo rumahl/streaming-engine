@@ -6,7 +6,7 @@
 # top of the Selkies base container.
 #
 # The base (addons/base) is the whole session apart from what it looks like —
-# X11 and the Wayland backend, audio, GPU wiring, s6, coTURN and Selkies
+# X11 and the Wayland backend, audio, GPU wiring, s6, coTURN, and Selkies
 # itself. This layer adds only the desktop: LXQt with the Openbox window
 # manager on X11 and natively on the nested labwc compositor under
 # SELKIES_WAYLAND=true, the browsers, and the proot-apps runner behind the
@@ -34,7 +34,7 @@ ARG DEBIAN_FRONTEND="noninteractive"
 # The base ships its setuid and setgid files owned by root, and dpkg replaces a
 # file by hardlinking the old one aside first -- which the kernel denies uid
 # 1000 on a setuid file it does not own. Released for the layers below, an
-# archive update to util-linux, shadow, sudo, fuse3 or dbus is just another
+# archive update to util-linux, shadow, sudo, fuse3, or dbus is just another
 # package; without this it fails the layer that takes it.
 USER 0
 SHELL ["/bin/sh", "-c"]
@@ -120,7 +120,7 @@ RUN apt-get clean && apt-get update && apt-get install --no-install-recommends -
         # it. Without the SVG icon engine every scalable icon in the session — menu
         # entries, the panel's menu button, tray icons — is silently blank
         qt6-svg-plugins \
-        # Qt reads only PNG, JPEG and GIF on its own; the rest of what a clipboard
+        # Qt reads only PNG, JPEG, and GIF on its own; the rest of what a clipboard
         # image or a downloaded file arrives as (WebP, TIFF, AVIF, HEIF) needs
         # these, and without them lximage-qt and the file manager show nothing
         qt6-image-formats-plugins \
@@ -198,14 +198,17 @@ RUN set -eu; \
 # Google Chrome as a downloaded .deb for the H.264/AV1 media stack the
 # distribution Chromium builds do not carry. Chrome's own launcher script gains
 # two switches, so every way of starting it -- menu entry, xdg-open, a shell --
-# carries them: --no-sandbox, because Chrome's sandbox needs CAP_SYS_ADMIN for
-# its setuid helper or unprivileged user namespaces for its zygote, and a
-# container's default seccomp profile grants neither, so a stock Chrome aborts
-# at the zygote (the container is the isolation boundary here); and the basic
-# password store, because the container runs no keyring daemon to unlock and
-# Chrome otherwise blocks on a prompt nobody can answer. The downloads retry
-# every failure and the Chrome one is held to HTTP/1.1, since its server resets
-# HTTP/2 streams mid-transfer often enough to fail a build.
+# carries them. --no-sandbox where the container denies Chrome's sandbox, which
+# needs CAP_SYS_ADMIN for its setuid helper or unprivileged user namespaces for
+# its zygote: a container's default seccomp profile grants neither, and a stock
+# Chrome aborts at the zygote (the container is the isolation boundary there).
+# The launcher asks for the namespaces the zygote creates at every start and
+# keeps the sandbox wherever they are granted, as under an unconfined seccomp
+# profile. And the basic password store, because the container runs no keyring
+# daemon to unlock and Chrome otherwise blocks on a prompt nobody can answer.
+# The downloads retry every failure and the Chrome one is held to HTTP/1.1,
+# since its server resets HTTP/2 streams mid-transfer often enough to fail a
+# build.
 RUN mkdir -pm755 /etc/apt/keyrings /etc/apt/sources.list.d /etc/apt/preferences.d && \
     curl -o /etc/apt/keyrings/packages.mozilla.org.asc -fsSL --retry 5 --retry-all-errors --retry-delay 3 --retry-connrefused --retry-max-time 180 "https://packages.mozilla.org/apt/repo-signing-key.gpg" && \
     printf 'Types: deb\nURIs: https://packages.mozilla.org/apt\nSuites: mozilla\nComponents: main\nSigned-By: /etc/apt/keyrings/packages.mozilla.org.asc\n' > /etc/apt/sources.list.d/mozilla.sources && \
@@ -213,8 +216,8 @@ RUN mkdir -pm755 /etc/apt/keyrings /etc/apt/sources.list.d /etc/apt/preferences.
     curl -o /tmp/google-chrome-stable.deb -fsSL --http1.1 --retry 5 --retry-all-errors --retry-delay 3 --retry-connrefused --retry-max-time 180 "https://dl.google.com/linux/direct/google-chrome-stable_current_$(dpkg --print-architecture).deb" && \
     apt-get clean && apt-get update && \
     apt-get install --no-install-recommends -y firefox /tmp/google-chrome-stable.deb && \
-    sed -i 's|^exec -a "$0" "$HERE/chrome" "$@"$|exec -a "$0" "$HERE/chrome" --no-sandbox --password-store=basic "$@"|' /opt/google/chrome/google-chrome && \
-    grep -q -- '--no-sandbox --password-store=basic "$@"' /opt/google/chrome/google-chrome && \
+    sed -i 's#^exec -a "$0" "$HERE/chrome" "$@"$#exec -a "$0" "$HERE/chrome" $(unshare --user --map-root-user --pid --net --fork true 2> /dev/null || echo --no-sandbox) --password-store=basic "$@"#' /opt/google/chrome/google-chrome && \
+    grep -q -- '|| echo --no-sandbox) --password-store=basic "$@"' /opt/google/chrome/google-chrome && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/debconf/* /var/log/* /tmp/* /var/tmp/*
 
 # proot-apps (https://github.com/linuxserver/proot-apps) backs the dashboards'
@@ -223,9 +226,9 @@ RUN mkdir -pm755 /etc/apt/keyrings /etc/apt/sources.list.d /etc/apt/preferences.
 # tarball is staged here and linked into each user's ~/.local/bin, because
 # proot-apps runs its tools from there by absolute path. proot traces every
 # process it starts, so a second copy carries CAP_SYS_PTRACE for the hosts that
-# restrict ptrace; it is kept apart because a file capability the container's
-# bounding set does not hold stops that binary from execing at all, and the
-# wrapper picks whichever of the two runs.
+# restrict ptrace (set below as real root); it is kept apart because a file
+# capability the container's bounding set does not hold stops that binary from
+# execing at all, and the wrapper picks whichever of the two runs.
 RUN mkdir -pm755 /opt/proot-apps && \
     PAPPS_RELEASE="$(curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --retry-max-time 180 -o /dev/null -w '%{url_effective}' "https://github.com/linuxserver/proot-apps/releases/latest" | sed 's|.*/||')" && \
     curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused --retry-max-time 180 "https://github.com/linuxserver/proot-apps/releases/download/${PAPPS_RELEASE}/proot-apps-$(dpkg --print-architecture | sed 's/amd64/x86_64/;s/arm64/aarch64/').tar.gz" \
@@ -236,8 +239,7 @@ RUN mkdir -pm755 /opt/proot-apps && \
         apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/debconf/* /var/log/* /tmp/* /var/tmp/*; \
     fi && \
     mkdir -pm755 /opt/proot-apps-cap && \
-    cp /opt/proot-apps/proot /opt/proot-apps-cap/proot && \
-    setcap cap_sys_ptrace+ep /opt/proot-apps-cap/proot
+    cp /opt/proot-apps/proot /opt/proot-apps-cap/proot
 COPY --chown=1000:1000 addons/desktop/selkies-proot /usr/local/bin/selkies-proot
 RUN chmod -f 755 /usr/local/bin/selkies-proot
 
@@ -295,7 +297,7 @@ RUN set -eu; \
 
 # Leaving the session is not something this desktop can offer: logging out or
 # locking ends or blocks the session the stream is showing and leaves a
-# connected client on a dead display, and shutdown, reboot, suspend and
+# connected client on a dead display, and shutdown, reboot, suspend, and
 # hibernate address an init this container does not run.
 #
 # Every one of those entries runs the one lxqt-leave binary, and the panel's own
@@ -324,6 +326,8 @@ RUN mkdir -pm755 /usr/local/share/applications && \
 
 # The session's own s6 service, supervised beside the base container's
 COPY --chown=1000:1000 addons/desktop/services/ /etc/service/
+# The same desktop for what starts one from a session file; LXQt ships the X11 one
+COPY --chown=1000:1000 addons/desktop/lxqt-wayland.desktop /usr/share/wayland-sessions/lxqt.desktop
 RUN find /etc/service \( -name run -o -name finish \) -exec chmod -f 755 {} +
 
 RUN printf "==============================================\n=         Selkies Desktop Container          =\n==============================================\n" > /etc/motd
@@ -334,9 +338,12 @@ USER 0
 # file owned by uid 1000, which the kernel refuses to honor. The PolicyKit
 # agent helper and pkexec need theirs to authenticate at all, and xterm's
 # utempter its setgid to record sessions. `restore` covers everything released
-# above, which is the base's own set rather than these.
+# above, which is the base's own set rather than these. A file capability set
+# under fakeroot is lost the same way, so the apps panel's ptrace-capable proot
+# gets its CAP_SYS_PTRACE here.
 SHELL ["/bin/sh", "-c"]
-RUN selkies-privileged-files restore && \
+RUN chown -R root:root /opt/proot-apps-cap && setcap cap_sys_ptrace+ep /opt/proot-apps-cap/proot && \
+    selkies-privileged-files restore && \
     for helper in /usr/lib/polkit-1/polkit-agent-helper-1 /usr/libexec/polkit-agent-helper-1 /usr/bin/pkexec; do \
         if [ -e "$helper" ]; then chown -f root:root "$helper" && chmod -f 4755 "$helper" || echo "Failed to restore setuid for $helper"; fi; \
     done && \

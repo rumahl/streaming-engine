@@ -3,19 +3,25 @@
 
 The RTP sender writes the dependency descriptor the AV1 RTP specification
 defines on every packet of a stream whose encoder names what each frame
-predicts from: the frame's number, its edges and how far back it predicts,
+predicts from: the frame's number, its edges, and how far back it predicts,
 with the dependency structure on a key frame's first packet. The bytes are
-read back with a reader built to libwebrtc's. A second NACK for one packet
-says the retransmission was lost too, and the sender then names the frame
-lost, and the engine routes that to the encoder of the peer's own display. The
-websockets relay is
-left as it was: it drops seconds of backlog at a time, which no reference
-window reaches back over, so it still skips ahead to a keyframe. Driven with
+read back with a reader built to libwebrtc's. A first NACK is answered with
+the packet twice, back to back. A second NACK for one packet says the
+retransmission was lost too, once it and any FlexFEC repair of the packet had
+a round trip to arrive, and the sender then names the frame lost, once however
+often the peer NACKs its packets again, and the engine routes that to the
+encoder of the peer's own display. The websockets relay is left as it was: it
+drops seconds of backlog at a time, which no reference window reaches back
+over, so it still skips ahead to a keyframe. The capture pipeline names what
+each frame of a session tracking its references predicts from, whatever size a
+resize in flight has left the pipeline at: a frame judged by that size went out
+undescribed and cost a second keyframe at the start of a session. Driven with
 stand-ins; no peer.
 """
 import asyncio
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
@@ -25,13 +31,14 @@ import helpers as H
 
 from selkies.webrtc.codecs import HEADER_EXTENSIONS
 from selkies.webrtc.rtcrtpparameters import RTCRtpHeaderExtensionParameters, RTCRtpParameters
-from selkies.webrtc.rtcrtpsender import RTCRtpSender
+from selkies.webrtc.rtcrtpsender import FRAME_NUMBERS_MEMORY, RTCRtpSender
 from selkies.webrtc.rtp import (
     DEPENDENCY_DESCRIPTOR_URI, RTCP_RTPFB_NACK, HeaderExtensionsMap, RtcpRtpfbPacket, RtpHistory,
     RtpPacket, dependency_descriptor,
 )
 from selkies.webrtc_engine import RTCApp
-from selkies.websockets_mode import _VideoRelay
+from selkies.webrtc_media_pipeline import MediaPipelinePixel
+from selkies.websockets_mode import CommonFrames, _VideoRelay
 
 res = H.Results("reference-invalidation")
 
@@ -188,11 +195,14 @@ res.check("the number wraps and a frame predicting two back is two back", descri
 res.check("a frame predicting from one this sender never sent is left out", describe(103, 77, False) is None)
 res.check("a key frame forgets the frames before it",
           describe(104, None, True) == (1, None) and describe(105, 102, False) is None)
-for fid in range(200, 270):
+for fid in range(200, 206 + FRAME_NUMBERS_MEMORY):
     describe(fid, fid - 1 if fid > 200 else None, fid == 200)
-res.check("the numbering keeps the last sixty-four frames",
-          len(sender._RTCRtpSender__frame_numbers) == 64 and describe(270, 205, False) is None
-          and describe(271, 269, False) == (72, 1), len(sender._RTCRtpSender__frame_numbers))
+newest = 205 + FRAME_NUMBERS_MEMORY
+number = sender._RTCRtpSender__frame_number
+res.check("the numbering keeps the last FRAME_NUMBERS_MEMORY frames, as far back as a pinned anchor may be",
+          len(sender._RTCRtpSender__frame_numbers) == FRAME_NUMBERS_MEMORY
+          and describe(newest + 1, 205, False) is None and describe(newest + 2, newest, False) == (number, 1),
+          len(sender._RTCRtpSender__frame_numbers))
 
 # --- the sender's answer to a NACK ----------------------------------------------
 async def nacks() -> None:
@@ -206,32 +216,88 @@ async def nacks() -> None:
         return True
 
     stand_in = SimpleNamespace(_RTCRtpSender__rtp_history=history, _retransmit=retransmit,
-                               _RTCRtpSender__abandoned=None,
-                               _emit_pli_event=lambda: events.append("pli"),
+                               _RTCRtpSender__rtt=None,
+                               transport=SimpleNamespace(_send_delay=lambda: 0.0),
+                               _emit_pli_event=lambda: events.append("pli"), _resync_held=lambda: False,
                                emit=lambda name, *args: events.append((name,) + args))
     nack = lambda *lost: RtcpRtpfbPacket(fmt=RTCP_RTPFB_NACK, ssrc=1, media_ssrc=2, lost=list(lost))
     await RTCRtpSender._handle_rtcp_packet(stand_in, nack(2, 3))
-    res.check("a first NACK is answered with the packets alone", sent == [2, 3] and not events, (sent, events))
+    res.check("a first NACK is answered with each packet twice and nothing else",
+              sent == [2, 2, 3, 3] and not events, (sent, events))
     await RTCRtpSender._handle_rtcp_packet(stand_in, nack(2))
-    res.check("a second NACK for a packet names its frame lost, and retransmits again",
-              sent == [2, 3, 2] and events == [("lost_frame", 10)], (sent, events))
+    res.check("a second NACK for a packet names its frame lost, and retransmits it once",
+              sent == [2, 2, 3, 3, 2] and events == [("lost_frame", 10)], (sent, events))
     await RTCRtpSender._handle_rtcp_packet(stand_in, nack(1, 3))
     res.check("one NACK names each lost frame once, and only frames NACKed twice",
-              events == [("lost_frame", 10), ("lost_frame", 11)] and sent == [2, 3, 2, 1, 3], events)
+              events == [("lost_frame", 10), ("lost_frame", 11)] and sent == [2, 2, 3, 3, 2, 1, 1, 3], events)
     await RTCRtpSender._handle_rtcp_packet(stand_in, nack(99, 3))
     res.check("a NACK past the history asks for a keyframe and still repairs the rest",
-              events[-1] == "pli" and sent == [2, 3, 2, 1, 3, 3], (events, sent))
+              events[-1] == "pli" and sent == [2, 2, 3, 3, 2, 1, 1, 3, 3], (events, sent))
+    await RTCRtpSender._handle_rtcp_packet(stand_in, nack(2, 1))
+    res.check("a frame is named lost once: a packet NACKed again, or another of its packets NACKed twice, "
+              "is only repaired", events == [("lost_frame", 10), ("lost_frame", 11), "pli"]
+              and sent[-2:] == [2, 1], (events, sent))
+    history._lost[10] -= 2 * history._horizon
+    history.add(RtpPacket(payload_type=96, sequence_number=5, payload=b"x"), 0.0, 10)
+    history.nacked(5)
+    await RTCRtpSender._handle_rtcp_packet(stand_in, nack(5))
+    res.check("past the history's horizon a frame number can be named lost again",
+              events[-1] == ("lost_frame", 10), events)
+
+    stand_in._RTCRtpSender__rtt = 0.05
+    history.add(RtpPacket(payload_type=96, sequence_number=6, payload=b"x"), time.time() - 1.0, 12)
+    await RTCRtpSender._handle_rtcp_packet(stand_in, nack(6))
+    await RTCRtpSender._handle_rtcp_packet(stand_in, nack(6))
+    res.check("a NACK sent before the retransmission had a round trip to arrive names nothing",
+              ("lost_frame", 12) not in events and sent[-3:] == [6, 6, 6], (events, sent))
+    history._packets[6][3] -= 0.1
+    history.repaired(6, time.time())
+    await RTCRtpSender._handle_rtcp_packet(stand_in, nack(6))
+    res.check("nor one before a FlexFEC repair covering the packet had", ("lost_frame", 12) not in events, events)
+    history._packets[6][3] -= 0.1
+    await RTCRtpSender._handle_rtcp_packet(stand_in, nack(6))
+    res.check("a round trip after the last repair went out, a NACK names the frame lost",
+              events[-1] == ("lost_frame", 12), events)
 
 asyncio.run(nacks())
 
 # --- the engine routes a lost frame to the peer's own display ---------------------
 routed = []
 app = SimpleNamespace(peer_connections={"peer-2": {"display_id": "display2"}},
-                      invalidate_reference=lambda display, frame: routed.append((display, frame)))
+                      invalidate_reference=lambda display, frame: routed.append((display, frame)),
+                      peer_recovery_taken=lambda peer_id, kind: True)
 RTCApp.on_lost_frame(app, "peer-2", 77)
 RTCApp.on_lost_frame(app, "unknown-peer", 78)
 res.check("a peer's lost frame reaches its own display's encoder, an unknown peer's the primary",
           routed == [("display2", 77), ("primary", 78)], routed)
+
+# --- the pipeline names what each frame predicts from -----------------------------
+class Frame(bytes):
+    """A pixelflux StripeFrame stand-in: the wire header, a slice, and the stamps."""
+
+
+def captured(fid: int, reference: int, height: int) -> Frame:
+    f = Frame(bytes([0x04, 0x01 if reference == -1 else 0x00]) + fid.to_bytes(2, "big") + bytes(8)
+              + b"\x00\x00\x00\x01\x65")
+    f.capture_ns = f.encode_start_ns = f.encode_end_ns = 1
+    f.frame_id, f.reference_frame_id, f.stripe_y_start, f.stripe_height = fid, reference, 0, height
+    return f
+
+
+async def pipeline_names() -> None:
+    """The pipeline holds an asyncio.Lock, which Python 3.9 builds only in a loop."""
+    delivered = []
+    pipeline = MediaPipelinePixel(async_event_loop=SimpleNamespace(call_soon_threadsafe=lambda fn, *a: fn(*a)),
+                                  encoder="h264enc", height=720)
+    pipeline.produce_data = lambda buf, pts, kind, keyframe=True, timing=None, dependency=None, codec=None, \
+        anchor=False: delivered.append(dependency)
+    for fid, reference, height in ((0, -1, 4096), (1, 0, 720), (2, 1, 1080), (3, -2, 720)):
+        pipeline._screen_capture_callback(captured(fid, reference, height))
+    res.check("a tracked frame names what it predicts from whatever size a resize left the pipeline at, "
+              "an untracked one nothing", delivered == [(0, None), (1, 0), (2, 1), None], delivered)
+
+
+asyncio.run(pipeline_names())
 
 # --- the websockets relay is unchanged by any of this ----------------------------
 def chunk(frame_id: int, key: bool = False, size: int = 100) -> dict:
@@ -242,7 +308,9 @@ def chunk(frame_id: int, key: bool = False, size: int = 100) -> dict:
 
 async def relay_skips_ahead() -> None:
     """A relay holds an asyncio.Event, which needs a running loop to build."""
-    relay = _VideoRelay(SimpleNamespace(), "primary", SimpleNamespace(), budget=250)
+    server = SimpleNamespace(common_frames={})
+    server.common_frames_for = lambda did: server.common_frames.setdefault(did, CommonFrames(lambda fid: None))
+    relay = _VideoRelay(server, "primary", SimpleNamespace(), budget=250)
     res.check("a fresh relay waits for a keyframe", relay.offer(chunk(0)) and not relay.backlog)
     res.check("the keyframe and the frames behind it queue",
               not relay.offer(chunk(1, key=True)) and not relay.offer(chunk(2))

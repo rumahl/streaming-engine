@@ -5,13 +5,18 @@ Resolution: an auto-mode HiDPI client asks for the window's physical size, a
 manual preset is requested as exact framebuffer pixels and shown, with "scale
 locally" off, at one stream pixel per device pixel, reset-to-window returns to
 the physical window size, and turning "scale locally" on in auto mode leaves
-the window-resize listener armed. HiDPI: the flag either streams physical
-pixels and scales the desktop, or leaves the desktop unscaled and divides the
-request by the UI-scaling pick for the browser to stretch back — never both. Clipboard: a server with the clipboard
+the window-resize listener armed. The WebRTC video is drawn nearest-sampled
+exactly while it is shown 1:1, and smoothed once scaled to fit. A pixel ratio
+changed through DevTools emulation re-requests the stream at it. HiDPI: the
+flag either streams physical pixels and scales the desktop, or leaves the
+desktop unscaled and divides the request by the UI-scaling pick for the
+browser to stretch back — never both. Clipboard: a server with the clipboard
 disabled must not arm the focus read (Chromium's permission prompt) or send any
 clipboard payload. Gamepad: a pad present before the channel opens honors the
 persisted gamepad toggle, and one pad's disconnect does not stop polling the
-others.
+others. Resize policy: with dynamic resizing disabled a manual resolution
+posted to the primary's page is neither requested nor applied, and the
+desktop keeps its size.
 
 The checks read the wire: r,WxH / js,* / cw,cb messages are tapped at
 WebSocket.send and RTCDataChannel.send inside the page, clipboard reads at
@@ -39,6 +44,8 @@ SELECTORS = ("webrtc", "websockets")
 VIEW_W, VIEW_H = 1000, 700
 DPR = 2
 PRESET_W, PRESET_H = 1280, 720
+# A size X11's modes round up (to 8-pixel cells), which the stream still carries exactly.
+ODD_W, ODD_H = 1278, 712
 RESIZED_W, RESIZED_H = 1100, 680
 # A manual resolution the local density would never ask for, and the pick it
 # derives: its shorter side against the 1080 rows 96 DPI is for. Neither 96 nor
@@ -225,7 +232,7 @@ def sink_box(page: Any, mode: str) -> Optional[dict]:
     `videoCanvas` every sink of its own follows.
 
     Returns:
-        `width`, `height`, `left` and `top` in CSS pixels, or None where the
+        `width`, `height`, `left`, and `top` in CSS pixels, or None where the
         page has no such element, which a check reports rather than raising.
     """
     sink = "stream" if mode == "webrtc" else "videoCanvas"
@@ -238,6 +245,37 @@ def sink_box(page: Any, mode: str) -> Optional[dict]:
     }})()""")
 
 
+def stream_size(page: Any, mode: str, want: tuple, timeout: float = 15) -> Optional[tuple]:
+    """The stream's own pixel size, polled until it is `want` or time runs out:
+    the WebRTC video's intrinsic size, or the websockets canvas's."""
+    probe = ("(() => { const v = document.getElementById('stream'); return v ? [v.videoWidth, v.videoHeight] : null; })()"
+             if mode == "webrtc" else
+             "(() => { const c = document.getElementById('videoCanvas'); return c ? [c.width, c.height] : null; })()")
+    deadline = time.time() + timeout
+    size = None
+    while time.time() < deadline:
+        got = page.evaluate(probe)
+        size = tuple(got) if got else None
+        if size == want:
+            break
+        time.sleep(0.3)
+    return size
+
+
+def video_rendering(page: Any, want: str, timeout: float = 8) -> Optional[str]:
+    """The WebRTC video's `image-rendering`, polled until it is `want`: the
+    rule reruns when the stream's own size settles after the box."""
+    deadline = time.time() + timeout
+    got = None
+    while time.time() < deadline:
+        got = page.evaluate("(() => { const v = document.getElementById('stream'); "
+                            "return v ? v.style.imageRendering : null; })()")
+        if got == want:
+            break
+        time.sleep(0.3)
+    return got
+
+
 def resolution_block(page: Any, mode: str, res: "H.Results") -> None:
     """Auto -> preset -> exact box -> reset -> scale-locally + resize, at dpr 2."""
     phys_w, phys_h = VIEW_W * DPR, VIEW_H * DPR
@@ -247,6 +285,9 @@ def resolution_block(page: Any, mode: str, res: "H.Results") -> None:
               root_matches(realized, phys_w, phys_h), f"root={realized}")
     sent = page.evaluate("window.__resSent")
     res.check("auto request on the wire is WxH * dpr", f"{phys_w}x{phys_h}" in sent, sent)
+    if mode == "webrtc":
+        got = video_rendering(page, "pixelated")
+        res.check("a stream at the window's device pixels is drawn 1:1", got == "pixelated", got)
 
     seen = len(sent)
     post(page, {"type": "setManualResolution", "width": PRESET_W, "height": PRESET_H})
@@ -275,6 +316,23 @@ def resolution_block(page: Any, mode: str, res: "H.Results") -> None:
               f"{off_box} after HiDPI off, {box} before")
     post(page, {"type": "setUseCssScaling", "value": False})
     time.sleep(0.3)
+    if mode == "webrtc":
+        got = video_rendering(page, "pixelated")
+        res.check("an exact manual box is drawn 1:1", got == "pixelated", got)
+        post(page, {"type": "setScaleLocally", "value": True})
+        got = video_rendering(page, "auto")
+        res.check("a manual resolution scaled to fit is smoothed", got == "auto", got)
+        post(page, {"type": "setScaleLocally", "value": False})
+        time.sleep(0.3)
+    sent = page.evaluate("window.__resSent")
+
+    seen = len(sent)
+    post(page, {"type": "setManualResolution", "width": ODD_W, "height": ODD_H})
+    wait_new_request(page, seen)
+    realized = wait_root(ODD_W, ODD_H)
+    size = stream_size(page, mode, (ODD_W, ODD_H))
+    res.check("a size the mode rounds up streams at the size asked for",
+              size == (ODD_W, ODD_H), f"stream {size}, root {realized}")
     sent = page.evaluate("window.__resSent")
 
     seen = len(sent)
@@ -301,6 +359,29 @@ def resolution_block(page: Any, mode: str, res: "H.Results") -> None:
     realized = wait_root(RESIZED_W * DPR, RESIZED_H * DPR)
     res.check("window resize realized on the server",
               root_matches(realized, RESIZED_W * DPR, RESIZED_H * DPR), f"root={realized}")
+
+
+def emulated_density_block(page: Any, mode: str, res: "H.Results") -> None:
+    """A pixel ratio changed through DevTools emulation re-requests the stream
+    at the new density, as a real display change does, and changing it back
+    restores the physical size. Such a change fires no resize and, in
+    Chromium, no resolution media query, so only the page's poll of the live
+    value sees it."""
+    cdp = page.context.new_cdp_session(page)
+    events = page.evaluate("""(() => { window.__dprEvents = [];
+      addEventListener('resize', () => __dprEvents.push('resize'));
+      matchMedia(`(resolution: ${devicePixelRatio}dppx)`).addEventListener('change', () => __dprEvents.push('query'));
+      return true; })()""")
+    for dsf, want in ((1, f"{RESIZED_W}x{RESIZED_H}"), (DPR, f"{RESIZED_W * DPR}x{RESIZED_H * DPR}")):
+        seen = len(page.evaluate("window.__resSent"))
+        cdp.send("Emulation.setDeviceMetricsOverride",
+                 {"width": RESIZED_W, "height": RESIZED_H, "deviceScaleFactor": dsf, "mobile": False})
+        sent = wait_new_request(page, seen)
+        fired = page.evaluate("window.__dprEvents.splice(0)") if events else None
+        res.check(f"an emulated pixel ratio of {dsf} re-requests the stream at it",
+                  len(sent) > seen and sent[-1] == want, f"{sent[seen:]} want {want}; events {fired}")
+    # Left attached at the context's own metrics: detaching drops the override,
+    # and the page with it to the bare window's size.
 
 
 def hidpi_block(page: Any, mode: str, res: "H.Results") -> None:
@@ -392,7 +473,7 @@ def soft_keyboard_block(page: Any, res: "H.Results") -> None:
 
     It is a real text input laid over the video, so a mobile engine would open its
     keyboard on every tap of the session -- over the picture, and with no way to
-    dismiss it. Focus, key events and IME composition are unaffected by these two
+    dismiss it. Focus, key events, and IME composition are unaffected by these two
     attributes; the off-screen assist input is what deliberately opens one, so it
     must not carry them.
     """
@@ -473,6 +554,28 @@ def clipboard_disabled_block(browser: Any, mode: str, res: "H.Results") -> None:
         page.context.close()
 
 
+def pinned_block(browser: Any, mode: str, res: "H.Results") -> None:
+    """enable_resize=false: a manual resolution posted to the primary's page,
+    as an embedding front end posts one, is neither requested nor applied, and
+    the desktop keeps its size."""
+    page = new_page(browser, mode)
+    try:
+        res.check("pinned page: video flowing", bool(wait_video(page, mode)))
+        time.sleep(1.0)
+        root = H.x_root_size()
+        seen = len(page.evaluate("window.__resSent"))
+        post(page, {"type": "setManualResolution", "width": PRESET_W, "height": PRESET_H})
+        time.sleep(4.0)
+        sent = page.evaluate("window.__resSent")[seen:]
+        res.check("pinned: a manual resolution is not requested", not sent, sent)
+        manual = page.evaluate("window.manualResolution || window.manual_resolution || false")
+        res.check("pinned: the page stays out of manual mode", manual is False, manual)
+        after = H.x_root_size()
+        res.check("pinned: the desktop keeps its size", after == root, f"{root} -> {after}")
+    finally:
+        page.context.close()
+
+
 def run(mode: str) -> bool:
     """Drive every block over one transport; True when all checks passed."""
     res = H.Results(f"core-parity-{mode}")
@@ -485,6 +588,7 @@ def run(mode: str) -> bool:
                 res.check("video flowing", bool(wait_video(page, mode)))
                 time.sleep(1.0)
                 resolution_block(page, mode, res)
+                emulated_density_block(page, mode, res)
                 hidpi_block(page, mode, res)
                 clipboard_enabled_block(page, res)
                 soft_keyboard_block(page, res)
@@ -492,11 +596,13 @@ def run(mode: str) -> bool:
                 gamepad_block(browser, mode, res)
             finally:
                 browser.close()
-        H.server_start(mode=mode, extra_env={"SELKIES_ENABLE_CLIPBOARD": "false"})
+        H.server_start(mode=mode, extra_env={"SELKIES_ENABLE_CLIPBOARD": "false",
+                                             "SELKIES_ENABLE_RESIZE": "false"})
         with sync_playwright() as p:
             browser = C.chromium_launch(p)
             try:
                 clipboard_disabled_block(browser, mode, res)
+                pinned_block(browser, mode, res)
             finally:
                 browser.close()
     finally:

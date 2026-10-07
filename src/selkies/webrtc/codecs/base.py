@@ -49,19 +49,24 @@ class EncodedPacket:
     and frees the GIL that a `bytes(frame)` copy would hold for the memcpy.
     `keyframe` says whether the sample decodes on its own, as the encoder
     reported it; audio samples always do. `timing` is a video frame's capture,
-    encode-start and encode-end instants in CLOCK_MONOTONIC nanoseconds as the
+    encode-start, and encode-end instants in CLOCK_MONOTONIC nanoseconds as the
     capture library stamped them, or None where it did not. `dependency` is a
     video frame's own id and the id of the frame it predicts from (None for a
     frame predicting from nothing), where the encoder tracks its references
     and can be told to leave a lost frame out of them; None where it cannot.
+    `codec` is the MIME type of the codec a video frame was coded with, as its
+    capture names it, or None where the source does not say. `anchor` says a
+    video delta frame is a long-term reference predicting from a frame every
+    peer holds, which every peer can decode.
     """
 
-    __slots__ = ("data", "pts", "dts", "time_base", "keyframe", "timing", "dependency")
+    __slots__ = ("data", "pts", "dts", "time_base", "keyframe", "timing", "dependency", "codec", "anchor")
 
     def __init__(self, data: Any, pts: Optional[int] = None,
                  time_base: Optional[Fraction] = None, keyframe: bool = True,
                  timing: Optional[tuple] = None,
-                 dependency: Optional[tuple] = None) -> None:
+                 dependency: Optional[tuple] = None,
+                 codec: Optional[str] = None, anchor: bool = False) -> None:
         self.data = data
         self.pts = pts
         self.dts = pts
@@ -69,6 +74,8 @@ class EncodedPacket:
         self.keyframe = keyframe
         self.timing = timing
         self.dependency = dependency
+        self.codec = codec
+        self.anchor = anchor
 
     def __len__(self) -> int:
         return len(self.data)

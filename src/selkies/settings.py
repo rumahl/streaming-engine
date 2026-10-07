@@ -43,6 +43,7 @@ from enum import Enum
 import argparse
 import os
 import logging
+import math
 import re
 import zlib
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -193,7 +194,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "webrtc_pacer",
         "type": "bool",
         "default": True,
-        "help": "Pace outgoing WebRTC packets per transport with strict priorities (audio/RTCP > data-channel > video), an IDR-aware video queue budget and GOP-reset recovery, so audio and interactive signaling are protected from video bursts on congested links. Enabled by default; set SELKIES_WEBRTC_PACER=false to disable. SELKIES_WEBRTC_PACER_STALE_MS sets the stale-GOP purge deadline in milliseconds (0 = disabled).",
+        "help": "Pace outgoing WebRTC packets per transport with strict priorities (audio/RTCP > data-channel > video), an IDR-aware video queue budget, and GOP-reset recovery, so audio and interactive signaling are protected from video bursts on congested links. Enabled by default; set SELKIES_WEBRTC_PACER=false to disable. SELKIES_WEBRTC_PACER_STALE_MS sets the stale-GOP purge deadline in milliseconds (0 = disabled).",
     },
     {
         "name": "file_transfers",
@@ -211,8 +212,8 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "print_spool_path",
         "type": "str",
-        "default": "~/.local/state/selkies/print",
-        "help": "Directory the session's print queue writes finished jobs into as PDFs, watched for documents to hand to the browser and created at startup when missing; a document is removed once a page has taken it.",
+        "default": "",
+        "help": "Directory the session's print queue writes finished jobs into as PDFs, watched for documents to hand to the browser and created at startup when missing; a document is removed once a page has taken it. Empty (default) uses selkies/print under $XDG_STATE_HOME, or under ~/.local/state when that is unset.",
     },
     {
         "name": "file_transfer_limit_mbps",
@@ -225,7 +226,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "audit_webhook_url",
         "type": "str",
         "default": "",
-        "help": 'URL that receives one JSON POST per clipboard transfer, file upload, file download, printed document handed over, page connection and recording, carrying metadata only (the event, an RFC 3339 timestamp, byte size, MIME type or file name) and never the content. Events are delivered in order over one keep-alive connection; a collector that is slow or down loses what overflows the queue rather than stalling the session. Empty (default) sends nothing.',
+        "help": 'URL that receives one JSON POST per clipboard transfer, file upload, file download, printed document handed over, page connection, and recording, carrying metadata only (the event, an RFC 3339 timestamp, byte size, MIME type, or file name) and never the content. Events are delivered in order over one keep-alive connection; a collector that is slow or down loses what overflows the queue rather than stalling the session, and is sent an audit.dropped event with the count once the queue drains. Empty (default) sends nothing.',
     },
     {
         "name": "audit_webhook_token",
@@ -264,11 +265,9 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "rate_control_mode",
         "type": "enum",
-        "default": "crf",
-        # "cbr" first is dropdown order only: the default stays "crf" and
-        # allowed[0] is never a fallback here (clients only send crf/cbr).
+        "default": "cbr",
         "meta": {"allowed": ["cbr", "crf"]},
-        "help": "Rate control mode for the video encoders (crf = constant quality/QP, cbr = constant bitrate). Honored for every video encoder when enable_rate_control is true (the default).",
+        "help": "Rate control mode for the video encoders on both transports (cbr = constant bitrate, crf = constant quality/QP). Honored by every video encoder when enable_rate_control is true (the default), except the two that run at the bitrate whatever the mode: a V4L2 memory-to-memory device at a variable one, Tegra's encoder at a constant one.",
     },
     {
         "name": "enable_rate_control",
@@ -386,7 +385,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "keyboard_shortcuts",
         "type": "bool",
         "default": True,
-        "help": "Let the client keep its own chords (Control+Shift with F, M, X or G, and Control+Shift+click) instead of passing them to the session. Turn it off where an application in the session binds the same chords; the side menu's buttons still reach every function, and pressing Escape three times still leaves gaming mode. Clients may override per user unless the value is locked.",
+        "help": "Let the client keep its own chords (Control+Shift with F, M, X, or G, and Control+Shift+click) instead of passing them to the session. Turn it off where an application in the session binds the same chords; the side menu's buttons still reach every function, and pressing Escape three times still leaves gaming mode. Clients may override per user unless the value is locked.",
     },
     {
         "name": "use_browser_cursors",
@@ -435,6 +434,12 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "bool",
         "default": True,
         "help": "Show the main sidebar UI.",
+    },
+    {
+        "name": "ui_show_connection_indicator",
+        "type": "bool",
+        "default": True,
+        "help": "Show the mark over the stream while the server finds the client's connection poor, with or without the sidebar.",
     },
     {
         "name": "ui_sidebar_show_video_settings",
@@ -633,7 +638,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "enable_basic_auth",
         "type": "bool",
         "default": True,
-        "help": "Enable basic authentication on the server. On by default, and the server refuses to start until a password is set through --basic-auth-password, SELKIES_BASIC_AUTH_PASSWORD, PASSWORD or PASSWD; pass --enable-basic-auth=false to serve without a login instead.",
+        "help": "Enable basic authentication on the server. On by default, and the server refuses to start until a password is set through --basic-auth-password, SELKIES_BASIC_AUTH_PASSWORD, PASSWORD, or PASSWD; pass --enable-basic-auth=false to serve without a login instead.",
     },
     {
         "name": "basic_auth_user",
@@ -661,7 +666,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "str",
         "default": "",
         "env_var": "SUBFOLDER",
-        "help": 'URL path prefix the server is reverse-proxied under; prepended to every route (websockets, tokens, metrics, static files). Slashes are optional, so "desk", "/desk" and "/desk/" are the same prefix and "/" is the root. The web client reads its own prefix from the URL it was loaded from, so only the server needs telling.',
+        "help": 'URL path prefix the server is reverse-proxied under; prepended to every route (websockets, tokens, metrics, static files). Slashes are optional, so "desk", "/desk", and "/desk/" are the same prefix and "/" is the root. The web client reads its own prefix from the URL it was loaded from, so only the server needs telling.',
     },
     {
         "name": "run_after_connect",
@@ -693,7 +698,13 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "video_fullcolor",
         "type": "bool",
         "default": False,
-        "help": "Encode with 4:4:4 chroma rather than 4:2:0 where the codec and encoder carry it (H.264 and H.265 on NVENC, VA-API, x264 and x265; VP9 profile 1 on VA-API and libvpx); other codecs and encoders stay 4:2:0. The server knows which of its encoders carry it on this host, so a client whose decoder has no 4:4:4 profile turns it off for itself only where the stream would carry it, whether it or this default asked for it, and streams 4:2:0 on the same codec; where it is locked on, such a client steps over WebSockets to the next allowed encoder whose 4:4:4 it decodes or that has none, and to JPEG last, and reports the stream over WebRTC. A WebRTC client names the 4:4:4 it decodes in its hello, so its first offer already fits it.",
+        "help": "Encode with 4:4:4 chroma rather than 4:2:0 where the codec and encoder carry it (H.264 and H.265 on NVENC, VA-API, x264, and x265; VP9 profile 1 on VA-API and libvpx); other codecs and encoders stay 4:2:0. The server knows which of its encoders carry it on this host, so a client whose decoder has no 4:4:4 profile turns it off for itself only where the stream would carry it, whether it or this default asked for it, and streams 4:2:0 on the same codec; where it is locked on, such a client steps over WebSockets to the next allowed encoder whose 4:4:4 it decodes or that has none, and to JPEG last, and reports the stream over WebRTC. A WebRTC client names the 4:4:4 it decodes in its hello, so its first offer already fits it.",
+    },
+    {
+        "name": "video_10bit",
+        "type": "bool",
+        "default": False,
+        "help": "Encode 10 bits per sample rather than 8 where the codec has a 10-bit profile an encoder of this host codes: H.264 on x264, and H.265 (Main 10, Main 4:4:4 10), VP9 (profiles 2 and 3), and AV1 on VA-API, x265, libvpx, and SVT-AV1, and H.265 and AV1 on NVENC. A GPU that does not encode the format hands the session to the software encoder, as it does a 4:4:4 it lacks, which the stream statistics show (H.264 on NVENC, which codes it at 8 bits); OpenH264, kvazaar, VP8, and JPEG stay 8-bit. A software encoder pays for it in CPU, converting every frame to 10-bit samples and coding at high bit depth, and the source is an 8-bit desktop, so it is recommended only together with 4:4:4 full color, where the added precision shows. The server knows which of its encoders carry it, and a client offers it only where its own decoder shows a 10-bit picture of that codec, turning it off for itself where it does not, whether it or this default asked for it; where it is locked on, such a client steps over WebSockets to the next allowed encoder it decodes, and reports the stream over WebRTC. A WebRTC client names the 10-bit formats it decodes in its hello, so its first offer already fits it; Chromium-based browsers decode AV1 over WebRTC at 8 bits only.",
     },
     {
         "name": "video_streaming_mode",
@@ -711,7 +722,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "use_paint_over_quality",
         "type": "bool",
         "default": True,
-        "help": "Enable high-quality paint-over for static scenes.",
+        "help": "Clean up a still screen at the paint-over quality, under CBR and CRF alike and whether or not video_streaming_mode (Turbo) sends every frame: once the picture stops changing, or keeps changing only in small places, a video encoder refreshes what changed at the paint-over CRF, and after a large change sends a key frame at it once the screen holds still. Under CBR the frames instead keep coming after the screen stops, each coded by the rate control, until the picture is clean, and then stop until it moves again, so a blinking cursor on a clean screen costs only its own frames: NVENC and x264 until their rate control reaches that quality (NVENC refreshes the screen a band a frame where the bitrate is too low for it to get there), VA-API until the encoded picture stops improving, x265 and VP9 until theirs codes at it, for half a minute at most; VP8 and SVT-AV1 hold a refresh at it, a key frame within a second of the bitrate; JPEG re-sends still stripes at the paint-over JPEG quality.",
     },
     {
         "name": "paint_over_jpeg_quality",
@@ -725,14 +736,14 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "type": "range",
         "default": "5-50",
         "meta": {"default_value": 18},
-        "help": 'H.264 paint-over CRF: allowed range, initial value, or both ("18,5-50"); "18-18" locks.',
+        "help": 'Paint-over quality index, on the video_crf scale and mapped onto each video codec\'s quantizer, that a still screen is cleaned up at: allowed range, initial value, or both ("18,5-50"); "18-18" locks.',
     },
     {
         "name": "video_paintover_burst_frames",
         "type": "range",
         "default": "1-30",
         "meta": {"default_value": 5},
-        "help": 'H.264 paint-over burst frames: allowed range, initial value, or both ("5,1-30"); "5-5" locks.',
+        "help": 'Frames a video encoder keeps sending after a cleanup or a key frame on a still screen, so rate control settles (under CBR every encoder but VP8 and SVT-AV1 keeps sending until the screen is clean instead): allowed range, initial value, or both ("5,1-30"); "5-5" locks.',
     },
     {
         "name": "second_screen",
@@ -778,7 +789,13 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "computer_use_bind",
         "type": "str",
         "default": "",
-        "help": "Start pixelflux's Computer-Use HTTP server on comma-separated entries: a bare port listens on the loopback addresses only, host:port names the address to listen on (0.0.0.0:9500,[::]:9500 accepts connections on every interface). Empty leaves it off; the PIXELFLUX_CU environment variable remains the standalone fallback.",
+        "help": "Start pixelflux's Computer-Use HTTP server on comma-separated entries: a bare port listens on the loopback addresses only, which every account on the host can reach, host:port names the address to listen on (0.0.0.0:9500,[::]:9500 accepts connections on every interface). A caller drives the desktop with this user's full authority, so the server needs --computer-use-token and does not start without it. Empty leaves it off; the PIXELFLUX_CU environment variable remains the standalone fallback.",
+    },
+    {
+        "name": "computer_use_token",
+        "type": "str",
+        "default": "",
+        "help": "Bearer token every Computer-Use request has to carry (Authorization: Bearer <token>); falls back to the PIXELFLUX_CU_TOKEN environment variable.",
     },
     {
         "name": "wayland_host_display",
@@ -953,7 +970,7 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "webrtc_ice_lite",
         "type": "bool",
         "default": False,
-        "help": "Run the server's ICE agent as ICE-lite: it offers host candidates only, takes the controlled role and answers the client's connectivity checks instead of sending its own, which suits a server whose host candidates are reachable as advertised (a public address, a static 1:1 NAT with webrtc_public_ip, or forwarded mux ports). STUN and TURN are then unused by the server itself; clients still receive them for candidates of their own.",
+        "help": "Run the server's ICE agent as ICE-lite: it offers host candidates only, takes the controlled role, and answers the client's connectivity checks instead of sending its own, which suits a server whose host candidates are reachable as advertised (a public address, a static 1:1 NAT with webrtc_public_ip, or forwarded mux ports). STUN and TURN are then unused by the server itself; clients still receive them for candidates of their own.",
     },
     {
         "name": "enable_cloudflare_turn",
@@ -994,14 +1011,14 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "js_socket_path",
         "type": "str",
-        "default": "/tmp",
-        "help": "Directory to write the Selkies Input Interposer communication sockets to, default: /tmp, results in socket files: /tmp/selkies_js{0-3}.sock",
+        "default": "",
+        "help": "Directory for the Selkies Input Interposer sockets (selkies_js{0-3}.sock, selkies_event{1000-1003}.sock). Empty uses XDG_RUNTIME_DIR, the session's private directory, and /tmp where that is unset; the interposer looks in the same place.",
     },
     {
         "name": "webcam_socket_path",
         "type": "str",
-        "default": "/tmp",
-        "help": "Directory to write the Selkies V4L2 Interposer webcam socket to, default: /tmp, results in socket file: /tmp/selkies_webcam0.sock",
+        "default": "",
+        "help": "Directory for the Selkies V4L2 Interposer webcam socket (selkies_webcam0.sock). Empty uses XDG_RUNTIME_DIR, the session's private directory, and /tmp where that is unset; the interposer looks in the same place.",
     },
     {
         "name": "webcam_width",
@@ -1019,14 +1036,14 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "name": "webcam_pixel_format",
         "type": "str",
         "default": "auto",
-        "help": 'Pixel format of the virtual webcam device. "auto" follows the uplink: a browser sending JPEG (no WebCodecs) gets an MJPEG device that carries its frames as received, any other uplink an I420 device, and a later uplink of the other kind re-creates the device for itself while no application is reading it. Or pin "I420" (planar 4:2:0, the browsers\' preference), "NV12", "YUYV" or "MJPEG", which is then kept whatever arrives.',
+        "help": 'Pixel format of the virtual webcam device. "auto" follows the uplink: a browser sending JPEG (no WebCodecs) gets an MJPEG device that carries its frames as received, any other uplink an I420 device, and a later uplink of the other kind re-creates the device for itself while no application is reading it. Or pin "I420" (planar 4:2:0, the browsers\' preference), "NV12", "YUYV", or "MJPEG", which is then kept whatever arrives.',
     },
     {
         "name": "webcam_encoder",
         "type": "enum",
         "default": "auto",
         "meta": {"allowed": ["auto", "h264", "h265", "vp8", "vp9", "av1", "mjpeg"]},
-        "help": 'Codec clients encode the webcam uplink with. Over WebSockets "auto" runs the measured ladder (H.264, else VP8, then VP9, AV1 and H.265 where the engine encodes them, JPEG when none keeps up) on engines that stream camera frames through MediaStreamTrackProcessor, and JPEG on the `<video>`-element path (Firefox): its software encoders can hold the camera rate while costing a full core, which no client-side probe can price. A codec name runs that one codec on every path, trading client CPU for a fraction of the uplink bandwidth, still falling to JPEG where it cannot keep up or encodes the wrong colors; "mjpeg" pins JPEG everywhere. Over WebRTC the browser sends its camera as the named codec when the answer negotiated it, and otherwise, as for "auto" and "mjpeg", as the first codec negotiated. Clients may override per user unless the value is locked.',
+        "help": 'Codec clients encode the webcam uplink with. Over WebSockets "auto" runs the measured ladder (H.264, else VP8, then VP9, AV1, and H.265 where the engine encodes them, JPEG when none keeps up) on engines that stream camera frames through MediaStreamTrackProcessor, and JPEG on the `<video>`-element path (Firefox): its software encoders can hold the camera rate while costing a full core, which no client-side probe can price. A codec name runs that one codec on every path, trading client CPU for a fraction of the uplink bandwidth, still falling to JPEG where it cannot keep up or encodes the wrong colors; "mjpeg" pins JPEG everywhere. Over WebRTC the browser sends its camera as the named codec when the answer negotiated it, and otherwise, as for "auto" and "mjpeg", as the first codec negotiated. Clients may override per user unless the value is locked.',
     },
     {
         "name": "webcam_device",
@@ -1055,8 +1072,8 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "congestion_control",
         "type": "bool",
-        "default": False,
-        "help": "Adapt the video bitrate to the transport-wide-cc (GCC-style) bandwidth estimate from WebRTC receiver feedback. Effective in CBR rate-control mode; may trade quality/stability for congestion responsiveness.",
+        "default": True,
+        "help": "Adapt a CBR display's bitrate to what its path carries, below the bitrate the client chose: over WebRTC from the transport-wide-cc receiver feedback (loss, and one-way delay standing past the path's own), over WebSockets from the queue a display's frame round trip shows past the path's own and its jitter. A page keeps the rate its display held for 10 s, and a restarted server starts that page's stream there, for a day or until the user sets a bitrate. False holds the chosen bitrate whatever the path carries, so a path slower than it lags or drops frames. Has no effect in CRF rate-control mode.",
     },
     {
         "name": "audio_channels",
@@ -1122,6 +1139,12 @@ SETTING_DEFINITIONS: List[Dict[str, Any]] = [
         "default": "",
         "help": "Comma-separated browser Origins allowed to open the streaming WebSocket (cross-site WebSocket-hijacking guard). Empty (default) allows only same-origin plus non-browser clients that send no Origin; use '*' to allow any origin.",
     },
+    {
+        "name": "frame_ancestors",
+        "type": "str",
+        "default": "",
+        "help": "Comma-separated pages allowed to show the client in a frame: origins such as https://portal.example.com, 'self' for this server's own pages, or 'none' for no frame at all, sent as the Content-Security-Policy frame-ancestors directive. Empty (default) lets any page frame it, as a platform embedding the desktop in its own UI needs.",
+    },
 ]
 
 # Secrets, flagged sensitive so consumers keep them out of client broadcasts.
@@ -1138,6 +1161,7 @@ SENSITIVE_SETTING_NAMES = frozenset({
     "cloudflare_turn_token_id",
     "cloudflare_turn_api_token",
     "audit_webhook_token",
+    "computer_use_token",
 })
 for _setting_def in SETTING_DEFINITIONS:
     if _setting_def["name"] in SENSITIVE_SETTING_NAMES:
@@ -1146,9 +1170,23 @@ for _setting_def in SETTING_DEFINITIONS:
 
 def _range_number(text: str) -> Union[int, float]:
     """Parse a range-setting number: int when integral, float otherwise, so a
-    fractional span bound stays representable."""
+    fractional span bound stays representable.
+
+    Raises:
+        ValueError: `text` is not a finite number (`inf`, `nan`, or a numeral
+            past the float range), which no span or rate can be and which the
+            settings JSON a page receives cannot carry.
+    """
     value = float(text)
+    if not math.isfinite(value):
+        raise ValueError(f"{text!r} is not a finite number")
     return int(value) if value.is_integer() else value
+
+
+def fps_label(fps: float) -> str:
+    """A frame rate as a log line states it: to a hundredth, without trailing
+    zeros, so 60000/1001 reads 59.94 and 60 reads 60."""
+    return f"{round(float(fps), 2):g}"
 
 
 def parse_bool(value: Any, default: bool = False) -> bool:
@@ -1194,6 +1232,14 @@ CODEC_LABELS = {"jpeg": "JPEG", "h264": "H.264", "h265": "H.265", "vp8": "VP8", 
 
 # Encoders with no hardware path: selecting one implies software encoding.
 CPU_ONLY_ENCODERS = ("jpeg", "h264enc-striped")
+# What a display streams with, as SETTINGS carries it: a controller beside the
+# display's owner changes these by its user's pick alone, while the display's
+# size and density, and anything its page changes on its own, follow the owner.
+STREAM_SETTINGS = (
+    "encoder", "framerate", "video_crf", "video_fullcolor", "video_10bit", "video_streaming_mode",
+    "jpeg_quality", "paint_over_jpeg_quality", "use_paint_over_quality", "video_paintover_crf",
+    "video_paintover_burst_frames", "video_bitrate", "rate_control_mode", "use_cpu", "audio_bitrate",
+)
 
 # The fallback ladder, one order on both transports: the full-frame codecs by the measured
 # time per frame of their software encoders (x264, SVT-AV1, libvpx VP8, x265, libvpx VP9),
@@ -1266,10 +1312,10 @@ def encoder_rung(encoder: str, backends: Optional[Dict[str, Dict[str, Optional[s
 
 def software_encoders() -> Dict[str, str]:
     """The software encoder of each codec the installed pixelflux build carries, by
-    codec name: H.264 by the build's feature choice ("x264" or "openh264"), the
-    others by what the FFmpeg it links carries ("x265" or "kvazaar", "libvpx",
-    "svt-av1"). A codec without an entry has no software path in that build.
-    Rendering the settings reference needs no extension, and reads as the
+    codec name: H.264 and H.265 by the build's feature choice ("x264" or
+    "openh264", "x265" or "kvazaar"), "libvpx" for VP8 and VP9, and "svt-av1" for
+    AV1. A codec without an entry has no software path in that build on this
+    machine. Rendering the settings reference needs no extension, and reads as the
     default x264 build.
     """
     try:
@@ -1291,14 +1337,27 @@ def software_fullcolor() -> Optional[List[str]]:
     return None if table is None else [str(codec) for codec in table]
 
 
+def software_formats() -> Optional[Dict[str, List[str]]]:
+    """The formats each software encoder of the installed pixelflux build codes its
+    codec in, as `chroma-depth` names (`pixelflux.SOFTWARE_FORMATS`); None where
+    there is no pixelflux to ask, or one from before the table."""
+    try:
+        import pixelflux
+    except ImportError:
+        return None
+    table = getattr(pixelflux, "SOFTWARE_FORMATS", None)
+    return None if table is None else {str(k): [str(f) for f in v] for k, v in dict(table).items()}
+
+
 _HARDWARE_ENCODERS: Dict[int, Optional[Dict[str, str]]] = {}
 _HARDWARE_FULLCOLOR: Dict[int, Optional[List[str]]] = {}
+_HARDWARE_FORMATS: Dict[int, Optional[Dict[str, List[str]]]] = {}
 
 
 def hardware_encoders(encode_node_index: int, auto_gpu: str = "") -> Optional[Dict[str, str]]:
     """The hardware encoder of each codec the GPU behind a render node serves,
     by codec name, as the backend pixelflux named when it probed the node once and
-    remembered ("nvenc", "vaapi", "tegra" or "v4l2"); a codec without an entry has no hardware path on that node. None
+    remembered ("nvenc", "vaapi", "tegra", or "v4l2"); a codec without an entry has no hardware path on that node. None
     where nothing can be known: no pixelflux to ask (rendering the settings
     reference), or one without the probe, so a caller narrows nothing on a guess.
 
@@ -1312,6 +1371,7 @@ def hardware_encoders(encode_node_index: int, auto_gpu: str = "") -> Optional[Di
     if node not in _HARDWARE_ENCODERS:
         served: Optional[Dict[str, str]] = None
         fullcolor: Optional[List[str]] = None
+        formats: Optional[Dict[str, List[str]]] = None
         try:
             import pixelflux
             probe = getattr(pixelflux, "hardware_encoders", None)
@@ -1320,12 +1380,16 @@ def hardware_encoders(encode_node_index: int, auto_gpu: str = "") -> Optional[Di
             probe = getattr(pixelflux, "hardware_fullcolor", None)
             if probe is not None:
                 fullcolor = [str(codec) for codec in probe(node, auto_gpu)]
+            probe = getattr(pixelflux, "hardware_formats", None)
+            if probe is not None:
+                formats = {str(k): [str(f) for f in v] for k, v in dict(probe(node, auto_gpu)).items()}
         except ImportError:
             served = None
         except Exception as e:
             logger.warning("Hardware encoder probe of render node %d failed: %s", node, e)
         _HARDWARE_ENCODERS[node] = served
         _HARDWARE_FULLCOLOR[node] = fullcolor
+        _HARDWARE_FORMATS[node] = formats
     return _HARDWARE_ENCODERS[node]
 
 
@@ -1334,6 +1398,15 @@ def hardware_fullcolor(encode_node_index: int, auto_gpu: str = "") -> Optional[L
     read with `hardware_encoders`; None where nothing can be known."""
     hardware_encoders(encode_node_index, auto_gpu)
     return _HARDWARE_FULLCOLOR.get(int(encode_node_index))
+
+
+def hardware_formats(encode_node_index: int, auto_gpu: str = "") -> Optional[Dict[str, List[str]]]:
+    """The formats the GPU behind a render node encodes each codec in, as
+    `chroma-depth` names (`pixelflux.hardware_formats`: `"420-8"`, `"444-8"`,
+    `"420-10"`, `"444-10"`), read with `hardware_encoders`; None where nothing
+    can be known."""
+    hardware_encoders(encode_node_index, auto_gpu)
+    return _HARDWARE_FORMATS.get(int(encode_node_index))
 
 
 def software_video_path(encoder: str, use_cpu: bool) -> bool:
@@ -1366,8 +1439,6 @@ class AppSettings:
     `_process_and_set_attributes`.
 
     Attributes:
-        ENCODER_RC_DEFAULTS: Per-encoder websockets rate-control default;
-            resolved by `resolve_rate_control_default`.
         _setting_definitions: The definition list, mutated in place when an
             override narrows a menu.
         _overridden: Setting name to whether CLI/env gave it explicitly; what
@@ -1408,6 +1479,7 @@ class AppSettings:
     enable_collab: tuple[bool, bool]
     master_token: str
     video_fullcolor: tuple[bool, bool]
+    video_10bit: tuple[bool, bool]
     subfolder: str
     video_bitrate: tuple[float, float]
     file_transfer_limit_mbps: float
@@ -1712,16 +1784,6 @@ class AppSettings:
         """
         return bool(getattr(self, "_overridden", {}).get(name, False))
 
-    ENCODER_RC_DEFAULTS = {
-        "h264enc": "crf",
-        "h265enc": "crf",
-        "vp8enc": "crf",
-        "vp9enc": "crf",
-        "av1enc": "crf",
-        "h264enc-striped": "crf",
-        "jpeg": "crf",
-    }
-
     def encode_node_index(self) -> Optional[int]:
         """The DRI render-node index hardware encoders open, resolved as the
         capture settings resolve it: `encode_dri` names a node, else `gpu_id`
@@ -1743,9 +1805,11 @@ class AppSettings:
     def encoder_backends(self) -> Optional[Dict[str, Dict[str, Any]]]:
         """The backends that serve each video codec on this host, by codec
         name: `hardware` (the backend pixelflux named, or None) from the startup probe,
-        `software` (the pixelflux build's library or None), and `fullcolor`, whether
+        `software` (the pixelflux build's library or None), `fullcolor`, whether
         each of those sides takes a `video_fullcolor` session as 4:4:4 (None where the
-        side is absent or the build does not say). None before
+        side is absent or the build does not say), and `ten_bit`, whether each side
+        takes a `video_10bit` session at 10 bits, by chroma (`"420"`, `"444"`; None
+        where the side is absent or unknown). None before
         `resolve_encoder_backends` ran or where the hardware side is unknown,
         so no consumer hides a choice on a guess."""
         hardware = getattr(self, "_hardware_encoders", None)
@@ -1758,6 +1822,16 @@ class AppSettings:
         def carries(codec: str, backend: Optional[str], table: Optional[List[str]]) -> Optional[bool]:
             return None if backend is None or table is None else codec in table
 
+        hw_formats = getattr(self, "_hardware_formats", None)
+        sw_formats = software_formats()
+
+        def ten_bit(codec: str, backend: Optional[str],
+                    formats: Optional[Dict[str, List[str]]]) -> Optional[Dict[str, bool]]:
+            if backend is None or formats is None:
+                return None
+            listed = formats.get(codec, [])
+            return {chroma: f"{chroma}-10" in listed for chroma in ("420", "444")}
+
         return {
             codec: {
                 "hardware": hardware.get(codec),
@@ -1765,6 +1839,10 @@ class AppSettings:
                 "fullcolor": {
                     "hardware": carries(codec, hardware.get(codec), hw_fullcolor),
                     "software": carries(codec, software.get(codec), sw_fullcolor),
+                },
+                "ten_bit": {
+                    "hardware": ten_bit(codec, hardware.get(codec), hw_formats),
+                    "software": ten_bit(codec, software.get(codec), sw_formats),
                 },
             }
             for codec in CODEC_LABELS
@@ -1774,13 +1852,54 @@ class AppSettings:
     def encoder_fullcolor(self, encoder: str, use_cpu: bool = False) -> Optional[bool]:
         """Whether a `video_fullcolor` session on this encoder streams 4:4:4 from this host:
         by the encode node's engine where the codec has one and software is not forced or
-        striped, else by the build's software encoder. None where that side is unknown."""
+        striped, else by the build's software encoder. A VA-API engine refuses a 4:4:4 it
+        lacks rather than streaming 4:2:0, so that session is the software encoder's too
+        (H.264 on every Intel and AMD device). None where the side that answers is unknown."""
         backends = self.encoder_backends()
         served = (backends or {}).get(codec_for_encoder(canonical_encoder(encoder)))
         if not served:
             return None
-        side = "software" if use_cpu or encoder in CPU_ONLY_ENCODERS or not served["hardware"] else "hardware"
-        return served["fullcolor"][side]
+        carried = served["fullcolor"]
+        if use_cpu or encoder in CPU_ONLY_ENCODERS or not served["hardware"]:
+            return carried["software"]
+        if carried["hardware"] is False and served["hardware"] == "vaapi" and carried["software"]:
+            return True
+        return carried["hardware"]
+
+    def encoder_ten_bit(self, encoder: str, use_cpu: bool = False, fullcolor: bool = False) -> Optional[bool]:
+        """Whether a `video_10bit` session on this encoder streams 10 bits from this host.
+
+        A session runs on the encode node's engine where the codec has one and software
+        is not forced or striped, and pixelflux hands it to the build's software encoder
+        where the engine lacks the 4:4:4 a full-color session asks for, or the 10 bits
+        this one does while the software encoder codes them. Each side answers at the
+        chroma it would run: its 4:4:4 where full color is on and it carries that, else
+        4:2:0.
+
+        Args:
+            encoder: The encoder wire value.
+            use_cpu: Whether software encoding is forced.
+            fullcolor: Whether the session asks for 4:4:4.
+
+        Returns:
+            Whether the stream is 10-bit; None where the side that would answer is unknown.
+        """
+        backends = self.encoder_backends()
+        served = (backends or {}).get(codec_for_encoder(canonical_encoder(encoder)))
+        if not served:
+            return None
+
+        def carried(side: str) -> Optional[bool]:
+            table = served["ten_bit"][side]
+            if table is None:
+                return None
+            return table["444" if fullcolor and served["fullcolor"][side] else "420"]
+
+        if use_cpu or encoder in CPU_ONLY_ENCODERS or not served["hardware"]:
+            return carried("software")
+        if fullcolor and served["fullcolor"]["hardware"] is False and served["fullcolor"]["software"]:
+            return carried("software")
+        return carried("hardware") or carried("software") or carried("hardware")
 
     def encoder_served(self, encoder: str) -> bool:
         """Whether a session on this encoder comes up on the codec it names
@@ -1815,6 +1934,7 @@ class AppSettings:
         self._hardware_encoders = ({} if node is None
                                    else hardware_encoders(node, str(self.auto_gpu or "")))
         self._hardware_fullcolor = [] if node is None else hardware_fullcolor(node, str(self.auto_gpu or ""))
+        self._hardware_formats = {} if node is None else hardware_formats(node, str(self.auto_gpu or ""))
         if self._hardware_encoders is None:
             return
         enc_definition = next(
@@ -1846,48 +1966,6 @@ class AppSettings:
                 self.encoder = fallback
         enc_definition["meta"]["allowed"] = list(served)
         self.apply_webrtc_encoder_filter()
-
-    def on_software_video_path(self) -> bool:
-        """Whether the server's own defaults put a session on the software
-        video path: the striped encoder, or a full-frame encoder with software
-        encoding forced by use_cpu or gpu_id=-1."""
-        forced = bool(self.use_cpu[0]) or str(self.gpu_id).strip() == "-1"
-        return software_video_path(self.encoder, forced)
-
-    def software_encoder_in_use(self) -> Optional[str]:
-        """The software encoder a session on the software path encodes with,
-        by the pixelflux build's table; None off that path or without one."""
-        if not self.on_software_video_path():
-            return None
-        return software_encoders().get(codec_for_encoder(self.encoder))
-
-    def resolve_rate_control_default(self) -> None:
-        """Apply the transport's rate-control default for the current mode.
-
-        WebRTC streams default to CBR whatever the encoder: a
-        congestion-controlled transport needs the encoder holding a bandwidth
-        target. Websockets streams are quality-driven (`ENCODER_RC_DEFAULTS`),
-        except that OpenH264 — the software H.264 encoder of a GPL-free
-        pixelflux build — targets a bandwidth, so a session known to be on the
-        software path defaults to CBR; encoders not listed keep their value.
-        The dashboards derive the same default client-side
-        (conditional-settings.js) from the published `software_encoders`.
-
-        A no-op when the operator pinned rate_control_mode or disabled rate
-        control. Called again on a live transport switch so an unpinned mode
-        tracks the transport actually streaming.
-        """
-        if not self.enable_rate_control[0] or self.was_provided("rate_control_mode"):
-            return
-        if self.mode == "webrtc":
-            self.rate_control_mode = "cbr"
-        elif self.software_encoder_in_use() == "openh264":
-            self.rate_control_mode = "cbr"
-        else:
-            self.rate_control_mode = self.ENCODER_RC_DEFAULTS.get(
-                self.encoder, self.rate_control_mode
-            )
-        self.resolve_paint_over_default()
 
     def apply_webrtc_encoder_filter(self) -> None:
         """Bring the `encoder` knob — the published menu and the value — in
@@ -1959,23 +2037,6 @@ class AppSettings:
             self._pre_webrtc_encoder = None
             self._webrtc_encoder_fallback = None
 
-    def resolve_paint_over_default(self) -> None:
-        """Default paint-over off on a bandwidth-targeted stream (CBR): the
-        static-scene repaint forces periodic bursts that a bitrate cap pays
-        for in motion quality, and no client has asked for the trade yet.
-
-        An explicit operator use_paint_over_quality choice wins via the
-        override check inside; client choices live in per-display state and
-        the dashboards' own precedence ladder, which this default never
-        outranks. Called from anywhere rate control resolves.
-        """
-        if self.was_provided("use_paint_over_quality"):
-            return
-        self.use_paint_over_quality = (
-            self.rate_control_mode != "cbr",
-            self.use_paint_over_quality[1],
-        )
-
     def _post_process_settings(self) -> None:
         """Normalize and cross-check settings whose meaning spans several
         entries.
@@ -1988,9 +2049,9 @@ class AppSettings:
         one would abort the server at startup rather than select the transport
         it names. With rate control locked off the engine runs constant
         quality on both transports, so the resolved mode and the menu
-        published to clients are CRF alone; an encoder-derived "cbr" would
-        leave the dashboards showing a bitrate slider the encoder ignores and
-        hiding the CRF slider in force. Microphone forwarding requires audio.
+        published to clients are CRF alone; the "cbr" default would leave the
+        dashboards showing a bitrate slider the encoder ignores and hiding the
+        CRF slider in force. Microphone forwarding requires audio.
         A public listener is the both-family wildcard address, so the server
         binds from `addr` alone.
         The clipboard policy is normalized to exactly one of its four values.
@@ -2036,10 +2097,6 @@ class AppSettings:
             )
             if rc_definition is not None:
                 rc_definition["meta"]["allowed"] = ["crf"]
-        else:
-            self.resolve_rate_control_default()
-        # Keys off the resolved mode whichever branch above produced it.
-        self.resolve_paint_over_default()
 
         audio_enabled = self.audio_enabled[0]
         if not audio_enabled and self.microphone_enabled[0]:
@@ -2126,7 +2183,7 @@ def effective_use_cpu(encoder: str, requested: Optional[bool], default: bool) ->
     return bool(default) if requested is None else bool(requested)
 
 
-# Never broadcast to clients: listener, filesystem and lifecycle-hook settings
+# Never broadcast to clients: listener, filesystem, and lifecycle-hook settings
 # a browser has no use for and that disclose host layout.
 CLIENT_PAYLOAD_EXCLUDED = [
     'port', 'addr', 'public', 'unix_socket', 'web_root', 'encode_dri', 'render_dri', 'debug',
@@ -2134,10 +2191,27 @@ CLIENT_PAYLOAD_EXCLUDED = [
     'file_manager_path', 'print_spool_path', 'run_after_connect', 'run_after_disconnect',
     'https_cert', 'rtc_config_json', 'app_ready_file', 'js_socket_path',
     'webcam_socket_path', 'webcam_device',
-    'uinput_mouse_socket', 'webrtc_statistics_dir', 'computer_use_bind',
+    'uinput_mouse_socket', 'webrtc_statistics_dir', 'computer_use_bind', 'computer_use_token',
     'wayland_host_display', 'app_wayland_display',
     'audit_webhook_url', 'audit_webhook_timeout',
 ]
+
+
+def socket_dir(configured: str) -> str:
+    """The directory the interposer sockets live in.
+
+    The operator's when set, else the session's private runtime directory, where
+    no other account can take a socket's name first (in a shared `/tmp` whoever
+    binds a name first serves every application the session starts), else
+    `/tmp`. The interposers and fake-udev resolve the same fallback.
+
+    Args:
+        configured: The `js_socket_path` or `webcam_socket_path` setting.
+
+    Returns:
+        The directory to bind or connect in.
+    """
+    return configured or os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
 
 
 def _published_enum_allowed(setting_def: Dict[str, Any], value: Any) -> List[str]:
@@ -2179,13 +2253,12 @@ def build_client_settings_payload() -> Dict[str, Dict[str, Any]]:
     off under a manual resolution, say) applies or defers to the operator.
     Adds the clipboard gate booleans derived from the single
     `enable_clipboard` policy, the start and on-demand booleans derived from
-    the microphone and webcam policies, the pixelflux build's `software_encoders`
-    (the software encoder behind each codec, "x264" or "openh264" for H.264),
-    which the dashboards' rate-control default reads, and once the startup
-    probe has run, `encoder_backends`: the hardware and software backend of
-    each codec on this host and whether each encodes 4:4:4, from which the
-    dashboards show the software encoding switch only where it switches
-    something and the client walks its codec ladder.
+    the microphone and webcam policies, and once the startup probe has run,
+    `encoder_backends`: the hardware and software backend of each codec on
+    this host (the software one the pixelflux build's, "x264" or "openh264"
+    for H.264) and whether each encodes 4:4:4, from which the dashboards show
+    the software encoding switch only where it switches something and the
+    client walks its codec ladder.
     """
     out = {}
     for setting_def in SETTING_DEFINITIONS:
@@ -2221,7 +2294,6 @@ def build_client_settings_payload() -> Dict[str, Dict[str, Any]]:
         mode = getattr(settings, f"{pipeline}_on_start")
         out[f"{pipeline}_on_start"]['value'] = mode == 'true'
         out[f"{pipeline}_on_demand"] = {'value': mode == 'demand'}
-    out['software_encoders'] = {'value': software_encoders()}
     backends = settings.encoder_backends()
     if backends is not None:
         out['encoder_backends'] = {'value': backends}

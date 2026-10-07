@@ -13,6 +13,8 @@ layout it gets instead is tests/integration/test_extended_monitor_outputs.py.
 """
 import asyncio
 import os
+import re
+import subprocess
 import sys
 import time
 
@@ -51,6 +53,27 @@ def monitors(du) -> dict:
         root = d.screen().root
         return {d.get_atom_name(m.name): (m.x, m.y, m.width_in_pixels, m.height_in_pixels)
                 for m in randr.get_monitors(root, is_active=True).monitors}
+
+
+def output_refresh() -> float:
+    """The refresh of the mode the connected output shows, 0 if none."""
+    out = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=10).stdout
+    rate = re.search(r"(\d+\.\d+)\*", out)
+    return float(rate.group(1)) if rate else 0.0
+
+
+def output_rates() -> dict:
+    """The refresh of the mode each connected output shows, by output name."""
+    out = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=10).stdout
+    rates, name = {}, None
+    for line in out.splitlines():
+        head = re.match(r"(\S+) connected", line)
+        if head:
+            name = head.group(1)
+        rate = re.search(r"(\d+\.\d+)\*", line)
+        if rate and name:
+            rates[name] = float(rate.group(1))
+    return rates
 
 
 def rect(layout: dict) -> tuple:
@@ -126,6 +149,40 @@ def main() -> bool:
                   ok and "screen_1" in outputs(du)
                   and not [n for n in monitors(du) if n.startswith("selkies-")],
                   (outputs(du), monitors(du)))
+
+        # The primary keeps the server's own mode, which carries no timings and
+        # so serves any refresh (`_mode_at`); the display beside it gets one made.
+        def at(fps: float) -> bool:
+            rates = output_rates()
+            return (set(rates) == {"screen", "screen_1"}
+                    and abs(rates["screen_1"] - fps) <= fps * du._REFRESH_SLACK
+                    and all(r == 0 or abs(r - fps) <= fps * du._REFRESH_SLACK for r in rates.values()))
+
+        asyncio.run(du.apply_output_layout(RIGHT, 2304, 720, 144))
+        res.check("every output of a layout runs at the stream's rate", at(144), output_rates())
+        asyncio.run(du.refresh_output_mode(90))
+        res.check("and every one follows a live frame-rate change", at(90), output_rates())
+
+        asyncio.run(du.retire_displays())
+        native = du._sync_resize_randr
+
+        def refused(*_args):
+            raise RuntimeError("native RandR refused")
+
+        du._sync_resize_randr = refused
+        try:
+            for i, fps in enumerate((120, 60, 60, 120, 60)):
+                realized = asyncio.run(du.resize_display("1600x900", fps))
+                rate = output_refresh()
+                res.check(f"the xrandr fallback sets a mode at a {fps} fps stream's rate ({i + 1})",
+                          realized == (1600, 900) and abs(rate - fps) <= fps * du._REFRESH_SLACK,
+                          (realized, rate))
+            out = subprocess.run(["xrandr"], capture_output=True, text=True, timeout=10).stdout
+            made = sorted(re.findall(r"^\s+(1600x900\S*)\s", out, re.M))
+            res.check("and makes one mode per rate, found again on the next resize",
+                      len(made) == 2, made)
+        finally:
+            du._sync_resize_randr = native
     finally:
         server.terminate()
     return res.summary()

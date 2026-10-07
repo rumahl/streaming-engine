@@ -6,7 +6,7 @@
 #
 # One RtpPacer per RTCDtlsTransport. Priority classes, highest first:
 # RTCP + audio (which bypass the token bucket entirely: they are protocol
-# rate-limited, tiny and latency-critical), data-channel, video (incl. RTX and
+# rate-limited, tiny, and latency-critical), data-channel, video (incl. RTX and
 # FEC).
 #
 # Scheduling is an event-driven token bucket. A packet goes straight out when
@@ -18,6 +18,12 @@
 # Invariants:
 #   * The burst budget always covers one max-size packet, otherwise a packet
 #     could never become affordable and its class would wedge forever.
+#   * The burst budget follows the link, never the pace alone: 5 ms of the
+#     pace until transport-cc feedback typically shows the wire delivering
+#     frames' leading bursts at twice the encoder's rate or more without loss,
+#     then what that link delivers in 10 ms until it typically falls below 1.5
+#     times the encoder's rate, loses a packet, delivers less than the encoder
+#     makes, or goes unmeasured (`_apply_pace`, `set_link_bps`).
 #   * Video is the only droppable class; every other class is bounded by
 #     backpressure on the sender instead.
 #   * The video queue budget is max(CAP_MIN_MS of wire time, IDR_FLOOR_FACTOR x
@@ -28,6 +34,11 @@
 #     than thinning arbitrary packet tails; a timeout resurrects video if no
 #     keyframe arrives, so an unbound keyframe callback or a stuck encoder
 #     cannot kill the class permanently (natural IDR cadence can be minutes).
+#     Where the video sender can resync its peer without one (`resync`: the
+#     encoder names each frame's reference and the peer reads the dependency
+#     descriptor), the drop is handed to it instead: it holds back the frames
+#     the purge left undecodable and has the encoder predict past them, and
+#     video flows on, the shared stream carrying no keyframe for one peer.
 #   * Rate control is AIMD on wire evidence: an internal overflow only proves
 #     injection > drain, and with UDP sends the drain is the pace setting, not
 #     the wire — once one brake drops the pace below the encoder rate, every
@@ -43,8 +54,9 @@
 import asyncio
 import logging
 import os
+import statistics
 import time
-from typing import Awaitable, Callable, Dict, Deque, Optional
+from typing import Any, Awaitable, Callable, Dict, Deque, Optional
 from collections import deque
 
 logger = logging.getLogger("selkies_webrtc_pacer")
@@ -54,7 +66,7 @@ logger = logging.getLogger("selkies_webrtc_pacer")
 CLASS_RTCP = 0
 CLASS_AUDIO = 0
 # CLASS_DC carries data-channel traffic (input, status, clipboard);
-# CLASS_VIDEO carries video RTP, RTX and FEC.
+# CLASS_VIDEO carries video RTP, RTX, and FEC.
 CLASS_DC = 1
 CLASS_VIDEO = 2
 # Classes that own a queue: class 0 bypasses the bucket and is never enqueued.
@@ -72,9 +84,24 @@ OVERFLOW_RECOVERY_PER_S = 0.25
 # crater the stream into a starvation valley that +25%/s takes seconds to
 # climb out of.
 AIMD_FLOOR_FACTOR = 0.35
-# Burst credit window: how much wire time the bucket may hoard. Wider windows
-# let video bursts land in front of audio.
+# Burst credit window: how much wire time at the pace the bucket may hoard
+# while the link's room is unknown or short. Wider windows let video bursts
+# land in front of audio at a bottleneck.
 DEBT_WINDOW_S = 0.005
+# A link measured to have room takes the burst it delivers in BURST_LINK_S,
+# never more than libwebrtc's send burst interval at the pace under its byte
+# cap, which keeps a burst inside a socket's send buffer.
+BURST_LINK_S = 0.010
+BURST_WINDOW_S = 0.040
+MAX_BURST_BYTES = 63_000
+# Room is a link delivering a frame's leading burst at this many times the
+# encoder's rate or faster, typically over the last LINK_SAMPLES feedback
+# packets and measured within LINK_MAX_AGE_S; a link found to have room keeps
+# it down to LINK_KEEP_FACTOR times that rate.
+LINK_HEADROOM_FACTOR = 2.0
+LINK_KEEP_FACTOR = 1.5
+LINK_SAMPLES = 5
+LINK_MAX_AGE_S = 2.0
 # Floor under the burst budget. Credit saturates at the budget, so a budget
 # below one packet leaves that packet unaffordable forever; DTLS records here
 # are MTU-sized and this keeps headroom above them.
@@ -91,6 +118,8 @@ KEYREQ_MIN_INTERVAL_S = 0.5
 MIN_PACE_BPS = 100_000
 # Defensive cap on drain sleeps; pokes handle the rest.
 DRAIN_MAX_SLEEP_S = 0.05
+# Frames whose end `frame_end` waits on at once; more than are ever in flight.
+FRAME_ENDS_MAX = 64
 # Post-enable grace: ignore goodput braking so the first (audio-only/startup)
 # feedback windows cannot slam the pace before video even ramps.
 GOODPUT_WARMUP_S = 5.0
@@ -159,6 +188,7 @@ class RtpPacer:
         request_keyframe: Optional[Callable[[], None]] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         on_dropped: Optional[Callable[[int], None]] = None,
+        resync: Optional[Callable[[Optional[int]], bool]] = None,
     ) -> None:
         self._encoder_bps = max(int(encoder_bps), 100_000)
         self._goodput_bps: Optional[int] = None
@@ -167,10 +197,16 @@ class RtpPacer:
         self._send_now = send_now
         self._send_now_data = send_now_data or send_now
         self._request_keyframe = request_keyframe
-        # Told the tag of every video packet dropped, refused or purged, so the
+        # Told the tag of every video packet dropped, refused, or purged, so the
         # transport's loss accounting can leave them out.
         self._on_dropped = on_dropped
+        # Offered a GOP reset's oldest dropped tag; True when the video sender
+        # resyncs its peer itself, so no keyframe is asked for (module notes).
+        self._resync = resync
         self._loop = loop or asyncio.get_running_loop()
+        # Tag of a frame's last packet -> what to call, and with what, once it is
+        # on the wire (`frame_end`); a dropped one is forgotten with its packet.
+        self.frame_ends: Dict[int, tuple] = {}
 
         self._queues: Dict[int, Deque[bytes]] = {c: deque() for c in _QUEUED_CLASSES}
         self._poke = asyncio.Event()
@@ -188,6 +224,11 @@ class RtpPacer:
         self._video_tags: Deque[Optional[int]] = deque()
         self.credit = 0.0
         self._debt_cap = 0.0
+        self._narrow_cap = 0.0
+        self._link_bps: Optional[float] = None
+        self._link_at = 0.0
+        self._link_recent: Deque[float] = deque(maxlen=LINK_SAMPLES)
+        self._link_room = False
         self._pace_bps = MIN_PACE_BPS
         # Sentinel for "AIMD owns the pace now"; distinct from the recovery
         # clock, which ticks on every pace update.
@@ -204,9 +245,10 @@ class RtpPacer:
         self._keyreq_answered = True
         self._enabled_at = self._last
         self._gop_dead_at = 0.0
+        self._purged_first: Optional[int] = None
         self._oversize_warned = False
         self.stats = {
-            "video_dropped": 0, "keyreqs": 0, "gop_resets": 0,
+            "video_dropped": 0, "keyreqs": 0, "gop_resets": 0, "resyncs": 0,
             "idr_resurrects": 0, "timeout_resurrects": 0, "stale_resets": 0,
             "paced_bytes": 0, "queue_max_bytes": 0, "fastpath_bytes": 0,
         }
@@ -260,6 +302,30 @@ class RtpPacer:
             self._goodput_bps = bps
             self._goodput_at = now
 
+    def set_link_bps(self, bps: Optional[float]) -> None:
+        """Take the rate the wire delivered a frame's leading burst at.
+
+        Args:
+            bps: The rate from the latest transport-cc feedback; 0 when that
+                feedback showed the wire losing packets, None when it held no
+                burst to measure, which leaves the last estimate to age out.
+        """
+        if bps is None:
+            return
+        self._link_bps = float(bps)
+        self._link_at = time.monotonic()
+        if bps > 0:
+            self._link_recent.append(float(bps))
+        else:
+            self._link_recent.clear()
+        self._apply_pace()
+
+    @property
+    def burst_probe_bytes(self) -> float:
+        """How much of a frame leaves unpaced whatever the link's room: the
+        leading bytes whose arrivals measure the link rather than the pace."""
+        return self._narrow_cap
+
     def _on_overflow(self) -> None:
         """Brake on queue overflow, sized by wire evidence alone.
 
@@ -299,6 +365,10 @@ class RtpPacer:
             return
         ceiling = PACE_FACTOR * self._encoder_bps
         self._last_pace_update_at = now
+        if self._link_bps and now - self._link_at > LINK_MAX_AGE_S:
+            self._link_bps = None
+            self._link_recent.clear()
+            self._apply_pace()
         if self._pace_bps >= ceiling:
             return
         grown = int(self._pace_bps * (1.0 + OVERFLOW_RECOVERY_PER_S) ** min(dt, 4.0))
@@ -314,14 +384,43 @@ class RtpPacer:
         ]
 
     def _apply_pace(self) -> None:
-        """Re-derive the burst budget from the current pace and clamp credit to
-        it. Credit saturates at the budget, so the budget is floored at
+        """Re-derive the burst budget from the pace and the link, and clamp
+        credit to it.
+
+        The budget is DEBT_WINDOW_S of the pace while the link's room is
+        unknown or short. A link the latest feedback showed delivering a
+        frame's leading burst at LINK_HEADROOM_FACTOR times the encoder's rate
+        or faster, with nothing lost on the wire and the pace not braked, takes
+        what it delivers in BURST_LINK_S, at most libwebrtc's burst, so a
+        frame leaves whole instead of trickling out at the pace behind its
+        first packets. Room is judged on the median of the last LINK_SAMPLES
+        estimates and kept while that stays at LINK_KEEP_FACTOR times the
+        encoder's rate or more: one burst's rate scatters with the receiver's
+        own timing, and a single estimate against a single threshold flips the
+        budget on every other feedback of a link close to it. The burst is
+        sized by the lower of the latest estimate and that median, and a
+        latest estimate below the encoder's rate closes the room at once, so
+        a link that drops is never burst into at its old rate. Sizing the burst
+        to the measured link rather than to the pace keeps the wide one off a
+        link near capacity, where it only moves the queue from the pacer to
+        the bottleneck, ahead of audio.
+        Credit saturates at the budget, so it is floored at
         BURST_FLOOR_BYTES: below one packet's size, that packet could never
         become affordable and its class would wedge."""
-        self._debt_cap = max(self._pace_bps / 8.0 * DEBT_WINDOW_S,
-                             float(BURST_FLOOR_BYTES))
-        if self.credit > self._debt_cap:
-            self.credit = self._debt_cap
+        pace_bytes = self._pace_bps / 8.0
+        self._narrow_cap = cap = max(pace_bytes * DEBT_WINDOW_S, float(BURST_FLOOR_BYTES))
+        link = self._link_bps
+        typical = statistics.median(self._link_recent) if self._link_recent else 0.0
+        factor = LINK_KEEP_FACTOR if self._link_room else LINK_HEADROOM_FACTOR
+        self._link_room = bool(link and link >= self._encoder_bps
+                               and typical >= factor * self._encoder_bps
+                               and time.monotonic() - self._link_at <= LINK_MAX_AGE_S)
+        if self._link_room and self._pace_bps >= int(PACE_FACTOR * self._encoder_bps):
+            cap = max(cap, min(min(link, typical) / 8.0 * BURST_LINK_S, pace_bytes * BURST_WINDOW_S,
+                               float(MAX_BURST_BYTES)))
+        self._debt_cap = cap
+        if self.credit > cap:
+            self.credit = cap
 
     def _refresh_windows(self) -> None:
         ceiling = PACE_FACTOR * self._encoder_bps
@@ -345,7 +444,7 @@ class RtpPacer:
 
         Only NATURAL keyframes enter the window: a forced keyframe is emitted at
         the collapsed bitrate that made us ask for it, so letting it evict a
-        window entry would shrink the floor, shrink the cap and trigger the next
+        window entry would shrink the floor, shrink the cap, and trigger the next
         reset — a self-reinforcing keyframe-churn cycle. A forced keyframe may
         still RAISE the floor, so a cap too small to hold one IDR still grows out
         of the churn.
@@ -392,6 +491,10 @@ class RtpPacer:
             logger.debug("pacer keyframe request failed", exc_info=True)
 
     # ------------------------------------------------------------------- send
+    def drain_s(self) -> float:
+        """Seconds until what is queued now has left, at the current pace."""
+        return self._bytes_queued * 8 / max(self._pace_bps, 1)
+
     def _accrue(self) -> None:
         now = time.monotonic()
         self.credit = min(self._debt_cap,
@@ -458,7 +561,7 @@ class RtpPacer:
                     deadline = idr_time
             now = time.monotonic()
             if now - self._video_ts[0] > deadline:
-                self._stale_reset(deadline)
+                self._stale_reset(deadline, tag)
                 self.stats["video_dropped"] += 1
                 self._drop(tag)
                 return False
@@ -472,12 +575,14 @@ class RtpPacer:
                 self.stats["fastpath_bytes"] += n
                 sender = self._send_now_data if cls == CLASS_DC else self._send_now
                 await sender(data)
+                if self.frame_ends and tag is not None:
+                    self._left(tag)
                 return True
 
         # Video queue budget: a packet the budget cannot hold abandons the GOP,
         # queue and all. The cap is video-only: audio/DC never push an IDR out.
         if cls == CLASS_VIDEO and self._video_bytes + n > self._video_cap_bytes():
-            self._reset_gop()
+            self._reset_gop(tag=tag)
             self.stats["video_dropped"] += 1
             self._drop(tag)
             return False
@@ -499,23 +604,42 @@ class RtpPacer:
         self._kick()
         return True
 
-    def _stale_reset(self, deadline_s: float) -> None:
+    def _stale_reset(self, deadline_s: float, tag: Optional[int] = None) -> None:
         """Latency-first GOP reset for queued video that outlived its usefulness."""
-        self._reset_gop("video backlog stale (>%.0fms)" % (deadline_s * 1000))
+        self._reset_gop("video backlog stale (>%.0fms)" % (deadline_s * 1000), tag)
         self.stats["stale_resets"] += 1
 
+    def frame_end(self, tag: int, sink: Callable[..., None], *args: Any) -> None:
+        """Call `sink(*args)` once the video packet tagged `tag`, the last of its
+        frame, leaves for the wire: how long a frame took to get there includes the
+        time it queued here. At most FRAME_ENDS_MAX are held; the oldest goes first."""
+        ends = self.frame_ends
+        ends[tag] = (sink, args)
+        if len(ends) > FRAME_ENDS_MAX:
+            del ends[next(iter(ends))]
+
+    def _left(self, tag: Optional[int]) -> None:
+        """A video packet went out: call what its frame's end was waiting on."""
+        end = self.frame_ends.pop(tag, None)
+        if end is not None:
+            end[0](*end[1])
+
     def _drop(self, tag: Optional[int]) -> None:
-        if tag is not None and self._on_dropped is not None:
-            self._on_dropped(tag)
+        if tag is not None:
+            self.frame_ends.pop(tag, None)
+            if self._on_dropped is not None:
+                self._on_dropped(tag)
 
     def _purge_video(self) -> int:
         """Drop the whole video queue, keeping the byte counters and the
-        enqueue-time and tag mirrors in lockstep with it; the packets dropped."""
+        enqueue-time and tag mirrors in lockstep with it; the packets dropped.
+        The oldest tag dropped is kept in `_purged_first`."""
         dq = self._queues[CLASS_VIDEO]
         n = len(dq)
         if dq:
             self.stats["video_dropped"] += n
             dq.clear()
+        self._purged_first = next((t for t in self._video_tags if t is not None), None)
         for tag in self._video_tags:
             self._drop(tag)
         self._video_tags.clear()
@@ -524,11 +648,21 @@ class RtpPacer:
         self._video_bytes = 0
         return n
 
-    def _reset_gop(self, reason: str = "video queue overflow") -> None:
+    def _reset_gop(self, reason: str = "video queue overflow", tag: Optional[int] = None) -> None:
         """Abandon the GOP: purge the queued video, which nothing behind the
         requested keyframe can use, refuse video until that keyframe, and
-        brake if wire evidence sizes one."""
+        brake if wire evidence sizes one. Where the video sender resyncs its
+        peer itself (`_resync`), told the oldest packet lost (the queue's, else
+        `tag`, the packet at hand), the purge and the brake are all: video
+        flows on and no keyframe is asked for."""
         purged = self._purge_video()
+        first = self._purged_first if self._purged_first is not None else tag
+        if not self._gop_dead and self._resync is not None and self._resync(first):
+            self._on_overflow()
+            self.stats["resyncs"] += 1
+            logger.info("pacer: %s => %d queued packets purged; the sender resyncs its peer",
+                        reason, purged)
+            return
         if not self._gop_dead:
             self._gop_dead = True
             self._gop_dead_at = time.monotonic()
@@ -589,10 +723,11 @@ class RtpPacer:
                                     "bucket", size, int(self._debt_cap))
                         data = dq.popleft()
                         self._bytes_queued -= size
+                        tag = None
                         if cls == CLASS_VIDEO:
                             self._video_bytes -= size
                             self._video_ts.popleft()
-                            self._video_tags.popleft()
+                            tag = self._video_tags.popleft()
                         self.credit -= size
                         try:
                             await sender(data)
@@ -601,14 +736,17 @@ class RtpPacer:
                                            exc_info=True)
                             # The receiver's reference chain dies with the
                             # purged packets: mark video dead so nothing that
-                            # depends on them is sent, and ask for a keyframe.
-                            self._reset_gop("send failed")
+                            # depends on them is sent, and ask for a keyframe,
+                            # unless the sender resyncs its peer itself.
+                            self._reset_gop("send failed", tag)
                             self._queues = {c: deque() for c in _QUEUED_CLASSES}
                             self._make_class_table()
                             self._bytes_queued = self._video_bytes = 0
                             self._release_senders()
                             return
                         self.stats["paced_bytes"] += size
+                        if tag is not None and self.frame_ends:
+                            self._left(tag)
                 if self._bytes_queued <= DC_LOW_WATER_BYTES:
                     self._release_senders()
                 if not self._bytes_queued:
@@ -657,6 +795,7 @@ class RtpPacer:
     def snapshot(self) -> Dict[str, int]:
         out = dict(self.stats)
         out["pace_bps"] = int(self._pace_bps)
+        out["burst_bytes"] = int(self._debt_cap)
         out["queued_bytes"] = self._bytes_queued
         out["video_bytes"] = self._video_bytes
         out["idr_floor_bytes"] = int(self._idr_floor_bytes)

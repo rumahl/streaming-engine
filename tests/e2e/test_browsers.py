@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Browser-engine matrix: Chromium (Chrome binary), Firefox, WebKit over the
-websockets transport (flow, input, clipboard, resize, console health), plus a
-reduced WebRTC flow on Firefox (parity with the Chrome reference) and WebKit."""
+websockets transport (flow, audio, input, clipboard, resize, console health),
+plus a reduced WebRTC flow on Firefox (parity with the Chrome reference) and
+WebKit. Over WebSockets, video and audio reach the page and playback on every
+engine, through libopus in WASM where the engine has no WebCodecs audio, and
+play on the output device the page picks. Over WebRTC, a manual resolution
+shown 1:1 is drawn nearest-sampled in Chromium only, since Firefox's compositor
+draws that slower than a smoothed video."""
 import os
 import sys
 import time
@@ -10,7 +15,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import helpers as H
 import core_lib as C
 from playwright.sync_api import sync_playwright
+from typing import Optional
 
+
+# A field of the class the dashboards put on their root, whose keys the input
+# core leaves to the page, and a point on it.
+NATIVE_FIELD_JS = """(() => {
+  const f = document.createElement('input');
+  f.id = 'native-field';
+  f.className = 'allow-native-input';
+  f.style.cssText = 'position:fixed;left:20px;top:20px;width:200px;height:30px;z-index:9999';
+  document.body.appendChild(f);
+})()"""
+NATIVE_FIELD_AT = (120, 35)
 
 DECODER_ERROR_PATTERNS = (
     "Failed to load resource", "Unexpected server response:", "ResizeObserver",
@@ -23,19 +40,38 @@ FF_E2E_PROFILE = C.FF_E2E_PROFILE
 openh264_version = C.openh264_version
 
 
-def engine_launch(p, engine: str):
+def engine_launch(p, engine: str, prefs: Optional[dict] = None):
     """Return (browser_or_none, ctx). Firefox needs a persistent profile that
     carries the OpenH264 GMP plugin (bundled profile ships without it, so the
-    WebRTC answer rejects the video m-line) plus autoplay/clipboard prefs."""
+    WebRTC answer rejects the video m-line) plus autoplay/clipboard prefs, and
+    `prefs` on top."""
     if engine == "chromium":
         b = C.chromium_launch(p)
         return b, b.new_context(viewport={"width": 1280, "height": 720, "deviceScaleFactor": 1})
     if engine == "firefox":
         ctx = C.firefox_persistent_context(
-            p, viewport={"width": 1280, "height": 720, "deviceScaleFactor": 1})
+            p, viewport={"width": 1280, "height": 720, "deviceScaleFactor": 1}, prefs=prefs)
         return None, ctx
     b = getattr(p, engine).launch(headless=True)
     return b, b.new_context(viewport={"width": 1280, "height": 720, "deviceScaleFactor": 1})
+
+
+def hold(page, key: str):
+    """Press `key` and leave it down; whether the X keymap then shows it held.
+
+    Headless WebKit drops synthetic keydowns under load, so the whole press is
+    retried rather than waited on.
+    """
+    pressed = False
+    for _ in range(4):
+        page.keyboard.down(key)
+        time.sleep(0.8)
+        pressed = C.x11_keymap_pressed(key)
+        if pressed is True:
+            break
+        page.keyboard.up(key)
+        time.sleep(0.6)
+    return pressed
 
 
 def engine_block(engine: str, mode: str = "websockets") -> "H.Results":
@@ -107,22 +143,36 @@ def engine_block(engine: str, mode: str = "websockets") -> "H.Results":
 
             page.mouse.click(640, 360)
             time.sleep(0.5)
-            pressed = False
-            for _ in range(4):
-                # Headless WebKit drops synthetic keydowns under load, so the whole
-                # press is retried rather than waited on.
-                page.keyboard.down("x")
-                time.sleep(0.8)
-                pressed = C.x11_keymap_pressed("x")
-                if pressed is True:
-                    break
-                page.keyboard.up("x")
-                time.sleep(0.6)
+            if mode == "websockets":
+                # The capture sends nothing while the desktop is silent.
+                tone = H.pulse_sine()
+                try:
+                    deadline = time.time() + 12
+                    depth = 0
+                    while time.time() < deadline:
+                        depth = page.evaluate("window.currentAudioBufferSize || 0") or 0
+                        if depth > 0:
+                            break
+                        time.sleep(0.5)
+                    res.check("audio: packets reach playback", depth > 0, depth)
+                finally:
+                    H.pulse_unload(tone)
+            pressed = hold(page, "x")
             res.check("input: key held in X keymap", pressed is True, pressed)
             page.keyboard.up("x")
             time.sleep(0.3)
             res.check("input: key released in X keymap",
                       C.x11_keymap_pressed("x") is False, "")
+            page.evaluate(NATIVE_FIELD_JS)
+            pressed = hold(page, "x")
+            page.mouse.click(*NATIVE_FIELD_AT)
+            page.keyboard.up("x")
+            time.sleep(0.5)
+            res.check("input: a key let go in a dashboard field is released",
+                      pressed is True and C.x11_keymap_pressed("x") is False, pressed)
+            page.evaluate("document.getElementById('native-field').remove()")
+            page.mouse.click(640, 360)
+            time.sleep(0.3)
 
             push = f"e2e-{tag}-s2c"
             ext, stop = H.x_own_clipboard(push.encode())
@@ -168,6 +218,25 @@ def engine_block(engine: str, mode: str = "websockets") -> "H.Results":
                 res.check("resize: X root follows browser", realized and abs(realized[0] - req_w) <= 16,
                           f"req={req_w}x{req_h} actual={realized}")
 
+            if mode == "webrtc":
+                # Inside the window: the page caps the video at its container.
+                for message in ({"type": "setScaleLocally", "value": False},
+                                {"type": "setManualResolution", "width": 1024, "height": 576}):
+                    page.evaluate("(m) => window.postMessage(m, window.location.origin)", message)
+                deadline = time.time() + 15
+                size = None
+                while time.time() < deadline:
+                    size = page.evaluate("(() => { const v = document.getElementById('stream'); "
+                                         "return v ? [v.videoWidth, v.videoHeight] : null; })()")
+                    if size == [1024, 576]:
+                        break
+                    time.sleep(0.5)
+                time.sleep(1.0)
+                got = page.evaluate("document.getElementById('stream').style.imageRendering")
+                want = "pixelated" if engine == "chromium" else "auto"
+                res.check("render: a 1:1 manual resolution is nearest-sampled in Chromium only",
+                          size == [1024, 576] and got == want, f"stream={size} rendering={got} want={want}")
+
             real_errors = [e for e in console_errors
                            if not any(p_ in e for p_ in DECODER_ERROR_PATTERNS)]
             benign = [u for u in not_found if u.endswith("/manifest.json") or "favicon" in u]
@@ -185,7 +254,7 @@ def engine_block(engine: str, mode: str = "websockets") -> "H.Results":
 
 
 def striped_block(engine: str) -> "H.Results":
-    """The striped encoder on one engine: the video worker decodes, composites
+    """The striped encoder on one engine: the video worker decodes, composites,
     and presents it off the page where the engine allows.
 
     chromium and firefox take the divert (fps counts the worker's composites,
@@ -304,6 +373,126 @@ def sink_block(engine: str) -> "H.Results":
     return res
 
 
+def wasm_block(engine: str, channels: int = 2) -> "H.Results":
+    """An engine without WebCodecs audio plays the stream's sound through
+    libopus in WASM: the decode worker says it fell back, and the playback
+    worklet is fed PCM that carries the desktop's tone. Surround comes as
+    pcmflux's multistream packets, split and decoded a stream at a time."""
+    res = H.Results(f"wasm-{engine}-{channels}ch")
+    H.server_start(mode="websockets", wayland=False,
+                   extra_env={"SELKIES_AUDIO_CHANNELS": str(channels)} if channels != 2 else None)
+    try:
+        with sync_playwright() as p:
+            browser, ctx = engine_launch(p, engine)
+            try:
+                ctx.add_init_script(C.NO_WEBCODECS_AUDIO_JS)
+                page = ctx.pages[0] if (engine == "firefox" and ctx.pages) else ctx.new_page()
+                said, errors = [], []
+                page.on("console", lambda m: said.append(m.text))
+                page.on("pageerror", lambda e: errors.append(str(e)))
+                page.goto(H.BASE_URL, wait_until="load")
+                res.check(f"[{engine}] video up", bool(C.wait_ws_video(page, timeout=45)), "")
+                page.mouse.click(640, 360)
+                tone = H.pulse_sine()
+                depth = level = 0
+                try:
+                    deadline = time.time() + 15
+                    while time.time() < deadline:
+                        depth = page.evaluate("window.currentAudioBufferSize || 0") or 0
+                        level = page.evaluate("window.currentAudioLevel || 0") or 0
+                        if depth > 0 and level > 0:
+                            break
+                        time.sleep(0.5)
+                finally:
+                    H.pulse_unload(tone)
+                res.check(f"[{engine}] the decode worker fell back on libopus in WASM",
+                          any("decodes on libopus in WASM" in t for t in said),
+                          [t for t in said if "Audio Decoder" in t][:3])
+                res.check(f"[{engine}] {channels}-channel packets reach playback", depth > 0, depth)
+                res.check(f"[{engine}] and play as sound, not silence", level > 0, level)
+                res.check(f"[{engine}] no page errors", not errors, "; ".join(errors)[:200])
+            finally:
+                if browser:
+                    browser.close()
+                else:
+                    ctx.close()
+    finally:
+        H.server_stop()
+    res.summary()
+    return res
+
+
+def output_block(engine: str) -> "H.Results":
+    """The output device a page picks carries its sound. Two null sinks stand in
+    for speakers; the page is told to play to one and then the other
+    (`audioDeviceSelected`), and the desktop's tone is heard on that sink's
+    monitor and not on the other's. Chromium picks through
+    AudioContext.setSinkId, Firefox, which has none, through a media element's."""
+    import test_microphone_audio as M
+    res = H.Results(f"output-{engine}")
+    names = ("selkies_pick_a", "selkies_pick_b")
+    sinks = [H.pulse_null_sink(n, sink_properties=f"device.description={n}") for n in names]
+    tone = None
+    H.server_start(mode="websockets", wayland=False)
+    try:
+        with sync_playwright() as p:
+            if engine == "chromium":
+                # Heard, not muted: the shared flags mute Chromium's output, and headless
+                # Chromium plays nothing to the sound server, so it runs on the test display.
+                kw = {"headless": False, "args": [a for a in C.BROWSER_ARGS if a != "--mute-audio"],
+                      "env": {**os.environ, "DISPLAY": H.TEST_DISPLAY}}
+                if C.CHROME_PATH:
+                    kw["executable_path"] = C.CHROME_PATH
+                browser = p.chromium.launch(**kw)
+                ctx = browser.new_context(viewport={"width": 1280, "height": 720})
+                ctx.grant_permissions(["microphone"], origin=H.BASE_URL)
+            else:
+                # The microphone grant that names the outputs, without a prompt no one answers.
+                browser, ctx = engine_launch(p, engine, prefs={"media.navigator.permission.disabled": True})
+            try:
+                page = ctx.pages[0] if (engine == "firefox" and ctx.pages) else ctx.new_page()
+                errors, said = [], []
+                page.on("pageerror", lambda e: errors.append(str(e)))
+                page.on("console", lambda m: said.append(m.text) if "output" in m.text.lower() else None)
+                page.goto(H.BASE_URL, wait_until="load")
+                res.check(f"[{engine}] video up", bool(C.wait_ws_video(page, timeout=45)), "")
+                page.mouse.click(640, 360)
+                tone = H.pulse_sine()
+                # Output devices are named to a page that holds a microphone grant.
+                outputs = page.evaluate("""async () => {
+                  try { const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+                        s.getTracks().forEach((t) => t.stop()); } catch (e) { /* named or not, list them */ }
+                  return (await navigator.mediaDevices.enumerateDevices())
+                    .filter((d) => d.kind === 'audiooutput').map((d) => [d.deviceId, d.label]);
+                }""")
+                for target in names:
+                    other = names[1 - names.index(target)]
+                    device = next((d for d in outputs if target in d[1]), None)
+                    res.check(f"[{engine}] {target} is offered as an output", device is not None, outputs)
+                    if device is None:
+                        continue
+                    page.evaluate("(id) => window.postMessage({ type: 'audioDeviceSelected', context: 'output', "
+                                  "deviceId: id }, location.origin)", device[0])
+                    time.sleep(2.5)
+                    heard = {n: M.analyze(M.record(f"{n}.monitor", 2.0), 440) for n in names}
+                    res.check(f"[{engine}] picked, {target} plays the desktop's tone",
+                              heard[target]["rms"] > 150 and heard[target]["ratio"] > 0.5, (heard[target], said[-2:]))
+                    res.check(f"[{engine}] and {other} goes quiet", heard[other]["rms"] < 50, heard[other])
+                res.check(f"[{engine}] no page errors", not errors, "; ".join(errors)[:200])
+            finally:
+                if browser:
+                    browser.close()
+                else:
+                    ctx.close()
+    finally:
+        H.pulse_unload(tone)
+        for module in sinks:
+            H.pulse_unload(module)
+        H.server_stop()
+    res.summary()
+    return res
+
+
 def main() -> None:
     """Run the engine blocks named on argv (default: all available)."""
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
@@ -318,6 +507,14 @@ def main() -> None:
         if which in ("all", "sink"):
             blocks.append(sink_block("webkit"))
             blocks.append(sink_block("chromium"))
+        if which in ("all", "output"):
+            blocks.append(output_block("chromium"))
+            blocks.append(output_block("firefox"))
+        if which in ("all", "wasm"):
+            blocks.append(wasm_block("chromium"))
+            blocks.append(wasm_block("firefox"))
+            blocks.append(wasm_block("webkit"))
+            blocks.append(wasm_block("chromium", channels=6))
         if which in ("all", "striped"):
             blocks.append(striped_block("chromium"))
             blocks.append(striped_block("firefox"))

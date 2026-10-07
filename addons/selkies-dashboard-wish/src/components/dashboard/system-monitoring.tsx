@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import { getLastServerSettings, getPrefixedKey } from "@/utils";
 import { t } from "@/i18n";
-import type { StreamClient, StreamInfo, StreamSample } from "../../../../selkies-web-core/lib/stream-stats.js";
+import { STATS_EVENT, type StreamClient, type StreamInfo, type StreamSample } from "../../../../selkies-web-core/lib/stream-stats.js";
 import {
 	graphPath,
 	seriesOf,
@@ -32,13 +32,14 @@ import {
 
 /**
  * The stats overlay: what the stream runs on, the graphs that grow while it
- * stays open, the figures under them and the host's meters, as a compact strip
+ * stays open, the figures under them, and the host's meters, as a compact strip
  * or in full.
  *
  * Everything drawn comes from the core's `window.stream_info`,
- * `window.stream_client` and `window.stream_stats`
- * (`selkies-web-core/lib/stream-stats.js`), read once a second while the
- * overlay is mounted and the tab is visible; what a row says and when it warns
+ * `window.stream_client`, and `window.stream_stats`
+ * (`selkies-web-core/lib/stream-stats.js`), read each time the core announces
+ * a change (`STATS_EVENT`) while the overlay is mounted and the tab is
+ * visible; what a row says and when it warns
  * is `lib/stream-stats-view.js`, shared with the default dashboard. Being on
  * screen is what turns the numbers on: the component posts `statsOpen` to the
  * core, which asks the server for them, and posts `open: false` on the way out.
@@ -57,13 +58,12 @@ declare global {
 		currentAudioBufferSize?: number;
 		/**
 		 * Set by the dashboard around a transport switch so the active core
-		 * suppresses the expected "Server disconnected" alert from the old peer.
+		 * leaves the old peer's teardown to the reload the switch makes.
 		 */
 		__selkiesModeSwitching?: boolean;
 	}
 }
 
-const READ_INTERVAL_MS = 1000;
 const GRAPH_WIDTH = 240;
 const GRAPH_HEIGHT = 44;
 
@@ -201,9 +201,9 @@ function Graph({ label, unit, series, max, bare }: GraphProps) {
 }
 
 /**
- * Renders the overlay, reading the core's `window` stream state once a second
- * and telling the core the stats are on screen for as long as it is mounted
- * in a visible tab.
+ * Renders the overlay, reading the core's `window` stream state whenever the
+ * core announces a change and telling the core the stats are on screen for as
+ * long as it is mounted in a visible tab.
  */
 export function SystemMonitoring() {
 	const [isDetailedView, setIsDetailedView] = useState(false);
@@ -233,9 +233,9 @@ export function SystemMonitoring() {
 			setFramerate(configuredFramerate());
 		};
 		read();
-		const id = setInterval(read, READ_INTERVAL_MS);
+		window.addEventListener(STATS_EVENT, read);
 		return () => {
-			clearInterval(id);
+			window.removeEventListener(STATS_EVENT, read);
 			countOverlay(-1);
 		};
 	}, [visible]);
@@ -271,20 +271,24 @@ export function SystemMonitoring() {
 		software: t('sections.stats.software'),
 		unknown: t('sections.stats.tooltipMemoryNA'),
 		throttled: t('sections.stats.throttled'),
+		hardware_available: t('sections.stats.hardwareAvailable'),
+		software_preferred: t('sections.stats.softwarePreferred'),
 	});
 	const number = (key: string): number => (latest && typeof latest[key] === 'number' ? (latest[key] as number) : 0);
 
 	const toggle = (
 		<Tooltip>
-			<TooltipTrigger asChild>
-				<Button
-					variant="ghost"
-					size="sm"
-					className="h-7 w-7 p-0 min-w-0 pointer-events-auto"
-					onClick={() => setIsDetailedView((detailed) => !detailed)}
-				>
-					{isDetailedView ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-				</Button>
+			<TooltipTrigger
+				render={
+					<Button
+						variant="ghost"
+						size="sm"
+						className="h-7 w-7 p-0 min-w-0 pointer-events-auto"
+						onClick={() => setIsDetailedView((detailed) => !detailed)}
+					/>
+				}
+			>
+				{isDetailedView ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
 			</TooltipTrigger>
 			<TooltipContent side="bottom">
 				<p>{isDetailedView ? t('stats.compactView') : t('stats.detailedView')}</p>
@@ -294,7 +298,7 @@ export function SystemMonitoring() {
 
 	if (!isDetailedView) {
 		return (
-			<div className="flex items-center gap-3 rounded-lg border bg-card px-3 py-1.5 text-xs shadow-sm backdrop-blur-sm tabular-nums cursor-grab active:cursor-grabbing">
+			<div className="flex items-center gap-3 rounded-lg border bg-card px-3 py-1.5 text-xs shadow-sm tabular-nums cursor-grab active:cursor-grabbing">
 				<div className="flex items-center gap-1 pointer-events-none">
 					{rows.map((row) => <StatusMark key={row.key} status={row.status} />)}
 				</div>
@@ -315,7 +319,7 @@ export function SystemMonitoring() {
 		);
 	}
 
-	const tiles = streamTiles(latest, client ? client.transport : 'websockets');
+	const tiles = streamTiles(latest, client ? client.transport : 'websockets', history);
 	const meters = streamMeters(latest);
 	const meterLabels: Record<string, string> = {
 		cpu: t('sections.stats.cpuLabel'),
@@ -334,83 +338,100 @@ export function SystemMonitoring() {
 	};
 
 	return (
-		<div className="flex w-80 flex-col gap-2.5 rounded-lg border bg-background/95 p-3 text-xs shadow-lg backdrop-blur-sm tabular-nums cursor-grab active:cursor-grabbing">
-			<div className="flex items-center justify-between">
-				<h3 className="text-sm font-semibold text-card-foreground pointer-events-none">{t('stats.monitorTitle')}</h3>
-				<div className="flex items-center gap-1">
-					<Tooltip>
-						<TooltipTrigger asChild>
-							<Button variant="ghost" size="sm" className="h-7 w-7 p-0 min-w-0 pointer-events-auto"
-								onClick={copy} aria-label={t('sections.stats.copyLabel')}>
+		<div className="flex min-h-0 w-80 flex-col rounded-lg border bg-background py-2 text-xs shadow-lg tabular-nums cursor-grab active:cursor-grabbing">
+			{/* The scroll is an inner box with no background, square corners, and rows that skip rendering
+			    while scrolled out of view. Chromium composites an opaque scroller (on a high-density screen,
+			    any) as a second layer redrawn over the panel with every video frame, and a rounded one through
+			    an offscreen pass; Firefox renders the rows a scroller hides with every frame. The panel's
+			    padding keeps the box clear of its corners. */}
+			<div className="flex min-h-0 flex-col gap-2.5 overflow-y-auto px-3 py-1 [&>*]:[content-visibility:auto] [&>*]:[contain-intrinsic-size:auto_2.75rem]">
+				<div className="flex items-center justify-between">
+					<h3 className="text-sm font-semibold text-card-foreground pointer-events-none">{t('stats.monitorTitle')}</h3>
+					<div className="flex items-center gap-1">
+						<Tooltip>
+							<TooltipTrigger
+								render={
+									<Button
+										variant="ghost"
+										size="sm"
+										className="h-7 w-7 p-0 min-w-0 pointer-events-auto"
+										onClick={copy}
+										aria-label={t('sections.stats.copyLabel')}
+									/>
+								}
+							>
 								{copied ? <Check className="h-3 w-3 text-[var(--stat-good)]" /> : <Copy className="h-3 w-3" />}
-							</Button>
-						</TooltipTrigger>
-						<TooltipContent side="bottom">
-							<p>{t('sections.stats.copyLabel')}</p>
-						</TooltipContent>
-					</Tooltip>
-					{toggle}
-				</div>
-			</div>
-
-			<div className="flex flex-col gap-1.5 pointer-events-none">
-				{rows.map((row) => (
-					<div key={row.key} className="grid grid-cols-[14px_76px_1fr] items-start gap-1.5">
-						<StatusMark status={row.status} />
-						<span className="text-[11px] uppercase leading-4 tracking-wide text-muted-foreground">
-							{t(`sections.stats.${row.key}Label`)}
-						</span>
-						<span className="flex min-w-0 flex-col [overflow-wrap:anywhere]">
-							<span className="font-semibold">{row.value || t('sections.stats.tooltipMemoryNA')}</span>
-							{row.detail && <span className="text-muted-foreground">{row.detail}</span>}
-							{row.reason && (
-								<span className="mt-0.5 border-l-2 border-[var(--stat-warn)] pl-1.5 text-muted-foreground">{row.reason}</span>
-							)}
-						</span>
+							</TooltipTrigger>
+							<TooltipContent side="bottom">
+								<p>{t('sections.stats.copyLabel')}</p>
+							</TooltipContent>
+						</Tooltip>
+						{toggle}
 					</div>
-				))}
+				</div>
+
+				<div className="flex flex-col gap-1.5 pointer-events-none">
+					{rows.map((row) => (
+						<div key={row.key} className="grid grid-cols-[14px_76px_1fr] items-start gap-1.5">
+							<StatusMark status={row.status} />
+							<span className="text-[11px] uppercase leading-4 tracking-wide text-muted-foreground">
+								{t(`sections.stats.${row.key}Label`)}
+							</span>
+							<span className="flex min-w-0 flex-col [overflow-wrap:anywhere]">
+								<span className="font-semibold">{row.value || t('sections.stats.tooltipMemoryNA')}</span>
+								{row.detail && <span className="text-muted-foreground">{row.detail}</span>}
+								{row.reason && (
+									<span className="mt-0.5 border-l-2 border-[var(--stat-warn)] pl-1.5 text-muted-foreground">{row.reason}</span>
+								)}
+							</span>
+						</div>
+					))}
+				</div>
+
+				<Graph label={t('sections.stats.fpsLabel')} unit="fps" {...graphs.fps} />
+				<Graph label={t('sections.stats.bandwidthLabel')} unit="Mbps" {...graphs.mbps} />
+				<Graph label={t('sections.stats.latencyLabel')} unit="ms" {...graphs.rtt} />
+
+				{(
+					<div className="grid grid-cols-2 gap-1.5 pointer-events-none">
+						{tiles.map((tile) => (
+							<div key={tile.key}
+								className={`flex flex-col rounded-md border bg-muted/40 px-1.5 py-1${tile.warn ? ' border-[var(--stat-warn)]' : ''}`}
+								title={tile.warn ? t('sections.stats.overshoot') : undefined}>
+								<b className="flex items-center gap-1 text-[13px]">{tile.warn && <StatusMark status="warn" />}{tile.value}</b>
+								{tile.detail && <small className="text-[10px] tabular-nums text-muted-foreground">{tile.detail}</small>}
+								<span className="text-[10.5px] text-muted-foreground">{t(`sections.stats.tiles.${tile.key}`, tile.label)}</span>
+							</div>
+						))}
+					</div>
+				)}
+
+				{meters.length > 0 && (
+					<div className="flex flex-col gap-1">
+						{meters.map((meter) => (
+							<div key={meter.key} title={meter.detail || undefined}
+								className="grid grid-cols-[76px_1fr_2.5rem] items-center gap-2">
+								<span className="text-[11px] uppercase tracking-wide text-muted-foreground">{meterLabels[meter.key]}</span>
+								{meter.bar && (
+									<span className="h-1.5 overflow-hidden rounded-full bg-muted">
+										<span className="block h-full w-full rounded-full bg-primary transition-transform duration-500"
+											style={{ transform: `translateX(${meter.percent - 100}%)` }} />
+									</span>
+								)}
+								<span className={meter.bar ? "text-right text-muted-foreground"
+									: "col-start-2 col-end-[-1] text-muted-foreground"}>{meter.text}</span>
+							</div>
+						))}
+					</div>
+				)}
+
+				{latest && (latest.mic || latest.webcam) && (
+					<div className="flex flex-col gap-1 text-muted-foreground pointer-events-none">
+						{latest.mic && <div className="flex items-center gap-1.5"><Mic className="h-3.5 w-3.5" aria-label="mic" />{latest.mic}</div>}
+						{latest.webcam && <div className="flex items-center gap-1.5"><Video className="h-3.5 w-3.5" aria-label="webcam" />{latest.webcam}</div>}
+					</div>
+				)}
 			</div>
-
-			<Graph label={t('sections.stats.fpsLabel')} unit="fps" {...graphs.fps} />
-			<Graph label={t('sections.stats.bandwidthLabel')} unit="Mbps" {...graphs.mbps} />
-			<Graph label={t('sections.stats.latencyLabel')} unit="ms" {...graphs.rtt} />
-
-			{(
-				<div className="grid grid-cols-2 gap-1.5 pointer-events-none">
-					{tiles.map((tile) => (
-						<div key={tile.key} className="flex flex-col rounded-md border bg-muted/40 px-1.5 py-1">
-							<b className="text-[13px]">{tile.value}</b>
-							<span className="text-[10.5px] text-muted-foreground">{tile.label}</span>
-						</div>
-					))}
-				</div>
-			)}
-
-			{meters.length > 0 && (
-				<div className="flex flex-col gap-1">
-					{meters.map((meter) => (
-						<div key={meter.key} title={meter.detail || undefined}
-							className="grid grid-cols-[76px_1fr_2.5rem] items-center gap-2">
-							<span className="text-[11px] uppercase tracking-wide text-muted-foreground">{meterLabels[meter.key]}</span>
-							{meter.bar && (
-								<span className="h-1.5 overflow-hidden rounded-full bg-muted">
-									<span className="block h-full rounded-full bg-primary transition-[width] duration-500"
-										style={{ width: `${meter.percent}%` }} />
-								</span>
-							)}
-							<span className={meter.bar ? "text-right text-muted-foreground"
-								: "col-start-2 col-end-[-1] text-muted-foreground"}>{meter.text}</span>
-						</div>
-					))}
-				</div>
-			)}
-
-			{latest && (latest.mic || latest.webcam) && (
-				<div className="flex flex-col gap-1 text-muted-foreground pointer-events-none">
-					{latest.mic && <div className="flex items-center gap-1.5"><Mic className="h-3.5 w-3.5" aria-label="mic" />{latest.mic}</div>}
-					{latest.webcam && <div className="flex items-center gap-1.5"><Video className="h-3.5 w-3.5" aria-label="webcam" />{latest.webcam}</div>}
-				</div>
-			)}
 		</div>
 	);
 }

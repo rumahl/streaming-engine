@@ -58,6 +58,15 @@ export const codecOfEncoder = (encoder) => ENCODER_CODECS[encoder] || 'h264';
 export const codecCarriesFullColor = (codec) => codec === 'h264' || codec === 'h265' || codec === 'vp9';
 
 /**
+ * Whether a codec has a 10-bit profile the server's encoders emit (H.264 High 10
+ * and High 4:4:4 Predictive, H.265 Main 10 and Main 4:4:4 10, VP9 profiles 2
+ * and 3, AV1).
+ * @param {string} codec The codec name.
+ * @returns {boolean}
+ */
+export const codecCarriesTenBit = (codec) => codec === 'h264' || codec === 'h265' || codec === 'vp9' || codec === 'av1';
+
+/**
  * The NAL units of an Annex-B buffer, each without its start code.
  * @param {Uint8Array} bytes
  * @returns {Uint8Array[]}
@@ -83,18 +92,20 @@ export const annexbNals = (bytes) => {
 
 /**
  * A bit reader over an RBSP: `bytes` from `offset` with emulation prevention
- * bytes removed, `limit` bytes at most.
+ * bytes removed, `limit` bytes at most; `raw` reads them as they stand, for
+ * AV1, which has none.
  * @param {Uint8Array} bytes
  * @param {number} offset
  * @param {number} limit
+ * @param {boolean} [raw]
  * @returns {{u: (n: number) => number, skip: (n: number) => void}}
  */
-export const rbspReader = (bytes, offset, limit) => {
+export const rbspReader = (bytes, offset, limit, raw = false) => {
   const data = [];
   let zeros = 0;
   for (let i = offset; i < bytes.length && data.length < limit; i++) {
     const b = bytes[i];
-    if (zeros >= 2 && b === 3) { zeros = 0; continue; }
+    if (!raw && zeros >= 2 && b === 3) { zeros = 0; continue; }
     zeros = b === 0 ? zeros + 1 : 0;
     data.push(b);
   }
@@ -122,7 +133,7 @@ export const parseAvcCodecFromAnnexB = (bytes) => {
   const hex2 = (n) => n.toString(16).toUpperCase().padStart(2, '0');
   for (const nal of annexbNals(bytes)) {
     if ((nal[0] & 0x80) === 0 && (nal[0] & 0x1f) === 7) {
-      // profile_idc, constraint flags and level_idc are the first three RBSP
+      // profile_idc, constraint flags, and level_idc are the first three RBSP
       // bytes and, with profile_idc always >= 66, never need emulation prevention.
       if (nal.length < 4) return null;
       return `avc1.${hex2(nal[1])}${hex2(nal[2])}${hex2(nal[3])}`;
@@ -163,9 +174,10 @@ export const parseHevcCodecFromAnnexB = (bytes) => {
 };
 
 /**
- * `av01.P.LLT.08` from the sequence header of an AV1 temporal unit: the profile,
- * the first operating point's level and tier. The encoders here emit 8-bit
- * 4:2:0, which the fixed bit-depth field states.
+ * `av01.P.LLT.DD` from the sequence header of an AV1 temporal unit: the profile,
+ * the first operating point's level and tier, and the bit depth its color
+ * configuration declares. Every operating point is read past, and the header
+ * as it stands, since AV1 has no emulation prevention.
  * @param {Uint8Array} bytes
  * @returns {string|null} `null` when no sequence header is found.
  */
@@ -191,11 +203,11 @@ export const parseAv1CodecFromObus = (bytes) => {
       }
     }
     if (obuType === 1) {
-      const r = rbspReader(bytes, i, Math.min(size, 64));
+      const r = rbspReader(bytes, i, size, true);
       const profile = r.u(3);
       r.skip(1);
       const reduced = r.u(1);
-      let level = 0;
+      let level;
       let tier = 0;
       if (reduced) {
         level = r.u(5);
@@ -217,14 +229,37 @@ export const parseAv1CodecFromObus = (bytes) => {
           }
         }
         const displayDelay = r.u(1);
-        r.skip(5);
-        r.skip(12);
-        level = r.u(5);
-        tier = level > 7 ? r.u(1) : 0;
-        if (decoderModel && r.u(1)) r.skip(bufferDelayBits * 2 + 1);
-        if (displayDelay && r.u(1)) r.skip(4);
+        const points = r.u(5) + 1;
+        for (let op = 0; op < points; op++) {
+          r.skip(12);
+          const opLevel = r.u(5);
+          const opTier = opLevel > 7 ? r.u(1) : 0;
+          if (op === 0) {
+            level = opLevel;
+            tier = opTier;
+          }
+          if (decoderModel && r.u(1)) r.skip(bufferDelayBits * 2 + 1);
+          if (displayDelay && r.u(1)) r.skip(4);
+        }
       }
-      return `av01.${profile}.${String(level).padStart(2, '0')}${tier ? 'H' : 'M'}.08`;
+      const widthBits = r.u(4) + 1;
+      const heightBits = r.u(4) + 1;
+      r.skip(widthBits + heightBits);
+      let orderHint;
+      if (!reduced) {
+        if (r.u(1)) r.skip(4 + 3);
+        r.skip(3 + 4);
+        orderHint = r.u(1);
+        if (orderHint) r.skip(2);
+        const screenContent = r.u(1) ? 2 : r.u(1);
+        if (screenContent > 0 && !r.u(1)) r.skip(1);
+        if (orderHint) r.skip(3);
+      } else {
+        r.skip(3);
+      }
+      r.skip(3);
+      const depth = r.u(1) ? ((profile === 2 && r.u(1)) ? 12 : 10) : 8;
+      return `av01.${profile}.${String(level).padStart(2, '0')}${tier ? 'H' : 'M'}.${String(depth).padStart(2, '0')}`;
     }
     pos = i + size;
   }
@@ -240,6 +275,23 @@ export const parseVp9Profile = (bytes) => {
   if (!bytes || bytes.length < 1) return 0;
   const b = bytes[0];
   return ((b >> 5) & 1) | (((b >> 4) & 1) << 1);
+};
+
+/**
+ * The bit depth a VP9 key frame's uncompressed header declares: 8 for profiles 0
+ * and 1, 10 or 12 by the flag that follows the sync code for profiles 2 and 3.
+ * @param {Uint8Array} bytes
+ * @returns {number}
+ */
+export const parseVp9BitDepth = (bytes) => {
+  const profile = parseVp9Profile(bytes);
+  if (profile < 2 || !bytes || bytes.length < 5) return 8;
+  const r = rbspReader(bytes, 0, 8);
+  r.skip(profile === 3 ? 5 : 4);
+  // A shown existing frame or a predicted one carries no color configuration.
+  if (r.u(1) || r.u(1)) return 10;
+  r.skip(2 + 24);
+  return r.u(1) ? 12 : 10;
 };
 
 /**
@@ -355,7 +407,8 @@ export const codecStringFor = (codec, keyframe, width, height, fps, is444, chrom
     case 'vp8':
       return 'vp8';
     case 'vp9':
-      return `vp09.0${keyframe ? parseVp9Profile(keyframe) : 0}.${vp9Level(width, height, fps)}.08`;
+      return `vp09.0${keyframe ? parseVp9Profile(keyframe) : 0}.${vp9Level(width, height, fps)}.${
+        String(keyframe ? parseVp9BitDepth(keyframe) : 8).padStart(2, '0')}`;
     case 'av1':
       return (keyframe && parseAv1CodecFromObus(keyframe)) ||
         `av01.0.${String(av1LevelIdx(width, height, fps)).padStart(2, '0')}M.08`;
@@ -462,6 +515,23 @@ export const PROBE_CODEC_STRINGS = {
   vp8: 'vp8',
   vp9: 'vp09.00.31.08',
   av1: 'av01.0.05M.08',
+};
+
+/**
+ * One 10-bit key frame of each format, 320x240 of flat gray, for asking a
+ * decoder for a picture rather than for its word: a codec name is its 4:2:0,
+ * the name with `444` after it its 4:4:4. An engine can accept a 10-bit
+ * configuration and then fail the frame, which only decoding one shows.
+ * @type {Object<string, string>}
+ */
+export const TEN_BIT_SAMPLES = {
+  h264: 'AAAAAWduAA2mzZQUH7ARAAADAAEAAAMAPA8UKZYAAAABaOvjyyLAAAABZYiEADf//vbw/gNCUJcRzeidMx+/Fbi6NDe9zgACrU8Qb7gsE2lPYBBAAAGfEd0SuCykEBAvSus=',
+  h264444: 'AAAAAWf0AA2Q2bKCg/YCIAAAAwAgAAAHgeKFMsAAAAABaOvjxEhEAAABZYiEADf//vaH+A0Lun/9P+C6zp85f52wAAq0QAbCNhAp8AAAAwAAAwAAAwACNw==',
+  h265: 'AAAAAUABDAH//wIgAAADAJAAAAMAAAMAPJWYCQAAAAFCAQECIAAAAwCQAAADAAADADygCggPE2WVmkkyvAWgIAAAAwAgAAADA8EAAAABRAHBcrQiQAAAASgBrwhg+Snjmyr/oamsIyBbC7MwAAADAAADAAADAAADAAADAPSA',
+  h265444: 'AAAAAUABDAH//wQIAAADAJwIAAADAAA8lZgJAAAAAUIBAQQIAAADAJwIAAADAAA8kAFBAeJssrNJJleAtAQAAAMABAAAAwB4IAAAAAFEAcFyhgxCJAAAASgBrwhg+Snjmyr/oamsIyBbC7MwAAADAAADAAADAAADAAADAPSA',
+  vp9: 'kkmDQgAJ+Ad7ABwSDgxJAAAYYAAAZzaRO7i1N12+muU5wAA=',
+  vp9444: 'sSTBoQAAn4B3sAHBIODEkAABgGAAAGc2kOnpLRNlZkoaQGA=',
+  av1: 'EgAKCwAAAAQ8/7xq+cBAMhcQAJEAhBAggIAAAgF1u6aQC9g5Dyf14A==',
 };
 
 /** The 4:4:4 configurations, at the profiles the encoders emit (VP9 profile 1). */

@@ -40,8 +40,8 @@ export default ({ mode }) => {
         output: {
           manualChunks: (id) => {
             if (id.includes('node_modules')) {
-              if (id.includes('@radix-ui') || id.includes('radix-ui')) {
-                return 'radix-ui';
+              if (id.includes('@base-ui')) {
+                return 'base-ui';
               }
               if (id.includes('react') || id.includes('framer-motion') || id.includes('lucide-react')) {
                 return 'vendor';

@@ -42,13 +42,13 @@ try:
 except (ImportError, RuntimeError):
     VirtualCamera = VirtualCameraSettings = None
 
-from .settings import settings as app_settings
+from .settings import settings as app_settings, socket_dir
 
 logger = logging.getLogger("webcam")
 
 WEBCAM_SOCKET_NAME = "selkies_webcam0.sock"
 
-# Codec ids shared by the WebSocket frame header, the WebRTC codec names and
+# Codec ids shared by the WebSocket frame header, the WebRTC codec names, and
 # pixelflux's VirtualCamera.CODEC_* constants.
 CODEC_MJPEG = 0
 CODEC_H264 = 1
@@ -100,7 +100,7 @@ def webcam_uplink_allowed(is_viewer: bool, is_collaborator: bool) -> bool:
 
 def webcam_socket_path() -> str:
     """Full path of the interposer socket, inside the configured socket directory."""
-    return os.path.join(app_settings.webcam_socket_path or "/tmp", WEBCAM_SOCKET_NAME)
+    return os.path.join(socket_dir(app_settings.webcam_socket_path), WEBCAM_SOCKET_NAME)
 
 
 def device_pixel_format(setting: str, codec: Optional[int]) -> str:

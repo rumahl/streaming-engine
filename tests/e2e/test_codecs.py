@@ -2,7 +2,7 @@
 """Every video codec, decoded by each browser engine, over both transports.
 
 For each codec the server is started with ``SELKIES_ENCODER`` set to
-its encoder and the page opens in Chromium, Firefox or WebKit. Over WebSockets
+its encoder and the page opens in Chromium, Firefox, or WebKit. Over WebSockets
 the stream must come up and the painted picture decode whatever the engine can
 do: an engine whose WebCodecs decoder takes the codec keeps it (the page's
 encoder stays the requested one and the server's stream line names the codec),
@@ -16,7 +16,8 @@ a codec it takes is negotiated and streamed, one it declines is answered with
 H.264 and the display moves to ``h264enc``, logged by the server.
 
 The picture is a known color the test paints on the server, sampled from the
-decoded frame in the page, exactly as ``test_encoders.py`` does.
+decoded frame in the page, exactly as ``test_encoders.py`` does; over WebRTC
+the <video> must then keep presenting frames while the screen changes.
 
     python3 tests/e2e/test_codecs.py ws-x11|ws-wl|wr-x11 [chromium|firefox|webkit|all]
 
@@ -24,6 +25,7 @@ A selector may carry the engine as a third part (``ws-x11-firefox``); without
 one every engine runs.
 """
 import os
+import re
 import sys
 import time
 from typing import Any, Optional
@@ -40,7 +42,7 @@ CODECS = [("h264enc", "H264", "avc1.64001F", "video/H264"),
           ("vp8enc", "VP8", "vp8", "video/VP8"),
           ("vp9enc", "VP9", "vp09.00.31.08", "video/VP9"),
           ("av1enc", "AV1", "av01.0.05M.08", "video/AV1")]
-ENGINES = ("chromium", "firefox", "webkit")
+ENGINES = TENC.ENGINES
 
 PROBE_JS = """async (codec) => {
   if (typeof VideoDecoder === 'undefined') return false;
@@ -74,24 +76,6 @@ def wait_stream_mode(mode_name: str, timeout: float = 15) -> str:
         time.sleep(0.5)
 
 
-def open_engine_page(p: Any, engine: str, mode: str) -> tuple:
-    """A page of `engine` on the core client in `mode`, with its browser or context to close."""
-    if engine == "firefox":
-        ctx = C.firefox_persistent_context(p, viewport={"width": 1280, "height": 720})
-        owner = ctx
-    else:
-        browser = C.launch_browser(p, engine)
-        ctx = browser.new_context(viewport={"width": 1280, "height": 720}, device_scale_factor=1)
-        owner = browser
-    ctx.add_init_script(f"window.__SELKIES_STREAMING_MODE__ = '{mode}';")
-    # Firefox runs on one persistent profile: the encoder a previous block's
-    # ladder stored must not become this block's pick.
-    ctx.add_init_script("try { localStorage.clear(); } catch (e) {}")
-    page = ctx.new_page()
-    page.goto(H.BASE_URL + "/", wait_until="load")
-    return owner, page
-
-
 def wait_settled_encoder(page: Any, timeout: float = 20) -> Optional[str]:
     """The page's encoder once it has stopped moving for a few seconds: the
     ladder answers a refusal within a second of the first frame."""
@@ -112,18 +96,27 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
     tag = f"{engine} {encoder}"
     # Every stream declares the matrix it converts with -- BT.709, or BT.601 for
     # VP8, whose keyframe header carries a single bit that can name no other.
-    # WebKit's GStreamer ports ignore that for VP8 and paint BT.709 above 576
-    # lines whatever the client is told, which shifts the saturated block by
-    # twenty levels through no fault of the stream.
-    matrix = not (engine == "webkit" and encoder == "vp8enc")
+    # Two engines paint some streams with a matrix of their own, twenty levels
+    # off on the saturated block through no fault of the stream: WebKit's
+    # GStreamer ports take a WebCodecs VP8 stream as BT.709 above 576 lines
+    # (over WebRTC the color-space header extension reaches them), and Firefox
+    # before 157 decodes WebRTC AV1 through libwebrtc's dav1d, whose frames it
+    # paints as BT.601 whatever they declare.
+    matrix = not (engine == "webkit" and encoder == "vp8enc" and mode == "websockets")
+    # WebKit's GStreamer ports hand WebRTC VP8 to libwebrtc's decoder where
+    # GStreamer's best is vp8dec and stamp its frames with their render time,
+    # zero under the stream's zero playout delay: the player presents the first
+    # few and drops the rest as late. Safari stamps them with the capture time.
+    held = ("WebKit's GStreamer player drops the VP8 frames libwebrtc decodes as late"
+            if engine == "webkit" and encoder == "vp8enc" else "")
     # The codec under test is the default; the ladder's rungs stay allowed.
     H.server_start(mode=mode, wayland=wayland,
                    extra_env={"SELKIES_ENCODER": f"{encoder},h264enc,jpeg"})
-    picture = TENC.Picture(wayland)
+    picture = TENC.Picture(wayland, live=mode == "webrtc")
     try:
         picture.paint()
         with sync_playwright() as p:
-            owner, page = open_engine_page(p, engine, mode)
+            owner, page = TENC.open_page(p, mode, engine)
             said: list = []
             page.on("console", lambda m: said.append(m.text))
             try:
@@ -131,6 +124,9 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
                     taken = page.evaluate(RTP_PROBE_JS, rtp_mime)
                     video = C.wait_wr_video(page)
                     res.check(f"{tag}: stream up", bool(video), video)
+                    if taken and engine == "firefox" and encoder == "av1enc":
+                        version = re.search(r"Firefox/(\d+)", page.evaluate("navigator.userAgent"))
+                        matrix = bool(version) and int(version.group(1)) >= 157
                     if taken:
                         res.check(f"{tag}: the browser took {mode_name} over RTP",
                                   C.wait_log(f"negotiated {rtp_mime}", timeout=10), "")
@@ -146,6 +142,7 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
                                   "Mode: H264" in line, TENC.encoder_field(line))
                     sample = picture.wait(page, matrix=matrix)
                     res.check(f"{tag}: the painted picture decodes", picture.matches(sample, matrix), sample)
+                    picture.keeps_presenting(res, tag, page, waived=held if taken else "")
                     print(f"      {tag}: rtp={'yes' if taken else 'no'} {TENC.encoder_field(line)}")
                     return
                 supported = page.evaluate(PROBE_JS, probe)
@@ -171,6 +168,11 @@ def block_codec(mode: str, wayland: bool, engine: str, encoder: str, mode_name: 
                               "Mode: H264" in line or "Mode: JPEG" in line, TENC.encoder_field(line))
                 fps = 0
                 for _ in range(20):
+                    if "Mode: JPEG" in line:
+                        # JPEG sends only what damage covers, so a still picture presents
+                        # no frames: repaint it so the rate measures the stream.
+                        picture.clear()
+                        picture.paint()
                     fps = page.evaluate("window.fps || 0")
                     if fps > 0:
                         break
@@ -195,8 +197,6 @@ def main() -> bool:
     mode = "websockets" if transport == "ws" else "webrtc"
     wayland = backend == "wl"
     engines = ENGINES if which == "all" else (which,)
-    if mode == "webrtc":
-        engines = tuple(e for e in engines if e == "chromium")
     res = H.Results(f"codecs {cell}")
     for engine in engines:
         for encoder, mode_name, probe, rtp_mime in CODECS:

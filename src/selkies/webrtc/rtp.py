@@ -66,6 +66,7 @@ RTCP_SDES = 202
 RTCP_BYE = 203
 RTCP_RTPFB = 205
 RTCP_PSFB = 206
+RTCP_XR = 207
 
 RTCP_RTPFB_NACK = 1
 RTCP_RTPFB_TWCC = 15
@@ -76,12 +77,19 @@ RTCP_PSFB_RPSI = 3
 RTCP_PSFB_FIR = 4
 RTCP_PSFB_APP = 15
 
+RTCP_XR_RRTR = 4
+RTCP_XR_DLRR = 5
+
 # The RTP Dependency Descriptor of the AV1 RTP specification, written on every packet of a
 # video stream whose encoder tracks its references: the frame the packet belongs to, its
 # edges, and the frame that one predicts from. A receiver reads a frame's dependency from it
 # instead of chaining every frame to its predecessor, so a frame predicting past a lost one
 # decodes as soon as it arrives.
 DEPENDENCY_DESCRIPTOR_URI = "https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension"
+
+# When a frame was captured, in the NTP clock the sender reports: 64-bit UQ32.32, the
+# estimated capture clock offset left out, as the sender is the capture system.
+ABS_CAPTURE_TIME_URI = "http://www.webrtc.org/experiments/rtp-hdrext/abs-capture-time"
 
 
 @dataclass
@@ -102,11 +110,14 @@ class HeaderExtensions:
     color_space: Any = None
     # The packet's dependency descriptor, packed as `dependency_descriptor` builds it.
     dependency_descriptor: Any = None
+    # The capture instant of the packet's frame as a 64-bit NTP timestamp.
+    abs_capture_time: Optional[int] = None
 
 
 class HeaderExtensionsMap:
     def __init__(self) -> None:
         self.__ids = HeaderExtensions()
+        self.__mutable: dict[int, int] = {}
 
     def configure(self, parameters: RTCRtpParameters) -> None:
         for ext in parameters.headerExtensions:
@@ -137,6 +148,19 @@ class HeaderExtensionsMap:
                 self.__ids.color_space = ext.id
             elif ext.uri == DEPENDENCY_DESCRIPTOR_URI:
                 self.__ids.dependency_descriptor = ext.id
+            elif ext.uri == ABS_CAPTURE_TIME_URI:
+                self.__ids.abs_capture_time = ext.id
+        # What `for_fec` zeroes: each mutable extension's ID and the byte its mutable part starts at.
+        self.__mutable = {
+            ext_id: first
+            for ext_id, first in (
+                (self.__ids.abs_send_time, 0),
+                (self.__ids.transmission_offset, 0),
+                (self.__ids.transport_sequence_number, 0),
+                (self.__ids.video_timing, 7),
+            )
+            if ext_id
+        }
 
     def has_dependency_descriptor(self) -> bool:
         """Whether the peer negotiated the dependency descriptor."""
@@ -192,7 +216,63 @@ class HeaderExtensionsMap:
                 values.color_space = (primaries, transfer, matrix, (siting >> 4) & 0x03)
             elif x_id == self.__ids.dependency_descriptor:
                 values.dependency_descriptor = bytes(x_value)
+            elif x_id == self.__ids.abs_capture_time:
+                if len(x_value) < 8:
+                    # Malformed length: skip rather than raise struct.error.
+                    continue
+                values.abs_capture_time = unpack("!Q", x_value[:8])[0]
         return values
+
+    def for_fec(self, packet: bytes) -> bytes:
+        """Copy an RTP packet for FlexFEC with mutable extension values zeroed.
+
+        libwebrtc zeroes these values on received media before XOR recovery
+        (`RtpPacket::ZeroMutableExtensions`). With unequal header lengths, as
+        video timing on a frame's last packet makes them, an unnormalized value
+        XORs into another packet's payload. Transport-wide sequence, absolute
+        send time, and transmission offset are zeroed whole, and video timing
+        from its pacer-exit leg (byte 7) on; the packet sent and kept for
+        retransmission is left as it is. Both RFC 8285 forms are walked as
+        libwebrtc parses them, and the walk ends where its parser does: at a
+        one-byte ID of 15, or of 0 with a length, and at an element running
+        past the block. A packet whose header does not parse comes back as it
+        is, as the receiver drops it, so nothing raises into the RTP task.
+        """
+        if len(packet) < 12 or not packet[0] & 0x10:
+            return packet
+        start = 12 + 4 * (packet[0] & 15)
+        if start + 4 > len(packet):
+            return packet
+        profile, words = unpack_from("!HH", packet, start)
+        pos, end = start + 4, start + 4 + 4 * words
+        if end > len(packet):
+            return packet
+        if profile != 0xBEDE and profile & 0xFFF0 != 0x1000:
+            return packet
+        mutable = self.__mutable
+        result = bytearray(packet)
+        while pos < end:
+            head = packet[pos]
+            pos += 1
+            if head == 0:
+                continue
+            if profile == 0xBEDE:
+                ext_id, length = head >> 4, (head & 15) + 1
+                if ext_id in (0, 15):
+                    break
+            else:
+                ext_id = head
+                if pos >= end:
+                    break
+                length = packet[pos]
+                pos += 1
+            if pos + length > end:
+                break
+            skip = mutable.get(ext_id, length)
+            if skip < length:
+                result[pos + skip:pos + length] = bytes(length - skip)
+            pos += length
+        return bytes(result)
 
     def set(self, values: HeaderExtensions) -> tuple[int, bytes]:
         extensions = []
@@ -270,6 +350,8 @@ class HeaderExtensionsMap:
             )
         if values.dependency_descriptor is not None and self.__ids.dependency_descriptor:
             extensions.append((self.__ids.dependency_descriptor, values.dependency_descriptor))
+        if values.abs_capture_time is not None and self.__ids.abs_capture_time:
+            extensions.append((self.__ids.abs_capture_time, pack("!Q", values.abs_capture_time)))
         return pack_header_extensions(extensions)
 
 
@@ -278,14 +360,14 @@ class HeaderExtensionsMap:
 # predicts from nothing and a frame predicting from the one before it, both switch points.
 # 28 bits: structure id 0, one decode target, the second template on the same layer and no
 # more templates, both templates' indications, the templates' frame diffs (none, then one),
-# no chains and no resolutions.
+# no chains, and no resolutions.
 DEPENDENCY_STRUCTURE = int("000000" "00000" "00" "11" "10" "10" "0" "1" "0000" "0" "0" "0", 2)
 
 
 def dependency_descriptor(first: bool, last: bool, frame_number: int,
                           fdiff: Optional[int], keyframe: bool) -> bytes:
     """The dependency descriptor of one packet: whether it opens and closes its frame, the
-    frame's number and how many frames back the frame predicts from -- None for a frame that
+    frame's number, and how many frames back the frame predicts from -- None for a frame that
     predicts from nothing. A frame one back rides the predicted-frame template alone and a
     key frame the other, so most packets carry the three mandatory bytes; a frame further
     back writes its own diff, and a key frame's first packet the structure the receiver
@@ -719,7 +801,10 @@ class RtcpRtpfbPacket:
 
     @classmethod
     def parse(cls, data: bytes, fmt: int) -> "RtcpRtpfbPacket":
-        if len(data) < 8 or len(data) % 4:
+        # Only a NACK's FCI comes in whole words: a transport-cc feedback runs
+        # to any length and libwebrtc pads it with the RTCP padding bit, which
+        # the caller has already stripped.
+        if len(data) < 8 or (fmt == RTCP_RTPFB_NACK and len(data) % 4):
             raise ValueError("RTCP RTP feedback length is invalid")
 
         ssrc, media_ssrc = unpack("!LL", data[0:8])
@@ -804,6 +889,51 @@ class RtcpSrPacket:
         return RtcpSrPacket(ssrc=ssrc, sender_info=sender_info, reports=reports)
 
 
+@dataclass
+class RtcpXrPacket:
+    """
+    Extended Report (RFC 3611) carrying the round-trip blocks: a receive-only peer sends
+    a Receiver Reference Time Report (`rrtr`, its NTP time), and the sender answers with
+    DLRR sub-blocks (`dlrr`: the reporter's SSRC, the middle 32 bits of that NTP time,
+    and the delay since, in 1/65536 s), from which the receiver computes the round trip
+    as a sender does from a receiver report. Other block types are skipped.
+    """
+
+    ssrc: int
+    rrtr: Optional[int] = None
+    dlrr: list[tuple[int, int, int]] = field(default_factory=list)
+
+    def __bytes__(self) -> bytes:
+        payload = pack("!L", self.ssrc)
+        if self.rrtr is not None:
+            payload += pack("!BBHQ", RTCP_XR_RRTR, 0, 2, self.rrtr)
+        if self.dlrr:
+            payload += pack("!BBH", RTCP_XR_DLRR, 0, 3 * len(self.dlrr))
+            for item in self.dlrr:
+                payload += pack("!LLL", *item)
+        return pack_rtcp_packet(RTCP_XR, 0, payload)
+
+    @classmethod
+    def parse(cls, data: bytes) -> "RtcpXrPacket":
+        if len(data) < 4:
+            raise ValueError("RTCP extended report length is invalid")
+
+        packet = cls(ssrc=unpack_from("!L", data)[0])
+        pos = 4
+        while pos + 4 <= len(data):
+            block_type, _, length = unpack_from("!BBH", data, pos)
+            pos += 4
+            end = pos + 4 * length
+            if len(data) < end:
+                raise ValueError("RTCP extended report block is truncated")
+            if block_type == RTCP_XR_RRTR and length == 2:
+                packet.rrtr = unpack_from("!Q", data, pos)[0]
+            elif block_type == RTCP_XR_DLRR and length % 3 == 0:
+                packet.dlrr += [unpack_from("!LLL", data, sub) for sub in range(pos, end, 12)]
+            pos = end
+        return packet
+
+
 AnyRtcpPacket = Union[
     RtcpByePacket,
     RtcpPsfbPacket,
@@ -811,6 +941,7 @@ AnyRtcpPacket = Union[
     RtcpRtpfbPacket,
     RtcpSdesPacket,
     RtcpSrPacket,
+    RtcpXrPacket,
 ]
 
 
@@ -857,6 +988,8 @@ class RtcpPacket:
                 packets.append(RtcpRtpfbPacket.parse(payload, count))
             elif packet_type == RTCP_PSFB:
                 packets.append(RtcpPsfbPacket.parse(payload, count))
+            elif packet_type == RTCP_XR:
+                packets.append(RtcpXrPacket.parse(payload))
 
         return packets
 
@@ -977,13 +1110,15 @@ class RtpPacket:
 
 class RtpHistory:
     """Packets sent on one stream, by sequence number, for retransmission, each with the
-    frame it carried and how many NACKs have named it.
+    frame it carried, how many NACKs have named it, when the last packet able to
+    restore it went out, and whether its GOP was abandoned; and the frames the peer was
+    reported to have lost.
 
     Bounded by RTP_HISTORY_S of sending and RTP_HISTORY_MAX_PACKETS; within
     those a sequence number cannot repeat, so a lookup is exact.
     """
 
-    __slots__ = ("_packets", "_order", "_horizon", "_capacity")
+    __slots__ = ("_packets", "_order", "_horizon", "_capacity", "_lost")
 
     def __init__(self, horizon: float = RTP_HISTORY_S,
                  capacity: int = RTP_HISTORY_MAX_PACKETS) -> None:
@@ -991,27 +1126,71 @@ class RtpHistory:
         self._order: deque = deque()
         self._horizon = horizon
         self._capacity = capacity
+        self._lost: dict[int, float] = {}
 
     def add(self, packet: RtpPacket, now: float, frame: Optional[int] = None) -> None:
         """Record a sent packet and let go of those past the horizon."""
-        self._packets[packet.sequence_number] = [packet, frame, 0]
+        self._packets[packet.sequence_number] = [packet, frame, 0, now, False]
         order = self._order
         order.append((now, packet.sequence_number))
         while order and (now - order[0][0] > self._horizon or len(order) > self._capacity):
             self._packets.pop(order.popleft()[1], None)
+
+    def abandon(self) -> None:
+        """Abandon every packet held, with the GOP the pacer dropped: its key frame is their
+        repair. Each packet carries the mark, so none sent later is taken for one, however
+        far the numbering has run since."""
+        for entry in self._packets.values():
+            entry[4] = True
+
+    def abandoned(self, sequence_number: int) -> bool:
+        """Whether the packet was held when its GOP was abandoned."""
+        entry = self._packets.get(sequence_number)
+        return entry is not None and entry[4]
 
     def get(self, sequence_number: int) -> Optional[RtpPacket]:
         entry = self._packets.get(sequence_number)
         return entry[0] if entry else None
 
     def nacked(self, sequence_number: int) -> tuple:
-        """The packet a NACK names, the frame it carried and how many NACKs have named it,
+        """The packet a NACK names, the frame it carried, and how many NACKs have named it,
         this one counted; a packet let go reads as (None, None, 0)."""
         entry = self._packets.get(sequence_number)
         if entry is None:
             return None, None, 0
         entry[2] += 1
         return entry[0], entry[1], entry[2]
+
+    def repaired(self, sequence_number: int, now: float) -> None:
+        """Note that a packet able to restore this one (its retransmission, a FlexFEC
+        repair covering it) reaches the wire at `now`, which counts what the pacer
+        holds ahead of it: the peer measures the round trip over RTCP, which skips
+        that queue, so it NACKs again before a repair waiting there can land."""
+        entry = self._packets.get(sequence_number)
+        if entry is not None:
+            entry[3] = now
+
+    def unrepaired(self, sequence_number: int, now: float, rtt: float) -> bool:
+        """Whether a NACK arriving at `now` left the peer after every packet able to
+        restore this one could have reached it, a round trip after the last went out.
+        A peer that knows the round trip NACKs again within a few milliseconds, before
+        a FlexFEC repair sent at the end of the packet's paced group can have landed."""
+        entry = self._packets.get(sequence_number)
+        return entry is not None and now - entry[3] >= rtt
+
+    def newly_lost(self, frame: int, now: float) -> bool:
+        """Whether `frame` is reported lost for the first time within the horizon. A peer
+        that knows the round trip re-NACKs a packet it still misses every round trip
+        until a later frame decodes, and another of the frame's packets can be NACKed
+        twice too; neither is news, and a report reaching the encoder after the frame
+        left its references is answered with a key frame."""
+        lost = self._lost
+        while lost and now - next(iter(lost.values())) > self._horizon:
+            del lost[next(iter(lost))]
+        if frame in lost:
+            return False
+        lost[frame] = now
+        return True
 
     def __len__(self) -> int:
         return len(self._order)
@@ -1089,7 +1268,7 @@ def build_flexfec_03(
     payload_xor = 0
     mask = 0
     for offset, media in covered:
-        # Byte 0 folds in P, X and CC (the version bits stay out); byte 1,
+        # Byte 0 folds in P, X, and CC (the version bits stay out); byte 1,
         # M and PT.
         recovery[0] ^= media[0] & 0x3F
         recovery[1] ^= media[1]

@@ -6,11 +6,17 @@ Setup:
   tcp2unix TCP:$E2E_PORT -> unix socket              (reverse-proxy shim, HTTP only)
   Chrome connects to that port, does WebRTC (signaling via the shim,
   media over the server's own UDP ICE sockets).
+
+The server's own --port is one nothing listens on, as under jupyter-server-proxy,
+so its signaling peer has to reach the endpoint through the socket as well.
 """
 import os
+import socket
 import subprocess
 import sys
 import time
+
+import psutil
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import helpers as H
@@ -21,7 +27,6 @@ SOCK = os.path.join(H.WORKDIR, "selkies-webrtc.sock")
 PORT = H.PORT
 
 H.server_stop()
-subprocess.run(["pkill", "-f", "tcp2unix.py"], capture_output=True)
 time.sleep(1.0)
 os.path.exists(SOCK) and os.unlink(SOCK)
 
@@ -30,9 +35,12 @@ env = {"PATH": os.environ.get("PATH", ""),
        "XDG_RUNTIME_DIR": H.RUNTIME_DIR,
        "SELKIES_MODE": "webrtc", "SELKIES_ENABLE_BASIC_AUTH": "false",
        "SELKIES_WEB_ROOT": H.CORE_DIST,
-       "SELKIES_TURN_REST_URI": ""}
+       "SELKIES_TURN_REST_URI": "", **H.inherited_env()}
+with socket.socket() as probe:
+    probe.bind(("127.0.0.1", 0))
+    UNUSED_PORT = probe.getsockname()[1]
 server = H.spawn(
-    [H.PYTHON, "-m", "selkies", "--port", str(PORT), "--unix-socket", SOCK],
+    [H.PYTHON, "-m", "selkies", "--port", str(UNUSED_PORT), "--unix-socket", SOCK],
     env=env, cwd=H.WORKDIR,
     stdout=open(os.path.join(H.WORKDIR, "selkies-webrtc.log"), "w"),
     stderr=subprocess.STDOUT, start_new_session=True)
@@ -41,12 +49,16 @@ proxy = H.spawn([H.PYTHON, os.path.join(H.TOOLS, "tcp2unix.py"),
                 env=dict(os.environ), cwd=H.WORKDIR,
                 stdout=open(os.path.join(H.WORKDIR, "proxy.log"), "w"),
                 stderr=subprocess.STDOUT, start_new_session=True)
-time.sleep(9)
+for _ in range(600):
+    if os.path.exists(SOCK):
+        break
+    time.sleep(0.1)
 
 res = H.Results("webrtc-unix")
 try:
-    listeners = [l for l in subprocess.run(["ss", "-tlnp"], capture_output=True, text=True).stdout.splitlines()
-                 if f":{PORT}" in l and "selkies" in l]
+    owner = psutil.Process(server.pid)
+    sockets = (owner.net_connections if hasattr(owner, "net_connections") else owner.connections)(kind="tcp")
+    listeners = [c.laddr for c in sockets if c.status == psutil.CONN_LISTEN]
     res.check("server owns no TCP listener", not listeners, listeners[:1])
     res.check("unix socket bound", os.path.exists(SOCK), SOCK)
 

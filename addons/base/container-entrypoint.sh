@@ -4,7 +4,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # PID-agnostic container init for the Selkies desktop container. It prepares the
-# runtime environment (joystick, webcam and fake-udev LD_PRELOAD, device nodes,
+# runtime environment (joystick, webcam, and fake-udev LD_PRELOAD, device nodes,
 # TURN defaults), derives the service set from the environment toggles, and then
 # hands service supervision to s6 (`s6-svscan /etc/service`): one `s6-supervise`
 # per service directory, restarts crashed services, and is controlled with
@@ -53,6 +53,12 @@ if [ -n "${PASSWD-}" ]; then
   echo "$(id -nu):${PASSWD}" | chpasswd 2>/dev/null ||
     echo "$(id -nu):${PASSWD}" | sudo-root chpasswd 2>/dev/null ||
     echo "selkies: cannot change the password of $(id -nu)" >&2
+fi
+# The login selkies resolves from these variables, in settings.py's order, is one
+# anybody knows while it is still the PASSWD this image publishes.
+if { [ -z "$(setting_value "${SELKIES_ENABLE_BASIC_AUTH-}")" ] || is_true "${SELKIES_ENABLE_BASIC_AUTH-}"; } &&
+  [ "${SELKIES_BASIC_AUTH_PASSWORD-${PASSWORD-${PASSWD-}}}" = "mypasswd" ]; then
+  echo "selkies: the login password is the placeholder this image publishes; set PASSWD or SELKIES_BASIC_AUTH_PASSWORD before anyone else can reach this container" >&2
 fi
 
 # A desktop menu watches the directories it read at startup, and cannot watch one
@@ -188,7 +194,7 @@ unset dri3_server gl_path
 # session still gets it through Zink or the X server's own render node
 # (services/xvfb/run); with no GPU at all both backends render in software and
 # switching would trade a capability for nothing. Settled before anything
-# derived from the backend: the display, the session type and the toolkit
+# derived from the backend: the display, the session type, and the toolkit
 # defaults all follow it. SELKIES_WAYLAND_X11_FALLBACK=false keeps Wayland and
 # composites in software, which shares no dmabuf, so a GL client aimed at the
 # Vulkan driver would produce buffers it cannot accept — the Zink override and
@@ -207,9 +213,10 @@ fi
 # With no DRM render node, the NVIDIA EGL/GBM vendor library the container
 # runtime injects segfaults inside Xwayland's EGL init, and glamor would have
 # nothing to accelerate anyway. wlroots honors WLR_XWAYLAND, so XWayland is
-# started through a wrapper pinning EGL to Mesa and shared-memory buffers.
+# started through a wrapper pinning EGL to Mesa and shared-memory buffers, and
+# loading no EGL external platform for a driver libEGL that comes before glvnd's.
 if [ "${SELKIES_WAYLAND}" = "true" ] && ! ls /dev/dri/renderD* > /dev/null 2>&1; then
-  printf '#!/bin/sh\nexport __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json\nexec /usr/bin/Xwayland -shm "$@"\n' > /tmp/selkies-xwayland
+  printf '#!/bin/sh\nexport __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json\nexport __EGL_EXTERNAL_PLATFORM_CONFIG_FILENAMES=\nexec /usr/bin/Xwayland -shm "$@"\n' > /tmp/selkies-xwayland
   chmod 755 /tmp/selkies-xwayland
   export WLR_XWAYLAND="/tmp/selkies-xwayland"
 fi

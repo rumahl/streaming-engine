@@ -1,7 +1,7 @@
 name: Release
 
 # Maintainer-triggered release: builds the wheel ONCE at the release version,
-# then builds multi-arch images, native packages and AppImages around it, and
+# then builds multi-arch images, native packages, and AppImages around it, and
 # assembles a DRAFT GitHub release with every build artifact attached. The
 # draft is finalized and published manually.
 #
@@ -24,7 +24,7 @@ name: Release
 # re-release of one it holds fails there and changes the GitHub release alone.
 #
 # The pinned pixelflux and pcmflux come from the release each project cut for
-# that version: the smoke test, the images, the packages and the AppImages all
+# that version: the smoke test, the images, the packages, and the AppImages all
 # install the wheels those projects published. `capture_stack: pypi` is the
 # explicit choice to resolve them from PyPI instead, for a release made after
 # the two were published there; nothing takes that road on its own.
@@ -188,7 +188,7 @@ jobs:
       contents: write
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: "*"
           path: release-artifacts/
@@ -204,9 +204,10 @@ jobs:
           # stay on the pixelflux and pcmflux releases this run took them from
           find release-artifacts -type f \( -name 'pixelflux-*.whl' -o -name 'pcmflux-*.whl' \) -delete
           # Artifacts of the run rather than of the release: the build record
-          # docker/build-push-action uploads per image, and the conda package
-          # the AppImage is assembled from
-          find release-artifacts -type f \( -name '*.dockerbuild' -o -name '*.conda' \) -delete
+          # docker/build-push-action uploads per image, the record of what each
+          # image was built from, and the conda package the AppImage is
+          # assembled from
+          find release-artifacts -type f \( -name '*.dockerbuild' -o -name 'selkies-*-images-*.txt' -o -name '*.conda' \) -delete
           find release-artifacts -type f -exec mv {} release/ \;
           ls -la release/
       # The run's latest and PyPI decisions ride ahead of the generated notes

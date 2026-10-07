@@ -5,7 +5,7 @@
 # Build selkies-<ver>-1-<arch>.pkg.tar.zst (run inside an Arch container)
 set -eux
 
-# Package managers with no retry option of their own -- apk, dnf, pacman and
+# Package managers with no retry option of their own -- apk, dnf, pacman, and
 # RubyGems all lack one -- are bounded-retried here. This composes with whatever
 # internal retrying the tool already does rather than replacing it, so it cannot
 # lower a default the way an explicit --setopt could.
@@ -25,6 +25,9 @@ retry pacman -Syu --noconfirm --needed python python-pip base-devel libxkbcommon
 /repo/infra/packaging/mkvenv.sh
 /repo/infra/packaging/interposer.sh /pkg-root
 /repo/infra/packaging/v4l2-interposer.sh /pkg-root
+# The print queue runs a copy of cupsd as the session user, which Arch's cups
+# package installs readable by root alone; the hook opens it on either install.
+install -Dm644 /repo/infra/packaging/arch/selkies-cupsd.hook /pkg-root/usr/share/libalpm/hooks/selkies-cupsd.hook
 # makepkg writes src/ and pkg/ next to the PKGBUILD, and /repo is read-only
 rm -rf /build
 mkdir -p /build /out

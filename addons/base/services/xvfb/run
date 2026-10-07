@@ -30,15 +30,20 @@ unset GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE LIBGL_KOPPER_DRI2
 # so the X11 backend and the Wayland compositor answer to the same selection.
 # A node whose renderer did not come up for the entrypoint's probe (a driver
 # whose GBM allocates nothing, say) draws nothing here either: glamor on it
-# reports success and leaves the screen black. Without a usable node the
-# server is the software framebuffer, whose GLX probing is kept on Mesa's EGL:
-# a vendor library's GBM has nothing to offer it and has crashed it before. The
-# session's own EGL selection is untouched either way.
+# reports success and leaves the screen black. A node named but absent is no
+# node at all, which a runtime that passes in the driver's libraries and no DRM
+# device leaves behind. Without a usable node the server is the software
+# framebuffer, whose GLX probing is kept on Mesa's EGL: a vendor library's GBM
+# has nothing to offer it, and NVIDIA's takes the server down where the
+# container has no /dev/dri at all. A runtime can also put the driver's own
+# libEGL ahead of glvnd's, where no vendor selection reaches, so the server
+# loads no EGL external platform either: NVIDIA's EGL then has no GBM platform
+# to be asked for. The session's own EGL selection is untouched either way.
 VFB_DEVICE=""
 RENDER_DRI="${SELKIES_RENDER_DRI:-${DRINODE:-}}"
 if [ "${SELKIES_GPU_ACCELERATED:-}" != "false" ] && /usr/bin/Xvfb -help 2>&1 | grep -q -- '-glamor'; then
   if [ -n "${RENDER_DRI}" ]; then
-    VFB_DEVICE="-glamor -dri ${RENDER_DRI}"
+    [ -e "${RENDER_DRI}" ] && VFB_DEVICE="-glamor -dri ${RENDER_DRI}"
   else
     # shellcheck disable=SC2086  # the resolved node, else every node here
     for node in ${SELKIES_GPU_RENDER_NODE:-/dev/dri/renderD*}; do
@@ -48,8 +53,9 @@ if [ "${SELKIES_GPU_ACCELERATED:-}" != "false" ] && /usr/bin/Xvfb -help 2>&1 | g
   fi
 fi
 MESA_EGL_VENDOR="/usr/share/glvnd/egl_vendor.d/50_mesa.json"
-if [ -z "${VFB_DEVICE}" ] && [ -f "${MESA_EGL_VENDOR}" ]; then
-  export __EGL_VENDOR_LIBRARY_FILENAMES="${MESA_EGL_VENDOR}"
+if [ -z "${VFB_DEVICE}" ]; then
+  [ -f "${MESA_EGL_VENDOR}" ] && export __EGL_VENDOR_LIBRARY_FILENAMES="${MESA_EGL_VENDOR}"
+  export __EGL_EXTERNAL_PLATFORM_CONFIG_FILENAMES=""
 fi
 
 # A server that died leaves its lock and socket behind, and the replacement then
@@ -72,7 +78,7 @@ fi
 # screen pixmap is on the GPU; both are startup lines, and both are the first
 # thing to look at when a session renders in software.
 # shellcheck disable=SC2086  # VFB_DEVICE is an option pair or empty
-/usr/bin/Xvfb "${DISPLAY}" -verbose 1 +extension "COMPOSITE" +extension "DAMAGE" +extension "GLX" +extension "RANDR" +extension "RENDER" +extension "MIT-SHM" +extension "XFIXES" +extension "XTEST" +iglx +render -nolisten "tcp" -ac -noreset -shmem -s 0 -dpms ${VFB_DEVICE} &
+/usr/bin/Xvfb "${DISPLAY}" -verbose 1 +extension "COMPOSITE" +extension "DAMAGE" +extension "GLX" +extension "RANDR" +extension "RENDER" +extension "MIT-SHM" +extension "XFIXES" +extension "XTEST" +iglx +render -nolisten "tcp" -noreset -shmem -s 0 -dpms ${VFB_DEVICE} &
 XVFB_PID=$!
 trap 'kill "${XVFB_PID}" 2>/dev/null' TERM INT
 
@@ -97,6 +103,13 @@ if [ "${READY}" != "true" ]; then
     kill -9 "${XVFB_PID}" 2>/dev/null
     wait "${XVFB_PID}" 2>/dev/null
     exit 1
+fi
+# The display admits the session's user and root by the uid the kernel reports for
+# each connection, and no other local process: one that changed to another uid in
+# the container would otherwise read every keystroke. There is no cookie file for
+# a client to be told of.
+if ! xhost "+SI:localuser:$(id -un)" +SI:localuser:root -local: > /dev/null 2>&1; then
+    echo "[xvfb] could not limit ${DISPLAY} to $(id -un) and root; it admits every local process" >&2
 fi
 echo "[xvfb] ${DISPLAY} is serving clients"
 wait "${XVFB_PID}"

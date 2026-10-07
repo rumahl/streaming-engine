@@ -15,9 +15,21 @@
  * choice and never for a server with no GPU, which is an ordinary deployment:
  * software encoding somebody selected, or on a host exposed no GPU, is neutral,
  * and software encoding on a session that asked for hardware where there is a
- * GPU is a warning and carries pixelflux's reason.
- * Technical values (`NVENC`, `zero-copy`, `renderD128`) are not translated; the
- * words a dashboard does translate arrive in `words`.
+ * GPU is a warning and carries pixelflux's reason. A readback in front of a
+ * hardware encoder is read the same way: it warns where the display server
+ * offered the encoder a zero-copy path (`zero_copy_available`) and the capture
+ * took a copy anyway, and is neutral on a server that offers none, such as an
+ * Xvfb with neither DRI3 nor NvFBC. The client's side reads the
+ * same way: software decoding warns only where a hardware decoder was there to
+ * take the stream, since a client without one is as ordinary as a server
+ * without a GPU, and a path through a relay or over TCP is how the network
+ * connects this client, which marks nothing either way, while a direct UDP
+ * path is good.
+ * Every value opens with a capital, and names the system reports (`nvidia`,
+ * `renderD128`, a decoder's own) are kept as reported. Technical values (`NVENC`,
+ * `Zero-copy`, `renderD128`) are not translated; the words a dashboard does
+ * translate arrive in `words`, and a figure's label is the dashboard's to word
+ * by the figure's key, the English here being the report's and the fallback.
  *
  * @module
  */
@@ -43,6 +55,10 @@
  * @property {string} software
  * @property {string} unknown
  * @property {string} throttled Said when the server holds frames back.
+ * @property {string} hardware_available Why a software decode fell short
+ *     where the engine has an efficient decoder for the stream.
+ * @property {string} software_preferred Why it fell short where this client
+ *     left a hardware decoder after it failed.
  */
 
 const CODEC_NAMES = { h264: 'H.264', h265: 'H.265', hevc: 'H.265', av1: 'AV1', vp8: 'VP8', vp9: 'VP9', jpeg: 'JPEG' };
@@ -53,6 +69,8 @@ const codecName = (codec) => CODEC_NAMES[String(codec || '').toLowerCase()] || S
 const nodeName = (path) => String(path || '').split('/').pop() || '';
 /** @param {Array<string|undefined|null|false>} parts @returns {string} */
 const joined = (parts) => parts.filter(Boolean).join(' · ');
+/** @param {string|undefined} text Prose the server or an engine phrased. @returns {string} */
+const sentence = (text) => (text ? text[0].toUpperCase() + text.slice(1) : '');
 
 /**
  * @param {StreamInfo|null} info
@@ -65,11 +83,12 @@ function encoderRow(info) {
   return {
     key: 'encoder',
     status: info.hardware ? 'good' : fell ? 'warn' : 'neutral',
-    value: joined([info.encoder, `${codecName(info.codec)}${video ? (info.fullcolor ? ' 4:4:4' : ' 4:2:0') : ''}`,
-      info.striped && 'striped']),
+    value: joined([info.encoder, `${codecName(info.codec)}${video ? (info.fullcolor ? ' 4:4:4' : ' 4:2:0') : ''}${
+      video && info.bit_depth === 10 ? ' 10-bit' : ''}`,
+      info.striped && 'Striped']),
     detail: info.hardware ? joined([info.gpu, nodeName(info.encode_node), info.driver])
-      : info.gpu_present === false ? 'no GPU exposed to the server' : '',
-    reason: fell ? info.encoder_reason : '',
+      : info.gpu_present === false ? 'No GPU exposed to the server' : '',
+    reason: fell ? sentence(info.encoder_reason) : '',
   };
 }
 
@@ -81,8 +100,8 @@ function captureRow(info) {
   if (!info) return { key: 'capture', status: 'neutral', value: '', detail: '', reason: '' };
   const wayland = info.backend === 'wayland';
   const software = wayland && info.renderer === 'pixman';
-  const path = info.zero_copy ? `zero-copy${wayland ? '' : ` (${info.capture})`}` : `readback${wayland ? '' : ` (${info.capture})`}`;
-  const readbackToGpu = !info.zero_copy && info.hardware;
+  const path = info.zero_copy ? `Zero-copy${wayland ? '' : ` (${info.capture})`}` : `Readback${wayland ? '' : ` (${info.capture})`}`;
+  const readbackToGpu = !info.zero_copy && info.hardware && info.zero_copy_available;
   const renderedInSoftware = software && info.hardware_expected;
   return {
     key: 'capture',
@@ -90,7 +109,7 @@ function captureRow(info) {
     value: joined([wayland ? 'Wayland' : 'X11', path]),
     detail: !wayland ? '' : software ? 'Pixman (software rendering)'
       : joined([`GL on ${nodeName(info.render_node)}`, info.render_gpu]),
-    reason: renderedInSoftware ? (info.renderer_reason || '') : readbackToGpu ? info.capture_reason : '',
+    reason: sentence(renderedInSoftware ? info.renderer_reason : readbackToGpu ? info.capture_reason : ''),
   };
 }
 
@@ -101,15 +120,16 @@ function captureRow(info) {
  */
 function decoderRow(client, words) {
   const decoder = client ? client.decoder : 'unknown';
+  const fell = decoder === 'software' && !!client.hardware_expected;
   return {
     key: 'decoder',
-    status: decoder === 'hardware' ? 'good' : decoder === 'software' ? 'warn' : 'neutral',
+    status: decoder === 'hardware' ? 'good' : fell ? 'warn' : 'neutral',
     value: words[decoder] || words.unknown,
     detail: client
       ? joined([client.decoder_evidence, codecName(client.codec), client.resolution,
         client.decode_path, client.sink])
       : '',
-    reason: '',
+    reason: fell ? words[client.decoder_reason] || sentence(client.decoder_reason) : '',
   };
 }
 
@@ -122,12 +142,12 @@ function decoderRow(client, words) {
 function connectionRow(client, latest, words) {
   const webrtc = !!client && client.transport === 'webrtc';
   const path = (client && client.path) || '';
-  const indirect = /relay|tcp/.test(path);
+  const direct = /^(host|srflx|prflx) udp$/.test(path);
   const throttled = !!(latest && latest.throttled);
   return {
     key: 'connection',
-    status: throttled || indirect ? 'warn' : webrtc && path ? 'good' : 'neutral',
-    value: joined([webrtc ? 'WebRTC' : 'WebSockets', path]),
+    status: throttled ? 'warn' : webrtc && direct ? 'good' : 'neutral',
+    value: joined([webrtc ? 'WebRTC' : 'WebSockets', sentence(path.replace(/\b(udp|tcp|tls)\b/g, (p) => p.toUpperCase()))]),
     detail: '',
     reason: throttled ? words.throttled : '',
   };
@@ -149,11 +169,18 @@ export function streamRows(info, client, latest, words) {
 const TILES = {
   encode_ms: ['Encode', 'ms'],
   pipeline_ms: ['Capture to encoded', 'ms'],
+  send_ms: ['Capture to sent', 'ms'],
   decode_ms: ['Decode', 'ms'],
+  present_ms: ['Arrival to screen', 'ms'],
   jitter_buffer_ms: ['Jitter buffer', 'ms'],
   audio_buffer_ms: ['Audio buffer', 'ms'],
+  video_mbps: ['Video rate', 'Mbps'],
+  peak_mbps: ['Peak, 250 ms', 'Mbps'],
   packet_loss_percent: ['Packet loss', '%'],
+  received_mb: ['Received', 'MB'],
   frames_dropped: ['Frames dropped', ''],
+  frames_not_shown: ['Frames not shown', ''],
+  lost_frames: ['Lost frames', ''],
   freezes: ['Freezes', ''],
   nacks: ['NACKs', ''],
   keyframe_requests: ['Key frame requests', ''],
@@ -161,26 +188,102 @@ const TILES = {
 
 /** The figures each transport shows, in order. */
 const TRANSPORT_TILES = {
-  websockets: ['encode_ms', 'pipeline_ms', 'decode_ms', 'audio_buffer_ms'],
-  webrtc: ['encode_ms', 'pipeline_ms', 'decode_ms', 'jitter_buffer_ms', 'audio_buffer_ms',
-    'packet_loss_percent',
-    'frames_dropped', 'freezes', 'nacks', 'keyframe_requests'],
+  websockets: ['encode_ms', 'pipeline_ms', 'send_ms', 'decode_ms', 'present_ms', 'audio_buffer_ms',
+    'video_mbps', 'peak_mbps', 'received_mb', 'lost_frames', 'frames_not_shown', 'keyframe_requests'],
+  webrtc: ['encode_ms', 'pipeline_ms', 'send_ms', 'decode_ms', 'jitter_buffer_ms', 'present_ms', 'audio_buffer_ms',
+    'video_mbps', 'peak_mbps', 'received_mb', 'packet_loss_percent',
+    'frames_dropped', 'frames_not_shown', 'freezes', 'nacks', 'keyframe_requests'],
 };
+
+/** The server's least and most of a time over the same second, by the time's key. */
+const RANGES = { pipeline_ms: ['pipeline_min_ms', 'pipeline_max_ms'], send_ms: ['send_min_ms', 'send_max_ms'] };
+
+/** How far above its CBR target a stream may run, the policy's bound, before its rate warns. */
+export const OVERSHOOT = 1.1;
+
+/**
+ * How long a time measured in an earlier second stands in for seconds that
+ * measured none, in ms: a still screen encodes nothing, so motion that comes and
+ * goes would otherwise blink its times out between frames.
+ */
+export const HOLD_MS = 5000;
+
+/**
+ * What a figure reads: its value with the unit, and for a time the server
+ * measured its range, as `least–most`, and whether it warns: the video rate
+ * when it runs past `OVERSHOOT` of its CBR target, which it is shown against.
+ * A time with nothing measured this second reads the last one measured within
+ * `HOLD_MS` (`history`), else `idle` where the stream moved no frame, else a
+ * dash.
+ * @param {StreamSample|null} latest
+ * @param {string} key
+ * @param {StreamSample[]|null} [history]
+ * @returns {{value: string, detail: string, warn: boolean}}
+ */
+function figure(latest, key, history = null) {
+  const [, unit] = TILES[key];
+  const at = (sample, k) => (sample && typeof sample[k] === 'number' ? sample[k] : null);
+  let shown = latest;
+  if (at(latest, key) === null && unit === 'ms' && latest && history) {
+    shown = null;
+    for (let i = history.length - 1; i >= 0 && latest.t - history[i].t <= HOLD_MS; i--) {
+      if (at(history[i], key) !== null) {
+        shown = history[i];
+        break;
+      }
+    }
+    if (shown === null) {
+      const idle = latest.encoded_fps === 0 || latest.fps === 0;
+      return { value: idle ? 'idle' : '\u2013', detail: '', warn: false };
+    }
+  }
+  const of = (k) => at(shown, k);
+  const value = of(key);
+  if (value === null) return { value: '\u2013', detail: '', warn: false };
+  const range = RANGES[key] && RANGES[key].map(of);
+  const target = key === 'video_mbps' ? of('target_mbps') : null;
+  return {
+    value: `${value}${target ? ` / ${target}` : ''}${unit === '%' ? '%' : unit ? ` ${unit}` : ''}`,
+    detail: range && range[0] !== null && range[1] !== null ? `${range[0]}\u2013${range[1]}` : '',
+    warn: !!target && value > OVERSHOOT * target,
+  };
+}
 
 /**
  * The figures under the graphs: one fixed set per transport, so the layout
- * holds still. A figure with nothing measured this second, an encode time on
- * an idle screen, reads as a dash rather than leaving.
+ * holds still. A time is the last second's, its range under it where the
+ * server measured one, and the video rate the last ten seconds' against the
+ * CBR target with its fullest quarter second beside it; everything else counts
+ * from the opening: the data received, the packet loss, and each drop and
+ * repair. A figure with nothing measured this second keeps its place: a time
+ * reads its last measurement for a while (`figure`), and the rest a dash.
  * @param {StreamSample|null} latest
  * @param {'websockets'|'webrtc'} transport
- * @returns {Array<{key: string, label: string, value: string}>}
+ * @param {StreamSample[]|null} [history] What the time figures fall back on.
+ * @returns {Array<{key: string, label: string, value: string, detail: string, warn: boolean}>}
  */
-export function streamTiles(latest, transport) {
-  return (TRANSPORT_TILES[transport] || TRANSPORT_TILES.websockets).map((key) => {
-    const [label, unit] = TILES[key];
-    const measured = latest && typeof latest[key] === 'number';
-    return { key, label, value: measured ? `${latest[key]}${unit === '%' ? '%' : unit ? ` ${unit}` : ''}` : '\u2013' };
-  });
+export function streamTiles(latest, transport, history = null) {
+  return (TRANSPORT_TILES[transport] || TRANSPORT_TILES.websockets).map((key) => (
+    { key, label: TILES[key][0], ...figure(latest, key, history) }));
+}
+
+/**
+ * The strip a dashboard lays over the stream: how fast frames reach the
+ * screen, the video rate against its target, and how long a frame takes from
+ * its capture to the wire, with the round trip over WebSockets, where the
+ * server measures one. Each names the tile, or graph, whose label captions it.
+ * @param {StreamSample|null} latest
+ * @param {'websockets'|'webrtc'} transport
+ * @returns {Array<{key: string, value: string, warn: boolean}>}
+ */
+export function streamStrip(latest, transport) {
+  const fps = latest && typeof latest.fps === 'number' ? `${latest.fps} fps` : '\u2013';
+  const keys = transport === 'webrtc' ? ['video_mbps', 'send_ms'] : ['video_mbps', 'send_ms', 'rtt_ms'];
+  return [{ key: 'fps', value: fps, warn: false }, ...keys.map((key) => {
+    if (key !== 'rtt_ms') return { key, ...figure(latest, key) };
+    const rtt = latest && typeof latest.rtt_ms === 'number' ? `${latest.rtt_ms} ms` : '\u2013';
+    return { key, value: rtt, warn: false };
+  })];
 }
 
 /** @param {number} bytes @returns {string} */
@@ -199,7 +302,9 @@ const gib = (bytes) => `${(bytes / 1073741824).toFixed(1)} GiB`;
 export function streamMeters(latest) {
   if (!latest || typeof latest.cpu_percent !== 'number') return [];
   const share = (used, total) => (total > 0 ? Math.min(100, (100 * used) / total) : 0);
-  const used = (key, percent) => ({ key, percent, text: `${Math.round(percent)}%`, detail: '', bar: true });
+  // Under ten percent a tenth shows, so a light session does not read as idle.
+  const used = (key, percent) => (
+    { key, percent, text: `${percent < 10 ? percent.toFixed(1) : Math.round(percent)}%`, detail: '', bar: true });
   const amounts = (key, gotten, total) => ({
     key,
     percent: share(gotten, total),
@@ -265,14 +370,17 @@ export function graphPath(values, width, height, max) {
  * @returns {string}
  */
 export function streamReport(info, client, latest) {
-  const words = { hardware: 'hardware', software: 'software', unknown: 'unknown', throttled: 'the server is holding frames back' };
+  const words = { hardware: 'Hardware', software: 'Software', unknown: 'Unknown', throttled: 'The server is holding frames back',
+    hardware_available: 'A hardware decoder is available for this stream',
+    software_preferred: 'Software preferred after a decoder fallback' };
   const rows = streamRows(info, client, latest, words);
   const lines = rows.map((row) => `${row.key}: ${joined([row.value, row.detail])}${row.status === 'warn' ? ' [!]' : ''}`);
   lines.push(...rows.map((row) => row.reason).filter(Boolean).map((reason) => `  ${reason}`));
   if (latest) {
     const shown = ['fps', 'encoded_fps', 'mbps', 'rtt_ms'].filter((key) => typeof latest[key] === 'number')
       .map((key) => `${key} ${latest[key]}`);
-    lines.push(joined(shown), ...streamTiles(latest, client ? client.transport : 'websockets').map((tile) => `${tile.label}: ${tile.value}`),
+    lines.push(joined(shown), ...streamTiles(latest, client ? client.transport : 'websockets').map((tile) =>
+      `${tile.label}: ${tile.value}${tile.detail ? ` (${tile.detail})` : ''}${tile.warn ? ' [!]' : ''}`),
       ...streamMeters(latest).map((meter) => `${meter.key}: ${joined([meter.text, meter.detail])}`));
     if (latest.mic) lines.push(`mic: ${latest.mic}`);
     if (latest.webcam) lines.push(`webcam: ${latest.webcam}`);

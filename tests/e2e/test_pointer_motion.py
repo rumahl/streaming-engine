@@ -149,6 +149,10 @@ def launch(browser: str, profile: str, dpr: float, query: str = "") -> subproces
             fh.write('user_pref("browser.startup.firstrunSkipsHomepage", true);\n')
             fh.write('user_pref("browser.startup.homepage_override.mstone", "ignore");\n')
             fh.write('user_pref("datareporting.policy.firstRunURL", "");\n')
+            # Firefox 156 opens its privacy notice or terms of use over a new
+            # profile's first page, and that page takes the clicks.
+            fh.write('user_pref("datareporting.policy.dataSubmissionPolicyBypassNotification", true);\n')
+            fh.write('user_pref("termsofuse.bypassNotification", true);\n')
         cmd = [binary("firefox"), "--no-remote", "--profile", profile,
                "--width", "1600", "--height", "900", url]
     else:
@@ -284,7 +288,8 @@ def measure(res, browser: str, dpr: float) -> None:
         root = d.screen().root
         # Raw movement is refused by every engine on Linux, so the fallback to a
         # plain lock is the path this runs on; a lock is what matters either way.
-        res.check(f"{label}: the pointer locks", True, LATEST.get("lockPath", ""))
+        res.check(f"{label}: the pointer locks", True,
+                  f"{LATEST.get('lockPath', '')}, motion from {LATEST.get('motionEvent', '')}")
 
         for name, count, delta, gap in PATTERNS:
             root.warp_pointer(700, 450)

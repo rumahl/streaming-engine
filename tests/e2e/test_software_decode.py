@@ -4,7 +4,7 @@
 A hardware H.264 decoder can accept its config and then fail at decode() —
 isConfigSupported does not predict it — so the client retries the same encoder
 with hardwareAcceleration 'prefer-software' before the ladder closes the socket,
-degrades the encoder and reloads. A decoder can also take its config and then neither output a frame nor error, so nothing
+degrades the encoder, and reloads. A decoder can also take its config and then neither output a frame nor error, so nothing
 signals the ladder; the ``silent`` block injects that and checks the no-output watchdog trips
 the same retry. These blocks inject exactly those failures into a real browser and check each
 arm of the decision.
@@ -13,8 +13,26 @@ The ``nowebcodecs`` block is the rung below the ladder: an engine with no WebCod
 at all is not refused but pinned to the striped-JPEG encoder at pre-flight, and
 the dashboard offers it nothing else.
 
-Usage: python3 tests/e2e/test_software_decode.py [retry|persisted|ladder|healthy|silent|striped|nowebcodecs|all]
+The ``nosoftware`` block is an engine with no software H.264 decoder, whose refusal of the
+preference must not read as a refusal of the codec; the ``nostart`` block one that claims a
+software decoder and starts none, whose failure must not count as a crash.
+
+The ``newtab`` block follows the preference past its tab: it holds for the tab that met the
+failure, and a new tab of the same profile starts on hardware again.
+
+The ``cleared`` and ``broken`` blocks follow the ladder's JPEG past its tab: a fault that
+clears gives a new tab its video back, and one that stays takes it to JPEG at its first crash.
+The ``held`` block follows the settings a crash resets the same way: the user's own come back
+in a new tab, and one picked again in the crashing tab stays picked.
+
+The ``hidden`` block is a background tab: a hidden page drops what it decodes, so video still
+sent to it must not read as a silent decoder and take it through the retry and the ladder's
+reloads to JPEG, and a page whose socket opens hidden (a reload or a reconnect in a background
+tab) pauses its video as a hide would have, and resumes it when shown.
+
+Usage: python3 tests/e2e/test_software_decode.py [retry|nosoftware|nostart|persisted|newtab|ladder|healthy|silent|striped|nowebcodecs|cleared|broken|held|hidden|all]
 """
+import json
 import os
 import sys
 import time
@@ -26,23 +44,36 @@ import core_lib as C
 
 from typing import Callable, Optional
 
-# localStorage namespace the client derives from origin + pathname.
+# Storage namespace the client derives from origin + pathname.
 STORAGE_KEY_JS = (
     "((location.origin + location.pathname).replace(/[^a-zA-Z0-9._-]/g, '_')"
     " + '_prefer_software_decode')"
 )
+ENCODER_KEY_JS = STORAGE_KEY_JS.replace("_prefer_software_decode", "_encoder")
 
 
-def shim_js(fail_mode: str) -> str:
+def shim_js(fail_mode: str, loads: int = 0, soft_h264: str = "yes") -> str:
     """Make every VideoDecoder in the page fail on a chosen path and record the acceleration
-    each decoder was configured with. ``hardware``/``all`` raise an asynchronous decode error;
-    ``silent`` accepts the chunk on the hardware path but never outputs and never errors, the
-    case the no-output watchdog exists for."""
+    each decoder was configured with. ``hardware``/``all`` raise an asynchronous decode error,
+    ``once`` only at the first hardware decode of a load; ``silent`` accepts the chunk on the
+    hardware path but never outputs and never errors, the case the no-output watchdog exists
+    for. ``loads`` confines the failure to the tab's first that many loads, a fault that clears
+    up; 0 keeps it for every load. ``soft_h264`` ``no`` is an engine with no software H.264
+    decoder, as Chromium without FFmpeg's video decoders: it refuses the software preference
+    for H.264, in ``isConfigSupported`` and at ``configure``; ``claims`` is one that takes the
+    preference in ``isConfigSupported`` and then starts no decoder for it."""
     return """
     (() => {
       const Real = window.VideoDecoder;
       if (!Real) return;
-      const MODE = '%s';
+      const MODE = %d && Number(sessionStorage.getItem('__navs') || 0) > %d ? 'none' : '%s';
+      const SOFT_H264 = '%s';
+      const softH264 = (cfg) => !!cfg && cfg.hardwareAcceleration === 'prefer-software'
+        && /^avc1/.test(cfg.codec || '');
+      const realSupported = Real.isConfigSupported.bind(Real);
+      Real.isConfigSupported = (cfg) => SOFT_H264 === 'no' && softH264(cfg)
+        ? Promise.resolve({ supported: false, config: cfg }) : realSupported(cfg);
+      let failedOnce = false;
       const errorFor = new WeakMap(), softFor = new WeakMap();
       const record = (accel) => {
         const seen = JSON.parse(sessionStorage.getItem('__cfgs') || '[]');
@@ -55,11 +86,19 @@ def shim_js(fail_mode: str) -> str:
         const accel = (cfg && cfg.hardwareAcceleration) || 'default';
         softFor.set(this, accel === 'prefer-software');
         record(accel);
+        if (SOFT_H264 !== 'yes' && softH264(cfg)) {
+          // What Chromium reports when no decoder will start for the config.
+          const cb = errorFor.get(this);
+          if (cb) setTimeout(() => cb(new DOMException('Unsupported configuration.', 'OperationError')), 0);
+          return;
+        }
         return origConfigure.call(this, cfg);
       };
       proto.decode = function (chunk) {
         const soft = softFor.get(this) === true;
-        if (MODE === 'all' || (MODE === 'hardware' && !soft)) {
+        const once = MODE === 'once' && !soft && !failedOnce;
+        if (once) failedOnce = true;
+        if (MODE === 'all' || (MODE === 'hardware' && !soft) || once) {
           const cb = errorFor.get(this);
           if (cb) setTimeout(() => cb(new DOMException('injected decode failure',
                                                        'EncodingError')), 0);
@@ -83,7 +122,7 @@ def shim_js(fail_mode: str) -> str:
         },
       });
     })();
-    """ % fail_mode
+    """ % (loads, loads, fail_mode, soft_h264)
 
 
 # Every WebCodecs global removed, the way an engine without the API presents.
@@ -99,10 +138,14 @@ NAV_JS = """
   (() => {
     const n = Number(sessionStorage.getItem('__navs') || 0) + 1;
     sessionStorage.setItem('__navs', String(n));
+    // Where each load's decoders start in the configure record.
+    const at = JSON.parse(sessionStorage.getItem('__navAt') || '[]');
+    at.push(JSON.parse(sessionStorage.getItem('__cfgs') || '[]').length);
+    sessionStorage.setItem('__navAt', JSON.stringify(at));
   })();
 """
 
-SEED_JS = "try { localStorage.setItem(%s, navigator.userAgent); } catch (e) {}" % STORAGE_KEY_JS
+SEED_JS = "try { sessionStorage.setItem(%s, '1'); } catch (e) {}" % STORAGE_KEY_JS
 
 ENCODER_JS = """
   try {
@@ -111,22 +154,40 @@ ENCODER_JS = """
   } catch (e) {}
 """
 
+# A load in a background tab: hidden before the client runs, so no visibilitychange reaches it.
+HIDDEN_LOAD_JS = """
+  Object.defineProperty(document, 'hidden', {configurable: true, get: () => true});
+  Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => 'hidden'});
+"""
+
+# The tab hidden or shown; `tell` fires the visibilitychange the browser would. Untold, the page
+# is hidden with nothing to pause its video, as when video reaches a page already hidden.
+VISIBILITY_JS = """([h, tell]) => {
+  Object.defineProperty(document, 'hidden', {configurable: true, get: () => h});
+  Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => h ? 'hidden' : 'visible'});
+  if (tell) document.dispatchEvent(new Event('visibilitychange'));
+}"""
+
 
 def open_client(pw, fail_mode: str = "none", seed_preference: bool = False,
-                encoder: Optional[str] = None, query: str = "", engine: str = "chromium"):
+                encoder: Optional[str] = None, query: str = "", engine: str = "chromium",
+                soft_h264: str = "yes", hidden: bool = False):
     """Launch a browser with the decode-failure shim installed.
 
     Args:
         pw: Active Playwright instance.
-        fail_mode: ``none``, ``hardware``, ``all``, or ``silent`` decode failure injection.
+        fail_mode: ``none``, ``hardware``, ``all``, ``once``, or ``silent`` decode failure injection.
         seed_preference: Pre-store the software-decode preference key.
         encoder: Optional encoder to pin in localStorage before load.
         query: Optional query string appended to the stream URL.
         engine: ``chromium``, ``firefox``, or ``webkit``. The shim needs WebCodecs, so on an
             engine without it (Playwright WebKit) it no-ops and the client takes its jpeg path.
+        soft_h264: Whether the engine has a software H.264 decoder (``shim_js``).
+        hidden: Every load starts hidden, as in a background tab (``HIDDEN_LOAD_JS``).
 
     Returns:
-        Tuple of (browser, page) with the stream page loaded.
+        Tuple of (browser, page) with the stream page loaded; ``page.console_lines`` collects
+        its console across reloads.
     """
     browser = C.chromium_launch(pw) if engine == "chromium" else C.launch_browser(pw, engine)
     ctx = browser.new_context(viewport={"width": 1280, "height": 720},
@@ -136,8 +197,12 @@ def open_client(pw, fail_mode: str = "none", seed_preference: bool = False,
         ctx.add_init_script(SEED_JS)
     if encoder:
         ctx.add_init_script(ENCODER_JS % encoder)
-    ctx.add_init_script(shim_js(fail_mode))
+    ctx.add_init_script(shim_js(fail_mode, soft_h264=soft_h264))
+    if hidden:
+        ctx.add_init_script(HIDDEN_LOAD_JS)
     page = ctx.new_page()
+    page.console_lines = []
+    page.on("console", lambda m: page.console_lines.append(m.text))
     page.goto(H.BASE_URL + "/" + (f"?{query}" if query else ""), wait_until="load")
     return browser, page
 
@@ -147,10 +212,12 @@ def read_state(page, retries: int = 6) -> dict:
     js = """(() => ({
       navs: Number(sessionStorage.getItem('__navs') || 0),
       cfgs: JSON.parse(sessionStorage.getItem('__cfgs') || '[]'),
+      navAt: JSON.parse(sessionStorage.getItem('__navAt') || '[]'),
       decoded: window.__decoded || 0,
-      stored: (() => { try { return localStorage.getItem(%s); } catch (e) { return null; } })(),
-      ua: navigator.userAgent,
-    }))()""" % STORAGE_KEY_JS
+      stored: (() => { try { return sessionStorage.getItem(%s); } catch (e) { return null; } })(),
+      codec: (window.stream_info && window.stream_info.codec) || null,
+      encoder: (() => { try { return localStorage.getItem(%s); } catch (e) { return null; } })(),
+    }))()""" % (STORAGE_KEY_JS, ENCODER_KEY_JS)
     for attempt in range(retries):
         try:
             return page.evaluate(js)
@@ -187,14 +254,87 @@ def block_retry(r: "H.Results") -> None:
                         "prefer-software" in state["cfgs"], state["cfgs"][:6])
                 r.check("frames decode after the switch", state["decoded"] > 0,
                         state["decoded"])
-                r.check("preference persisted for this browser build",
-                        state["stored"] == state["ua"], (state["stored"] or "")[:40])
+                r.check("preference stored for this tab", state["stored"] is not None, state["stored"])
                 # The ladder reloads 3s after a fatal error; outlast it.
                 time.sleep(6)
                 after = read_state(page)
                 r.check("page never reloaded", after["navs"] == 1, after["navs"])
                 r.check("still decoding", after["decoded"] > state["decoded"],
                         (state["decoded"], after["decoded"]))
+                page.console_lines.clear()
+                page.reload(wait_until="load")
+                wait_for(page, lambda s: s["navs"] == 2 and s["decoded"] > 0)
+                said = [line for line in page.console_lines if line.startswith("[fallback]")]
+                r.check("a reload of the tab says it decodes in software, and why",
+                        any("decodes video in software since" in line and "decoder error" in line
+                            for line in said), said)
+            finally:
+                browser.close()
+    finally:
+        H.server_stop()
+
+
+def block_nosoftware(r: "H.Results") -> None:
+    """An engine with no software H.264 decoder meets one hardware decode error: the
+    software retry it cannot take leaves the choice of decoder to the engine, which decodes
+    on, where reading the refused preference as a refused codec would step the stream down
+    the ladder for the rest of the tab's life."""
+    from playwright.sync_api import sync_playwright
+    H.server_start(mode="websockets")
+    try:
+        with sync_playwright() as pw:
+            browser, page = open_client(pw, fail_mode="once", soft_h264="no")
+            try:
+                state = wait_for(page, lambda s: len(s["cfgs"]) > 1 and s["decoded"] > 0, timeout=40)
+                r.check("the failed decoder was rebuilt", len(state["cfgs"]) > 1, state["cfgs"][:6])
+                r.check("without the software preference the engine refuses",
+                        "prefer-software" not in state["cfgs"], state["cfgs"][:6])
+                r.check("frames decode after the error", state["decoded"] > 0, state["decoded"])
+                time.sleep(6)
+                after = read_state(page)
+                r.check("the stream stays H.264", after["codec"] == "h264", after["codec"])
+                r.check("no fallback encoder stored", after["encoder"] is None, after["encoder"])
+                r.check("no software preference stored", after["stored"] is None, after["stored"])
+                r.check("page never reloaded", after["navs"] == 1, after["navs"])
+                r.check("still decoding", after["decoded"] > state["decoded"],
+                        (state["decoded"], after["decoded"]))
+                r.check("the console says why", any("has no software decoder for avc1" in line
+                                                     for line in page.console_lines))
+            finally:
+                browser.close()
+    finally:
+        H.server_stop()
+
+
+def block_nostart(r: "H.Results") -> None:
+    """An engine that takes the software preference for H.264 and then starts no decoder for
+    it meets one hardware decode error: the software retry puts out no frame, and the decoder
+    the engine picks gets the stream back without a reload, where the crash ladder would
+    reload the page on its safe settings and count a crash toward JPEG."""
+    from playwright.sync_api import sync_playwright
+    H.server_start(mode="websockets")
+    try:
+        with sync_playwright() as pw:
+            browser, page = open_client(pw, fail_mode="once", soft_h264="claims")
+            try:
+                state = wait_for(page, lambda s: "prefer-software" in s["cfgs"] and s["cfgs"][-1] == "default"
+                                 and s["decoded"] > 0, timeout=40)
+                r.check("software was tried", "prefer-software" in state["cfgs"], state["cfgs"][:6])
+                r.check("then the engine's own decoder again", state["cfgs"][-1:] == ["default"],
+                        state["cfgs"][-3:])
+                r.check("frames decode after the error", state["decoded"] > 0, state["decoded"])
+                time.sleep(6)
+                after = read_state(page)
+                crashes = page.evaluate("localStorage.getItem(%s + '_crash_count')" % STORAGE_PREFIX_JS)
+                r.check("the stream stays H.264", after["codec"] == "h264", after["codec"])
+                r.check("no fallback encoder stored", after["encoder"] is None, after["encoder"])
+                r.check("no software preference stored", after["stored"] is None, after["stored"])
+                r.check("no crash counted", crashes is None, crashes)
+                r.check("page never reloaded", after["navs"] == 1, after["navs"])
+                r.check("still decoding", after["decoded"] > state["decoded"],
+                        (state["decoded"], after["decoded"]))
+                r.check("the console says why", any("Software decode put out no frame" in line
+                                                     for line in page.console_lines))
             finally:
                 browser.close()
     finally:
@@ -202,8 +342,8 @@ def block_retry(r: "H.Results") -> None:
 
 
 def block_persisted(r: "H.Results") -> None:
-    """A remembered preference is applied to the first decoder, so a client with
-    a broken hardware path pays no failed decode at all."""
+    """A tab's remembered preference is applied to the first decoder of its next
+    load, so a reload on a broken hardware path pays no failed decode."""
     from playwright.sync_api import sync_playwright
     H.server_start(mode="websockets")
     try:
@@ -227,6 +367,39 @@ def block_persisted(r: "H.Results") -> None:
         H.server_stop()
 
 
+def block_newtab(r: "H.Results") -> None:
+    """Hardware decode fails in one tab, which switches to software: a new tab of the same
+    profile, the fault gone, configures a hardware decoder first and stores no preference."""
+    from playwright.sync_api import sync_playwright
+    H.server_start(mode="websockets")
+    try:
+        with sync_playwright() as pw:
+            browser, page = open_client(pw, fail_mode="hardware")
+            try:
+                state = wait_for(page, lambda s: s["decoded"] > 0 and "prefer-software" in s["cfgs"])
+                r.check("the failing tab switched to software decode",
+                        "prefer-software" in state["cfgs"], state["cfgs"][:6])
+                storage = page.context.storage_state()
+                page.context.close()
+                # A fresh server, so the new tab is the display's only client.
+                H.server_start(mode="websockets")
+                fresh = browser.new_context(storage_state=storage, viewport={"width": 1280, "height": 720},
+                                            device_scale_factor=1)
+                fresh.add_init_script(NAV_JS)
+                fresh.add_init_script(shim_js("none"))
+                page = fresh.new_page()
+                page.goto(H.BASE_URL + "/", wait_until="load")
+                state = wait_for(page, lambda s: s["decoded"] > 0)
+                r.check("a new tab decodes", state["decoded"] > 0, state["decoded"])
+                r.check("on a hardware decoder from the start",
+                        bool(state["cfgs"]) and "prefer-software" not in state["cfgs"], state["cfgs"][:6])
+                r.check("with no preference stored", state["stored"] is None, state["stored"])
+            finally:
+                browser.close()
+    finally:
+        H.server_stop()
+
+
 def block_ladder(r: "H.Results") -> None:
     """Software decode fails too: the ladder still runs, and the preference is
     dropped so the next load re-probes hardware."""
@@ -241,8 +414,8 @@ def block_ladder(r: "H.Results") -> None:
                 # two and the ladder looks like it stopped at software.
                 state = wait_for(
                     page,
-                    lambda s: s["navs"] > 1 and "prefer-software" in s["cfgs"]
-                    and s["cfgs"][s["cfgs"].index("prefer-software") + 1:],
+                    lambda s: s["navs"] > 1 and len(s["navAt"]) > 1
+                    and len(s["cfgs"]) > s["navAt"][1],
                     timeout=60)
                 r.check("software was tried first",
                         "prefer-software" in state["cfgs"], state["cfgs"][:6])
@@ -251,10 +424,12 @@ def block_ladder(r: "H.Results") -> None:
                 # The preference is dropped on the way into the ladder, so the reloaded
                 # page re-probes hardware rather than being pinned by a failure software
                 # did not cause; it then arms its own retry, which sets the key again.
-                after_software = state["cfgs"][state["cfgs"].index("prefer-software") + 1:]
+                # The first page may configure more than one software decoder before the
+                # ladder reloads it, so the reloaded page's own first decoder is read.
+                reloaded = state["cfgs"][state["navAt"][1]:] if len(state["navAt"]) > 1 else []
                 r.check("next load re-probes hardware",
-                        bool(after_software) and after_software[0] == "default",
-                        state["cfgs"][:6])
+                        bool(reloaded) and reloaded[0] == "default",
+                        {"cfgs": state["cfgs"][:6], "navAt": state["navAt"]})
             finally:
                 browser.close()
     finally:
@@ -322,7 +497,9 @@ def block_striped(r: "H.Results") -> None:
 def block_nowebcodecs(r: "H.Results") -> None:
     """No WebCodecs at all: the stream comes up as striped JPEG without a reload,
     the encoder is pinned to jpeg for the session, and the classic dashboard's
-    encoder menu offers only what this engine can play."""
+    encoder menu offers only what this engine can play. The next browser to take
+    the display, and a later visit of the same profile with WebCodecs, the way a
+    browser update brings it, stream video."""
     from playwright.sync_api import sync_playwright
     import test_dashboards as TD
     H.server_start(mode="websockets", web_root=H.CLASSIC_DIST)
@@ -357,6 +534,174 @@ def block_nowebcodecs(r: "H.Results") -> None:
                 enabled = [o["value"] for o in options if not o["disabled"]]
                 r.check("dashboard enables only the jpeg encoder", opened and enabled == ["jpeg"], str(options))
                 r.check("no page errors", not errors, "; ".join(errors)[:200])
+                storage = ctx.storage_state()
+                ctx.close()
+                # The next controller, inside the reconnect grace, is a browser with WebCodecs
+                # and nothing stored: the JPEG was the departed page's, not the display's.
+                other = browser.new_context(viewport={"width": 1280, "height": 720}, device_scale_factor=1)
+                other.add_init_script(NAV_JS)
+                page = other.new_page()
+                page.goto(H.BASE_URL + "/", wait_until="load")
+                state = wait_for(page, lambda s: s["codec"] not in (None, "jpeg"), timeout=30)
+                r.check("the next browser to connect streams video", state["codec"] not in (None, "jpeg"),
+                        state["codec"])
+                other.close()
+                # A fresh server, so what the later visit streams comes from its own storage.
+                H.server_start(mode="websockets", web_root=H.CLASSIC_DIST)
+                later = browser.new_context(storage_state=storage, viewport={"width": 1280, "height": 720},
+                                            device_scale_factor=1)
+                later.add_init_script(NAV_JS)
+                page = later.new_page()
+                page.goto(H.BASE_URL + "/", wait_until="load")
+                state = wait_for(page, lambda s: s["codec"] is not None)
+                r.check("a later visit with WebCodecs streams video", state["codec"] not in (None, "jpeg"),
+                        state["codec"])
+                r.check("and asks for no JPEG of its own", state["encoder"] != "jpeg", state["encoder"])
+            finally:
+                browser.close()
+    finally:
+        H.server_stop()
+
+
+def block_cleared(r: "H.Results") -> None:
+    """Every decoder fails at decode() for a tab's first three loads and then works, as through
+    a GPU process restart or a driver hiccup: the crash ladder still takes that tab to JPEG,
+    which holds for that tab alone, so a new tab of the profile streams video again. The
+    page decodes on the main thread, where the shim reaches its decoders."""
+    from playwright.sync_api import sync_playwright
+    H.server_start(mode="websockets")
+    try:
+        with sync_playwright() as pw:
+            browser = C.chromium_launch(pw)
+            try:
+                ctx = browser.new_context(viewport={"width": 1280, "height": 720}, device_scale_factor=1)
+                ctx.add_init_script(NAV_JS)
+                ctx.add_init_script(shim_js("all", loads=3))
+                page = ctx.new_page()
+                said = []
+                page.on("console", lambda m: said.append(m.text) if m.text.startswith("[fallback]") else None)
+                page.goto(H.BASE_URL + "/?offscreen_worker=false", wait_until="load")
+                state = wait_for(page, lambda s: s["navs"] > 3 and s["codec"] == "jpeg", timeout=90)
+                r.check("the failing tab reaches JPEG at its fourth load", state["navs"] == 4
+                        and state["codec"] == "jpeg", {"navs": state["navs"], "codec": state["codec"]})
+                r.check("which says it streams JPEG for the third crash", any(
+                    "streams the jpeg encoder (in place of" in line and "decoder crash 3" in line
+                    for line in said), said)
+                r.check("and counts the crashes", any("since its last healthy session: 3" in line
+                                                      for line in said), said)
+                time.sleep(6)
+                after = read_state(page)
+                r.check("and stays there", after["navs"] == 4 and after["codec"] == "jpeg",
+                        {"navs": after["navs"], "codec": after["codec"]})
+                storage = ctx.storage_state()
+                ctx.close()
+                # A fresh server, so what the new tab streams comes from its own storage.
+                H.server_start(mode="websockets")
+                fresh = browser.new_context(storage_state=storage, viewport={"width": 1280, "height": 720},
+                                            device_scale_factor=1)
+                fresh.add_init_script(NAV_JS)
+                page = fresh.new_page()
+                page.goto(H.BASE_URL + "/?offscreen_worker=false", wait_until="load")
+                state = wait_for(page, lambda s: s["codec"] is not None)
+                r.check("a new tab streams video once decode works", state["codec"] == "h264", state["codec"])
+                r.check("with the pick the fallback replaced back", state["encoder"] is None, state["encoder"])
+                r.check("and frames present", C.page_fps(page, timeout=15) > 0)
+            finally:
+                browser.close()
+    finally:
+        H.server_stop()
+
+
+PICKS = {"framerate": "120", "video_crf": "18", "manual_resolution": "true",
+         "manual_width": "1280", "manual_height": "720"}
+STORAGE_PREFIX_JS = "(location.origin + location.pathname).replace(/[^a-zA-Z0-9._-]/g, '_')"
+SEED_PICKS_JS = """(() => {
+  if (sessionStorage.getItem('__picked')) return;
+  sessionStorage.setItem('__picked', '1');
+  const prefix = %s;
+  for (const [k, v] of Object.entries(%s)) localStorage.setItem(prefix + '_' + k, v);
+})();""" % (STORAGE_PREFIX_JS, json.dumps(PICKS))
+READ_PICKS_JS = """(() => {
+  const prefix = %s, out = {};
+  for (const k of %s) out[k] = localStorage.getItem(prefix + '_' + k);
+  return out;
+})()""" % (STORAGE_PREFIX_JS, json.dumps(list(PICKS)))
+
+
+def block_held(r: "H.Results") -> None:
+    """A crash's safe settings hold for the crashing tab alone. With the user's frame rate,
+    quality and manual size stored, every decoder fails for the tab's first load: it reloads
+    on the ladder's safe values, a quality picked again there stays picked, and a new tab of
+    the profile has the rest of the user's settings back."""
+    from playwright.sync_api import sync_playwright
+    H.server_start(mode="websockets")
+    try:
+        with sync_playwright() as pw:
+            browser = C.chromium_launch(pw)
+            try:
+                ctx = browser.new_context(viewport={"width": 1280, "height": 720}, device_scale_factor=1)
+                ctx.add_init_script(NAV_JS)
+                ctx.add_init_script(SEED_PICKS_JS)
+                ctx.add_init_script(shim_js("all", loads=1))
+                page = ctx.new_page()
+                page.goto(H.BASE_URL + "/?offscreen_worker=false", wait_until="load")
+                state = wait_for(page, lambda s: s["navs"] >= 2 and s["codec"] is not None, timeout=60)
+                r.check("the crash reloads the tab", state["navs"] >= 2, {"navs": state["navs"]})
+                held = page.evaluate(READ_PICKS_JS)
+                r.check("on the ladder's safe values", held == {"framerate": "60", "video_crf": "25",
+                        "manual_resolution": "false", "manual_width": None, "manual_height": None}, held)
+                page.evaluate("window.postMessage({type: 'settings', settings: {video_crf: 30}}, window.location.origin)")
+                time.sleep(1)
+                storage = ctx.storage_state()
+                ctx.close()
+                # A fresh server, so what the new tab streams comes from its own storage.
+                H.server_start(mode="websockets")
+                fresh = browser.new_context(storage_state=storage, viewport={"width": 1280, "height": 720},
+                                            device_scale_factor=1)
+                fresh.add_init_script(NAV_JS)
+                page = fresh.new_page()
+                page.goto(H.BASE_URL + "/?offscreen_worker=false", wait_until="load")
+                wait_for(page, lambda s: s["codec"] is not None)
+                picks = page.evaluate(READ_PICKS_JS)
+                r.check("a new tab has the user's frame rate and manual size back",
+                        {k: picks[k] for k in ("framerate", "manual_resolution", "manual_width", "manual_height")}
+                        == {k: PICKS[k] for k in ("framerate", "manual_resolution", "manual_width", "manual_height")},
+                        picks)
+                r.check("and the quality picked again in the crashing tab", picks["video_crf"] == "30", picks)
+            finally:
+                browser.close()
+    finally:
+        H.server_stop()
+
+
+def block_broken(r: "H.Results") -> None:
+    """Every decoder fails at decode() on every load of every tab: the crash ladder still ends
+    on JPEG and stays there, and a new tab of the profile, the fault still there, takes JPEG
+    at its first crash rather than walking the ladder again."""
+    from playwright.sync_api import sync_playwright
+    H.server_start(mode="websockets")
+    try:
+        with sync_playwright() as pw:
+            browser = C.chromium_launch(pw)
+            try:
+                storage = None
+                for tab, loads in (("the first tab", 4), ("a new tab", 2)):
+                    if storage is not None:
+                        # A fresh server, so what the new tab streams comes from its own storage.
+                        H.server_start(mode="websockets")
+                    ctx = browser.new_context(storage_state=storage, viewport={"width": 1280, "height": 720},
+                                              device_scale_factor=1)
+                    ctx.add_init_script(NAV_JS)
+                    ctx.add_init_script(shim_js("all"))
+                    page = ctx.new_page()
+                    page.goto(H.BASE_URL + "/?offscreen_worker=false", wait_until="load")
+                    wait_for(page, lambda s, n=loads: s["codec"] == "jpeg" and s["navs"] >= n, timeout=90)
+                    time.sleep(6)
+                    after = read_state(page)
+                    r.check(f"{tab} settles on JPEG at load {loads}", after["navs"] == loads
+                            and after["codec"] == "jpeg", {"navs": after["navs"], "codec": after["codec"]})
+                    storage = ctx.storage_state()
+                    ctx.close()
             finally:
                 browser.close()
     finally:
@@ -398,10 +743,77 @@ def block_silent(r: "H.Results") -> None:
         H.server_stop()
 
 
-BLOCKS = {"retry": block_retry, "persisted": block_persisted,
+def block_hidden(r: "H.Results") -> None:
+    """A background tab. Its video still flowing, a hidden page drops every decoded frame, which
+    must not read as a silent decoder: no software retry, no reload, no ladder. A page whose
+    socket opens hidden, as a reload or a reconnect in a background tab does, pauses its video as
+    a hide would have and resumes it when shown, on its own encoder.
+
+    The page's own full-frame decoder is the one that drops frames while hidden, so the video
+    worker is disabled, as in ``silent``.
+    """
+    from playwright.sync_api import sync_playwright
+    H.server_start(mode="websockets")
+    try:
+        with sync_playwright() as pw:
+            browser, page = open_client(pw, encoder="h264enc", query="offscreen_worker=false")
+            try:
+                state = wait_for(page, lambda s: s["decoded"] > 0, timeout=30)
+                r.check("hidden: the page decodes before its tab hides", state["decoded"] > 0, state)
+                chunks = page.evaluate("window.videoChunksReceived || 0")
+                page.evaluate(VISIBILITY_JS, [True, False])
+                time.sleep(22)
+                hidden = read_state(page)
+                r.check("hidden: video still reached the hidden page",
+                        page.evaluate("window.videoChunksReceived || 0") > chunks + 30)
+                r.check("hidden: which neither retried in software nor reloaded",
+                        hidden["navs"] == 1 and "prefer-software" not in hidden["cfgs"],
+                        (hidden["navs"], hidden["cfgs"][:6]))
+                page.evaluate(VISIBILITY_JS, [False, True])
+                shown = wait_for(page, lambda s: s["decoded"] > hidden["decoded"] + 30, timeout=15)
+                r.check("hidden: shown, it decodes on", shown["decoded"] > hidden["decoded"] + 30,
+                        (hidden["decoded"], shown["decoded"]))
+            finally:
+                browser.close()
+
+            mark = len(H.server_log())
+            browser, page = open_client(pw, encoder="h264enc", query="offscreen_worker=false",
+                                        hidden=True)
+            try:
+                paused = "Received STOP_VIDEO for 'primary'"
+                deadline = time.time() + 20
+                while time.time() < deadline and paused not in H.server_log()[mark:]:
+                    time.sleep(0.5)
+                r.check("hidden on connect: the page pauses its video", paused in H.server_log()[mark:])
+                time.sleep(2)
+                chunks = page.evaluate("window.videoChunksReceived || 0")
+                time.sleep(20)
+                hidden = read_state(page)
+                # On the one load: a reload would start the count over.
+                r.check("hidden on connect: no video reaches it while hidden",
+                        hidden["navs"] == 1 and page.evaluate("window.videoChunksReceived || 0") - chunks <= 2,
+                        hidden["navs"])
+                r.check("hidden on connect: no software retry, no reload",
+                        hidden["navs"] == 1 and "prefer-software" not in hidden["cfgs"],
+                        (hidden["navs"], hidden["cfgs"][:6]))
+                page.evaluate(VISIBILITY_JS, [False, True])
+                shown = wait_for(page, lambda s: s["decoded"] > hidden["decoded"] + 30, timeout=20)
+                # JPEG never reaches a VideoDecoder, so decoded frames are the H.264 stream's.
+                r.check("hidden on connect: shown, it streams H.264 again",
+                        shown["decoded"] > hidden["decoded"] + 30, (hidden["decoded"], shown["decoded"]))
+            finally:
+                browser.close()
+    finally:
+        H.server_stop()
+
+
+BLOCKS = {"retry": block_retry, "nosoftware": block_nosoftware, "nostart": block_nostart,
+          "persisted": block_persisted, "newtab": block_newtab,
           "ladder": block_ladder, "healthy": block_healthy,
           "silent": block_silent,
-          "striped": block_striped, "nowebcodecs": block_nowebcodecs}
+          "striped": block_striped, "nowebcodecs": block_nowebcodecs,
+          "cleared": block_cleared, "broken": block_broken, "held": block_held,
+          "hidden": block_hidden}
 
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"

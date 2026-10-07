@@ -3,20 +3,20 @@ title: Base Container
 description: The session with no desktop in it, how it starts, how it is laid out, how to run a checkout inside it, and how to build a desktop of your own on it.
 ---
 
-The [Base Container](https://github.com/selkies-project/selkies/tree/main/addons/base), `ghcr.io/selkies-project/selkies/base:main-${DISTRIB_FLAVOR}`, is the whole session apart from what it looks like: the display servers, the audio stack, the GPU wiring, the gamepad and webcam plumbing, service supervision, an embedded TURN server and Selkies itself. The [Desktop Container](desktop-image.md) adds LXQt to it, and the [KDE Plasma desktops](kde-images.md) add Plasma; a desktop of your own is built the same way, and everything on this page applies to all of them unchanged.
+The [Base Container](https://github.com/selkies-project/selkies/tree/main/addons/base), `ghcr.io/selkies-project/selkies/base:main-${DISTRIB_FLAVOR}`, is the whole session apart from what it looks like: the display servers, the audio stack, the GPU wiring, the gamepad and webcam plumbing, service supervision, an embedded TURN server, and Selkies itself. The [Desktop Container](desktop-image.md) adds LXQt to it, and the [KDE Plasma desktops](kde-images.md) add Plasma; a desktop of your own is built the same way, and everything on this page applies to all of them unchanged.
 
 ## What is in the image
 
 | Part | What it is |
 | --- | --- |
-| X11 backend | [XLibre](https://github.com/X11Libre/xserver)'s `Xvfb`, built from a release archive pinned by checksum with the two patches under `addons/base/patches`: the screen pixmap lives on the GPU so glamor renders and DRI3 presents there, and the server starts with spare outputs Selkies plugs a second display into |
+| X11 backend | [XLibre](https://github.com/X11Libre/xserver)'s `Xvfb`, built from a release archive pinned by checksum with the five patches under `addons/base/patches`: the screen pixmap lives on the GPU so glamor renders and DRI3 presents there, the server starts with spare outputs Selkies plugs a second display into, a DRI3 client can synchronize its presents explicitly, the vblank the server fakes runs at the rate the session is captured at, and the capture's blit signals a GPU semaphore the encoder waits on |
 | Wayland backend | Selkies' own headless capture compositor, and a nested [labwc](https://labwc.github.io) session compositor built from source with `addons/base/build-labwc.sh` (window management, decorations, XWayland, and a control socket a second screen is asked over) |
-| Audio | PipeWire, WirePlumber and `pipewire-pulse`, which `pcmflux` captures from and the microphone plays into |
-| GPU runtime | NVIDIA's EGL platform libraries for GBM, Wayland and X11 (`egl-x11`, pinned by checksum), Mesa with Zink, the VA-API and Vulkan loaders, and `selkies-gpu-probe`, which measures what the session can render on |
+| Audio | PipeWire, WirePlumber, and `pipewire-pulse`, which `pcmflux` captures from and the microphone plays into; a PulseAudio client that leaves its buffer size to the server gets a 40 ms target (`addons/base/pipewire-pulse.conf.d`) rather than pipewire-pulse's 2 s |
+| GPU runtime | NVIDIA's EGL platform libraries for GBM, Wayland, and X11 (`egl-x11`, pinned by checksum), Mesa with Zink, the VA-API and Vulkan loaders, and `selkies-gpu-probe`, which measures what the session can render on |
 | Printing | A CUPS scheduler Selkies runs its own print queue on, so a document printed in the session reaches the browser |
 | Supervision | The [s6](https://skarnet.org/software/s6/) supervision suite from the distribution's packages, one service directory per daemon under `/etc/service` |
 | TURN | An embedded [coTURN](turn.md#coturn) for the WebRTC transport, started only when no external TURN server is configured |
-| Selkies | The `selkies` wheel with `pixelflux` and `pcmflux`, the [Input Interposer](input-interposer.md), [fake-udev](input-interposer.md#fake-udev) and the [V4L2 Interposer](v4l2-interposer.md) built from source, and `selkies-privileged-files` |
+| Selkies | The `selkies` wheel with `pixelflux` and `pcmflux`, the [Input Interposer](input-interposer.md), [fake-udev](input-interposer.md#fake-udev), and the [V4L2 Interposer](v4l2-interposer.md) built from source, and `selkies-privileged-files` |
 
 The image is built for Ubuntu 26.04 and Debian Trixie, on `x86_64` and `aarch64`, and is rootless: every layer runs as uid 1000 through `fakeroot`, so the package database and apt cache belong to the session user and `sudo apt-get install` works inside a running session the same way. `sudo-root` is the real thing, for device nodes and permissions only. The setuid and setgid files (`mount`, `su`, `sudo`, `fusermount3`, the PAM helpers) belong to root, which is what the privileged-file bracket below is for.
 
@@ -25,7 +25,7 @@ The image is built for Ubuntu 26.04 and Debian Trixie, on `x86_64` and `aarch64`
 `/etc/container-entrypoint.sh` is the image's entrypoint. It is PID-agnostic: it can be PID 1 (add `docker run --init` for zombie reaping) or run below an injected init or launcher, since it ends by launching `s6-svscan /etc/service` itself rather than expecting to be the init. In order, it:
 
 1. Creates `XDG_RUNTIME_DIR` (`/tmp/runtime-ubuntu`) with the `0700` mode dbus and PipeWire require, sets the time zone from `TZ` and the account password from `PASSWD`, and creates the XDG directories a desktop menu watches so the first application installed into the home appears in it.
-2. Wires the gamepad and webcam plumbing for the session's applications: `SELKIES_INTERPOSER`, `SELKIES_WEBCAM_INTERPOSER` and `FAKE_UDEV_LIB` go into `LD_PRELOAD`, and `/dev/input` is created where the container has none of its own.
+2. Wires the gamepad and webcam plumbing for the session's applications: `SELKIES_INTERPOSER`, `SELKIES_WEBCAM_INTERPOSER`, and `FAKE_UDEV_LIB` go into `LD_PRELOAD`, and `/dev/input` is created where the container has none of its own.
 3. Reads the backend (`SELKIES_WAYLAND`) and the transport (`SELKIES_MODE`) the way `settings.py` reads them, so the service set and Selkies agree.
 4. Runs `selkies-gpu-probe`, which resolves the render node from `SELKIES_RENDER_DRI` or the `SELKIES_AUTO_GPU` token exactly as the capture will and brings the compositor's renderer up on it. From that one report the entrypoint settles hardware OpenGL for the session's applications (the vendor's GLX and EGL on NVIDIA, Mesa's own driver elsewhere, Zink on the Vulkan driver where Mesa itself does not reach the GPU, `DISABLE_ZINK=true` to opt out) and whether a Wayland session can keep its backend: a compositor that cannot reach the GPU starts the X11 backend instead unless `SELKIES_WAYLAND_X11_FALLBACK=false`. `docker exec <container> selkies-gpu-probe` asks it the same question later.
 5. Sets the display (`DISPLAY=:20` on X11; the nested compositor's XWayland takes the first free number on Wayland), the PipeWire latency and the PulseAudio socket, and the print queue's socket.
@@ -48,7 +48,7 @@ The services under `/etc/service` are, each a `run` script and a `finish` script
 
 `s6-svc` and `s6-svstat` control and inspect them, the `supervisorctl` equivalents (`s6-svc -r /etc/service/selkies` restarts Selkies). `s6-overlay` is deliberately not used: it insists on being PID 1, while plain `s6-svscan` works both as PID 1 and below any foreign init.
 
-`/etc/selkies-entrypoint.sh` is the Selkies service. It sources the environment file, drops the interposers from its own `LD_PRELOAD` by value (they answer for `/dev/video0` and `/dev/input` in whatever process loads them, which the capture and gamepad backends must keep seeing as the kernel reports them; an operator-supplied preload survives), waits for the X socket on the X11 backend, and starts `selkies`, whose every setting comes from the `SELKIES_*` variables of the environment ([Settings Reference](../settings.md)).
+`/etc/selkies-entrypoint.sh` is the Selkies service. It sources the environment file, drops the interposers from its own `LD_PRELOAD` by value (they answer for `/dev/video0` and `/dev/input` in whatever process loads them, which the capture and gamepad backends must keep seeing as the kernel reports them; an operator-supplied preload survives), waits for the X socket on the X11 backend and presets the display's size, and starts `selkies`, whose every setting comes from the `SELKIES_*` variables of the environment ([Settings Reference](../settings.md)). The preset is the size a manual resolution locks the stream to, as `settings.py` resolves it from those variables and the command line, else `DISPLAY_SIZEW` by `DISPLAY_SIZEH` (1920x1080 unless set); a display already that size keeps the mode its X server came up in, and dynamic resizing replaces it with the client's own size once one connects.
 
 ## Layout
 
@@ -59,8 +59,8 @@ The services under `/etc/service` are, each a `run` script and a `finish` script
 | `/tmp/runtime-ubuntu` (`XDG_RUNTIME_DIR`) | The session's sockets, the environment file, the print queue's socket, the logs the services write |
 | `selkies`, `selkies-gpu-probe`, `selkies-resize` | The console scripts of the wheel: the server, the GPU report, and the resize helper for a session with `--enable-resize=false` |
 | `/usr/local/bin/selkies-privileged-files` | The setuid bracket for package layers, and the `sudo-root ... run` path for in-session package management |
-| `/usr/$LIB/selkies_input_interposer.so`, `selkies_v4l2_interposer.so`, `libudev.so.1.0.0-fake` | The preloads the session's applications get, exported as `SELKIES_INTERPOSER`, `SELKIES_WEBCAM_INTERPOSER` and `FAKE_UDEV_LIB` |
-| `/home/ubuntu` | The session user's home, uid 1000; mount a volume there to keep settings, downloads and installed applications |
+| `/usr/$LIB/selkies_input_interposer.so`, `selkies_v4l2_interposer.so`, `libudev.so.1.0.0-fake` | The preloads the session's applications get, exported as `SELKIES_INTERPOSER`, `SELKIES_WEBCAM_INTERPOSER`, and `FAKE_UDEV_LIB` |
+| `/home/ubuntu` | The session user's home, uid 1000; mount a volume there to keep settings, downloads, and installed applications |
 
 ## Running a checkout inside it
 
@@ -76,7 +76,7 @@ The repository's [`docker-compose.yml`](https://github.com/selkies-project/selki
 
 ## Building a desktop on it
 
-Use the base as the `FROM` image and add only the desktop: its packages, its session defaults, and the s6 service its session needs, one `run` script under `/etc/service/<name>/`. [`addons/desktop/Dockerfile`](https://github.com/selkies-project/selkies/tree/main/addons/desktop/Dockerfile) is the reference, adding LXQt, the browsers and the proot-apps runner in that way, and the [KDE Plasma desktops](kde-images.md) are the same pattern in their own repositories. Keep the base's entrypoint and services as they are; a desktop that needs the entrypoint changed replaces the script alone, so it keeps up with the base's updates:
+Use the base as the `FROM` image and add only the desktop: its packages, its session defaults, and the s6 service its session needs, one `run` script under `/etc/service/<name>/`. [`addons/desktop/Dockerfile`](https://github.com/selkies-project/selkies/tree/main/addons/desktop/Dockerfile) is the reference, adding LXQt, the browsers, and the proot-apps runner in that way, and the [KDE Plasma desktops](kde-images.md) are the same pattern in their own repositories. Keep the base's entrypoint and services as they are; a desktop that needs the entrypoint changed replaces the script alone, so it keeps up with the base's updates:
 
 ```dockerfile
 ARG DISTRIB_FLAVOR=ubuntu26.04

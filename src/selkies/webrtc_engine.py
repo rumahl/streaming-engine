@@ -77,6 +77,7 @@ from .settings import (
 from . import audit
 from . import capture_demand
 from . import stream_stats
+from .stream_server import ConnectionVerdict
 from .ice import TcpMux, UdpMux
 from .ice.ice import get_host_addresses
 from .webcam import CODEC_BY_NAME, get_shared_webcam, webcam_locked_off, webcam_uplink_allowed
@@ -103,10 +104,11 @@ from .webrtc.codecs.base import EncodedPacket
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 from .webrtc.contrib.relay import MediaRelay
 from enum import Enum
-from .display_utils import LOST_FRAME_MEMORY
+from .display_utils import FRAME_NUM_WRAP, LOST_FRAME_MEMORY, CommonFrames
 from .webrtc_media_pipeline import MediaPipeline
 from .input_handler import (
     BULK_DRAIN_TIMEOUT_S,
+    SecretText,
     gamepad_slot_denied,
     VIEWER_ALLOWED_PREFIXES,
     VIEWER_COLLAB_EXTRA_PREFIXES,
@@ -146,6 +148,9 @@ def parse_webrtc_port_range(raw: str) -> Optional[Tuple[int, int]]:
 # The codec whose 4:4:4 an encoder's stream carries when full color is on; the others encode
 # 4:2:0 whatever is asked.
 FULLCOLOR_CODECS = {"h264enc": "h264", "h264enc-striped": "h264", "h265enc": "h265", "vp9enc": "vp9"}
+# The codec whose 10-bit profile an encoder's stream carries when 10-bit is on; the others
+# encode 8 bits whatever is asked.
+TEN_BIT_CODECS = {"h264enc": "h264", "h265enc": "h265", "vp9enc": "vp9", "av1enc": "av1"}
 
 logger = logging.getLogger("webrtc")
 
@@ -201,6 +206,12 @@ IDR_REQUEST_FLOOR_S = 0.25
 # own, so an encoder that ignores requests degrades to a smear rather than
 # a dead stream.
 GATE_TIMEOUT_S = 1.0
+# Frames without an encode instant a bridge holds back, predicting from one it
+# let go, before it takes the encoder for one that never predicted past the drop.
+LOST_CHAIN_FRAMES = 3
+# How far past its display's steered rate a video bridge lets frames run, in
+# seconds of that rate, before it drops delta frames (`PipelineBridge.set_budget`).
+BUDGET_WINDOW_S = 0.25
 
 
 async def drain_data_channel(channel: RTCDataChannel,
@@ -280,6 +291,19 @@ class RTCAppError(Exception):
     """Raised for unrecoverable errors in the RTC signaling/pipeline layer."""
     pass
 
+
+def _frame_bytes(item: Any) -> int:
+    """The encoded size of a bridge item, 0 for one carrying no buffer."""
+    data = getattr(item, "data", None)
+    return memoryview(data).nbytes if data is not None else 0
+
+
+def _encode_start(timing: Optional[tuple]) -> Optional[float]:
+    """When a frame's encode began, in seconds on CLOCK_MONOTONIC, or None for a
+    frame the capture stamped no encode instant on."""
+    return timing[1] / 1e9 if timing and len(timing) > 1 and timing[1] > 0 else None
+
+
 class PipelineBridge:
     """A bridge to asynchronously pass data between Media and the RTC pipeline.
 
@@ -294,11 +318,40 @@ class PipelineBridge:
     websockets relay does. A frame that names what it predicts from is
     dropped with a word to the encoder (`invalidate_reference`), which then
     predicts past it, and only the frames predicting from a dropped one are
-    held back, so the stream resumes on the next frame without a keyframe. A
+    held back, so the stream resumes on the next frame without a keyframe.
+    The ids let go are forgotten once a frame the encoder began after the
+    latest word goes out: frames reach the bridge in encode order, so nothing
+    coded before the word can follow it, while an id recurs every 65536
+    frames, which an infinite GOP outlasts. A
+    second frame held back that way although its encode began after the word
+    went out says the encoder never heard it (a word sent while the capture is
+    still starting is lost) and will keep predicting from what the bridge let
+    go, so a keyframe is asked for, as for a closed gate, until one arrives.
+    The first such frame proves nothing, since the encoder reads its words
+    just before it stamps an encode, and the frames it coded before the word
+    are held without one however far the loop lags. A frame without an encode
+    instant counts instead, past LOST_CHAIN_FRAMES in a row. A
     frame that names nothing closes a gate that holds delta frames back, a
     keyframe is asked for until one arrives and reopens it, and a queued
     keyframe is never evicted by a delta frame. A gate no keyframe answers
     within GATE_TIMEOUT_S reopens on its own.
+
+    A bridge given its display's steered rate (`set_budget`) also holds the
+    stream to it. An encoder meets a rate by coarser quantizers, down to the
+    coarsest it has, and content the coarsest cannot fit (noise, film grain)
+    overshoots, which a path sized for the rate queues and loses, and
+    whatever repairs the loss adds more. The frames let through fill a bucket
+    that drains at the rate, and while it holds more than BUDGET_WINDOW_S of
+    the rate a delta frame that names what it predicts from is dropped with
+    the word to the encoder, so the frame rate falls instead of the latency
+    rising. Keyframes pass uncharged: charged, a large one would drop the
+    delta frames behind it for as long as it takes on a slow path. Neither is
+    a frame FRAME_NUM_WRAP frames or a multiple of it past a keyframe dropped:
+    an H.264 decoder that misses the frame whose frame_num wraps to 0 cannot
+    be predicted past the gap, so the encoder answers such a drop with a
+    keyframe. Queued, such an H.264 frame, and the one after a keyframe, which
+    an encoder keeping two long-term references marks into the second, is not
+    let go for a newer frame either: the newer one is, as behind a keyframe.
     """
     def __init__(self, maxsize: int = 1,
                  request_keyframe: Optional[Callable[[], None]] = None,
@@ -336,8 +389,46 @@ class PipelineBridge:
         self._last_request: Optional[float] = None
         # Frame ids dropped recently, which nothing delivered may predict from.
         self._lost: deque = deque(maxlen=LOST_FRAME_MEMORY)
+        # When the encoder was last told of a drop, on the clock the capture stamps
+        # encode instants with, and the frames held since then that it coded after
+        # that or that carry no encode instant.
+        self._told_at: Optional[float] = None
+        self._held = 0
         self.dropped = 0
         self.invalidated = 0
+        self._budget_bps: Optional[float] = None
+        self._budget_bytes = 0.0
+        self._budget_at = 0.0
+        self.over_budget = 0
+        # Frames the encoder coded since the last keyframe, as they arrive.
+        self._since_key = 0
+
+    def set_budget(self, bps: Optional[float]) -> None:
+        """Hold the frames let through to `bps`, the display's steered rate;
+        None lets every frame through."""
+        if not bps:
+            self._budget_bps = None
+            self._budget_bytes = 0.0
+            return
+        if self._budget_bps is None:
+            self._budget_at = self._clock()
+        self._budget_bps = float(bps)
+
+    def _budget_level(self) -> float:
+        """The bytes the frames let through still stand at, drained to now."""
+        now = self._clock()
+        self._budget_bytes = max(0.0, self._budget_bytes - (now - self._budget_at) * self._budget_bps / 8.0)
+        self._budget_at = now
+        return self._budget_bytes
+
+    def _budget_full(self) -> bool:
+        """Whether the frames let through stand past BUDGET_WINDOW_S of the rate."""
+        return (self._budget_bps is not None
+                and self._budget_level() > self._budget_bps / 8.0 * BUDGET_WINDOW_S)
+
+    def _charge(self, item: Any) -> None:
+        if self._budget_bps is not None:
+            self._budget_bytes = self._budget_level() + _frame_bytes(item)
 
     def set_data(self, data: Any, keyframe: bool = True) -> None:
         """Enqueue an item, dropping the oldest one when the queue is full.
@@ -368,13 +459,21 @@ class PipelineBridge:
             self._queued_keyframe = True
             self._gated_at = None
             self._lost.clear()
+            self._held = 0
+            self._since_key = 0
             return
+        self._since_key += 1
         dependency = data.dependency if self._invalidate is not None else None
         if dependency is not None:
             frame_id, reference = dependency
             if reference in self._lost:
-                self._lost.append(frame_id)
-                self.dropped += 1
+                self._hold(frame_id, getattr(data, "timing", None))
+                return
+            kept = (str(getattr(data, "codec", "") or "").lower() == "video/h264"
+                    and (self._since_key == 1 or not self._since_key % FRAME_NUM_WRAP))
+            if self._since_key % FRAME_NUM_WRAP and not kept and self._budget_full():
+                self.over_budget += 1
+                self._drop(data)
                 return
             if queue.full():
                 if self._queued_keyframe:
@@ -382,11 +481,16 @@ class PipelineBridge:
                     return
                 self._drop(queue.get_nowait())
                 if reference in self._lost:
-                    self._lost.append(frame_id)
-                    self.dropped += 1
+                    self._hold(frame_id, getattr(data, "timing", None))
                     return
             queue.put_nowait(data)
-            self._queued_keyframe = False
+            self._charge(data)
+            self._queued_keyframe = kept
+            self._held = 0
+            if self._lost and self._told_at is not None:
+                encoded = _encode_start(getattr(data, "timing", None))
+                if encoded is not None and encoded > self._told_at:
+                    self._lost.clear()
             return
         now = self._clock()
         if self._gated_at is not None:
@@ -418,8 +522,27 @@ class PipelineBridge:
         """Let a frame go and tell the encoder, so nothing later predicts from it."""
         self.dropped += 1
         self.invalidated += 1
+        self._held = 0
+        self._told_at = self._clock()
         self._lost.append(item.dependency[0])
         self._invalidate(item.dependency[0])
+
+    def _hold(self, frame_id: int, timing: Optional[tuple]) -> None:
+        """Hold back a frame predicting from one already let go, and ask for a
+        keyframe when the encoder coded it after it was told of the drop."""
+        self.dropped += 1
+        self._lost.append(frame_id)
+        encoded = _encode_start(timing)
+        if encoded is None:
+            self._held += 1
+            unheard = self._held > LOST_CHAIN_FRAMES
+        elif self._told_at is not None and encoded > self._told_at:
+            self._held += 1
+            unheard = self._held > 1
+        else:
+            unheard = False
+        if unheard:
+            self._ask(self._clock())
 
     def empty(self) -> bool:
         return self._queue.empty()
@@ -497,6 +620,11 @@ class RTCApp:
             peer's offer when the peer's hello names no 4:4:4 for the
             display's codec while the display emits it; returns whether full
             color went off for the display.
+        get_ten_bit_for_display: Whether a display is asked for 10-bit samples,
+            resolved at offer time like its full color.
+        on_ten_bit_declined: Async hook `(display_id)` called before a peer's
+            offer when the peer's hello names no 10-bit decode of the format the
+            display emits; returns whether 10-bit went off for the display.
         get_use_cpu_for_display: Whether a display forces software encoding,
             resolved at offer time like the encoder; with it decides whether a
             4:4:4 profile may be advertised.
@@ -504,7 +632,7 @@ class RTCApp:
             greetings (settings, current cursor) reach the joining peer.
         on_data_close: Data channel closed.
         on_data_error: Data channel error.
-        on_data_message: Input dispatcher, called with the message, display id
+        on_data_message: Input dispatcher, called with the message, display id,
             and the peer id as `conn_id`.
         on_peer_gone: Async hook called as `(peer_id, peer_entry)` when a peer
             reaches closed: the id releases per-connection input state
@@ -514,13 +642,23 @@ class RTCApp:
         on_sdp: SDP offer to send over signaling.
         request_idr_frame: Async keyframe request for a display.
         invalidate_reference: Tells a display's encoder a peer lost a frame,
-            so the frames after it stop predicting from it.
+            or its video bridge dropped one (`dropped`), so the frames after
+            it stop predicting from it.
+        acknowledge_reference: Tells a display's encoder every peer holds a
+            frame, or where not `held` was sent it (`CommonFrames`, per display
+            and level in `common_frames`).
         on_video_consumer_active: Per-peer video pause (tab-hide STOP_VIDEO /
             START_VIDEO), display-scoped; left None the verbs fall through to
             the input dispatcher, which ignores them.
         on_audio_consumer_active: Per-peer audio pause (the side menu's
             STOP_AUDIO / START_AUDIO); left None the verbs are dropped.
-        on_consumers_changed: A display's consumer set changed (join, close).
+        on_consumers_changed: A display's consumer set changed (join, close,
+            or a peer's audio settling on the surround or stereo stream).
+        on_stats_open: A controller's page opened its stats, called with its
+            display id so the first figures need not wait for the next period.
+        on_frame_sent: A frame of a display is on the wire to its controller,
+            called with the display id, the frame's capture instant, and its
+            payload bytes once its last packet leaves the pacer.
         provision_virtual_mic: Brings up the shared SelkiesVirtualMic (null
             sinks, module-virtual-source, default source) before a mic
             playback opens its `input` stream, so an app recording the default
@@ -554,6 +692,8 @@ class RTCApp:
         self.get_use_cpu_for_display = lambda display_id: bool(app_settings.use_cpu[0])
         self.on_video_codec_declined = None
         self.on_fullcolor_declined = None
+        self.get_ten_bit_for_display = lambda display_id: bool(app_settings.video_10bit[0])
+        self.on_ten_bit_declined = None
 
         self.on_data_open = lambda channel=None: logger.warning('unhandled on_data_open')
         self.on_data_close = lambda: logger.warning('unhandled on_data_close')
@@ -565,11 +705,20 @@ class RTCApp:
         self.on_sdp = lambda sdp_type, sdp, client_peer_id: logger.warning('unhandled sdp event')
 
         self.request_idr_frame = lambda display_id='primary': logger.warning('unhandled request_idr_frame')
-        self.invalidate_reference = lambda display_id, frame_id: logger.warning('unhandled invalidate_reference')
+        self.invalidate_reference = lambda display_id, frame_id, dropped=False: logger.warning('unhandled invalidate_reference')
+        self.acknowledge_reference: Callable[..., None] = lambda display_id, frame_id, held=True: None
+        self.common_frames: Dict[Tuple[str, bool], CommonFrames] = {}
+        # Whether a peer is its display's owner (a predicate on the peer id): a peer that is
+        # not, a viewer or a controller beside the owner, has its keyframe requests and lost
+        # frames taken at most once a second each, since they cost the owner's stream.
+        self.peer_owns_display: Callable[[str], bool] = lambda client_peer_id: True
+        self._peer_recovery_times: Dict[Tuple[str, str], float] = {}
 
         self.on_video_consumer_active = None
         self.on_audio_consumer_active = None
         self.on_consumers_changed = None
+        self.on_stats_open = None
+        self.on_frame_sent = None
 
         self.provision_virtual_mic = None
 
@@ -610,6 +759,7 @@ class RTCApp:
         desc = RTCSessionDescription(sdp=sdp, type=sdp_type)
         await peer_conn.setRemoteDescription(desc)
         await self._settle_video_codec(client_peer_id, peer_obj)
+        await self._settle_audio_codec(client_peer_id, peer_obj)
 
     async def set_ice(self, ice: Dict, client_peer_id: str) -> None:
         """Add an ICE candidate received from the signaling server.
@@ -676,7 +826,19 @@ class RTCApp:
         and shared by every channel; an entry is dropped once the slowest
         channel has passed it, so the cache holds what is in flight, not the
         whole payload. An empty payload is sent only as a tagged reply,
-        settling a client fetch against an empty server clipboard.
+        settling a client fetch against an empty server clipboard. Every
+        payload, one message or many, takes its turn on a channel, and a newer
+        announcement supersedes an older one still queued or in flight there,
+        which then gets no further chunks: the clipboard is last-value-wins, and
+        a small copy made during a large transfer would otherwise reach the
+        client first and be overwritten when the older payload completes. A
+        tagged reply is neither superseded nor supersedes, since its payload is
+        only cached and never pasted. Text its owner marked secret
+        (`SecretText`) carries `secret` on its clipboard-msg or
+        clipboard-msg-start payload, so clients keep it out of sight and take
+        it back off the local clipboard; an empty one, sent like any other
+        announcement, says the session's clipboard no longer holds the secret
+        sent before it.
 
         Args:
             data: Clipboard payload; str is UTF-8 encoded before sending.
@@ -692,9 +854,13 @@ class RTCApp:
                 `send_system_action` addresses a requester: the other peers
                 already hold the content, and a reply they did not ask for is
                 read as their own fetch and cached rather than pasted. A
-                requester whose channel has closed receives nothing.
+                requester whose channel has closed receives nothing. An
+                announcement goes to the controllers alone: a viewer's page
+                never takes the session's clipboard, so a copy made there has
+                no business on a viewer's channel.
         """
-        if not data and not reply_to:
+        secret = isinstance(data, SecretText)
+        if not data and not reply_to and not secret:
             return
 
         is_text = mime_type == "text/plain"
@@ -707,15 +873,28 @@ class RTCApp:
             if channel is None or channel.readyState != "open":
                 return
             requester = channel
-        if data_bytes and (requester is not None
-                           or next(self._iter_open_data_channels(), None) is not None):
+        channels = ([requester] if requester is not None
+                    else [channel for _did, channel in self._controller_channels()])
+        if data_bytes and channels:
             audit.emit("clipboard.send", mime_type=mime_type, size_bytes=len(data_bytes))
 
-        def send_typed(msg_type: str, payload: Any) -> None:
-            if requester is not None:
-                self.send_message_to_channel(requester, msg_type, payload)
-            else:
-                self.__send_data_channel_message(msg_type, payload)
+        # One payload at a time per channel: start/data/end carry no transfer
+        # id, so a send racing another would interleave two payloads' chunks
+        # into one assembly.
+        locks = self.__dict__.setdefault("_clipboard_send_locks", {})
+        latest = self.__dict__.setdefault("_clipboard_send_latest", {})
+        live = {id(c) for c in self._iter_open_data_channels()}
+        live.update(id(c) for c in channels)
+        for table in (locks, latest):
+            for gone in [k for k in table if k not in live]:
+                del table[gone]
+        announcement = object()
+        if not reply_to:
+            for c in channels:
+                latest[id(c)] = announcement
+
+        def superseded(channel: Any) -> bool:
+            return not reply_to and latest.get(id(channel)) is not announcement
 
         if len(data_bytes) <= clipboard_chunk_size:
             b64data = base64.b64encode(data_bytes).decode('utf-8')
@@ -727,7 +906,15 @@ class RTCApp:
             }
             if reply_to:
                 payload["reply_to"] = reply_to
-            send_typed("clipboard-msg", payload)
+            if secret:
+                payload["secret"] = True
+
+            async def deliver_whole(channel: Any) -> None:
+                async with locks.setdefault(id(channel), asyncio.Lock()):
+                    if not superseded(channel):
+                        self.send_message_to_channel(channel, "clipboard-msg", payload)
+
+            await asyncio.gather(*(deliver_whole(c) for c in channels), return_exceptions=True)
         else:
             start_payload = {
                 "mime_type": mime_type,
@@ -736,16 +923,8 @@ class RTCApp:
             }
             if reply_to:
                 start_payload["reply_to"] = reply_to
-            channels = ([requester] if requester is not None
-                        else list(self._iter_open_data_channels()))
-            # One payload at a time per channel: start/data/end carry no
-            # transfer id, so a send racing another would interleave two
-            # payloads' chunks into one assembly.
-            locks = self.__dict__.setdefault("_clipboard_send_locks", {})
-            live = {id(c) for c in self._iter_open_data_channels()}
-            live.update(id(c) for c in channels)
-            for gone in [k for k in locks if k not in live]:
-                del locks[gone]
+            if secret:
+                start_payload["secret"] = True
             offsets = list(range(0, len(data_bytes), clipboard_chunk_size))
             prepared: dict = {}
             prepare_lock = asyncio.Lock()
@@ -775,9 +954,12 @@ class RTCApp:
             async def deliver(channel: Any) -> None:
                 want_gz = bool(getattr(channel, "_selkies_gz_tx", False))
                 async with locks.setdefault(id(channel), asyncio.Lock()):
+                    if superseded(channel):
+                        progress.pop(id(channel), None)
+                        return
                     self.send_message_to_channel(channel, "clipboard-msg-start", start_payload)
                     for offset in offsets:
-                        if channel.readyState != "open":
+                        if channel.readyState != "open" or superseded(channel):
                             progress.pop(id(channel), None)
                             return
                         payload, gz_payload = await chunk_for(offset, want_gz)
@@ -794,7 +976,8 @@ class RTCApp:
 
             await asyncio.gather(*(deliver(c) for c in channels), return_exceptions=True)
 
-        logger.debug(f"Sent clipboard data of length {len(data_bytes)} with mime type {mime_type}")
+        size = "a secret" if secret else f"{len(data_bytes)} bytes"
+        logger.debug(f"Sent clipboard data ({mime_type}, {size})")
 
     def send_cursor_data(self, data: Any) -> None:
         """Broadcast a cursor update, remembering it for late-joining peers."""
@@ -835,18 +1018,27 @@ class RTCApp:
         for ch in channels:
             self.send_message_to_channel(ch, "stream_info", info)
 
+    def send_cc_rate(self, display_id: str, kbps: int) -> None:
+        """Tell a display's controllers the rate congestion control has held it
+        at, which each page keeps to start its next stream there (`RateHold`)."""
+        for _, channel in self._controller_channels(display_id):
+            self.send_message_to_channel(channel, "cc_rate", {"kbps": kbps})
+
     def send_stream_stats(self, display_id: str, stats: Dict[str, Any]) -> None:
         """Send one second's figures to the display's controllers watching them."""
         for _, channel in self._controller_channels(display_id, subscribed=True):
             self.send_message_to_channel(channel, "stream_stats", stats)
 
-    def send_system_action(self, action: str, peer_id: Optional[str] = None) -> None:
+    def send_system_action(self, action: str, peer_id: Optional[str] = None,
+                           only: bool = False) -> None:
         """Send a system action (e.g. ``command_error,<text>``) to clients.
 
         With a `peer_id` whose channel is still open, only that peer is
         addressed (requester-scoped feedback); otherwise — including a
         requester that reconnected under a new peer id — the action is
-        broadcast, and shared-mode viewers suppress it client-side.
+        broadcast, and shared-mode viewers suppress it client-side. `only`
+        drops it instead of broadcasting, for an action that means something
+        to that peer alone.
         """
         if peer_id is not None:
             peer_obj = self.peer_connections.get(peer_id)
@@ -854,6 +1046,8 @@ class RTCApp:
             if channel is not None and channel.readyState == "open":
                 self.send_message_to_channel(channel, "system", {"action": action})
                 return
+        if only:
+            return
         self.__send_data_channel_message("system", {"action": action})
 
     def send_print_document(self, name: str, size: int,
@@ -1120,13 +1314,14 @@ class RTCApp:
 
     def munge_sdp(self, sdp: str, encoder: Optional[str] = None,
                   fullcolor: Optional[bool] = None,
-                  use_cpu: Optional[bool] = None) -> str:
+                  use_cpu: Optional[bool] = None,
+                  ten_bit: bool = False) -> str:
         """Rewrite the local offer SDP for optimal streaming behavior.
 
         Injects a 125 ms rtx-time, `sps-pps-idr-in-keyframe=1` for H.264/H.265,
         the Opus ptime, and generous video bandwidth ceilings
         (`_munge_video_bandwidth`). Displays can run different encoders,
-        chroma formats and software-encoding flags; the caller passes the ones
+        chroma formats, and software-encoding flags; the caller passes the ones
         this offer's display is using (defaults: the primary/global encoder and
         the configured full-color and software-encoding settings).
 
@@ -1141,7 +1336,10 @@ class RTCApp:
         4:4:4 profile makes decoders misread its color range (visibly darker
         output). A full-color VP9 display offers profile 1, the 4:4:4 profile,
         in place of profile 0; the client asks for full color only where its
-        receiver takes that profile.
+        receiver takes that profile. A 10-bit display offers the 10-bit profile of
+        its codec the same way: VP9 profile 2, or 3 at 4:4:4, H.265 Main 10 in
+        place of Main, and H.264 High 10 (`6e001f`); AV1's main profile carries
+        both depths.
 
         The Opus ptime advertises the real frame duration pcmflux emits
         (`audio_frame_duration_ms`) so the client keys its minptime munge off
@@ -1154,6 +1352,7 @@ class RTCApp:
                 the configured setting.
             use_cpu: Whether the display forces software encoding; None reads
                 the configured setting.
+            ten_bit: Whether the display emits a 10-bit bitstream.
 
         Returns:
             The munged SDP text.
@@ -1188,8 +1387,13 @@ class RTCApp:
                 if ("h264" in encoder or "x264" in encoder) and fullcolor \
                         and not (software_path and software_encoders().get("h264") == "openh264"):
                     section = re.sub(r'profile-level-id=[0-9A-Fa-f]{6}', 'profile-level-id=f4001f', section)
-            if "vp9" in encoder and fullcolor:
-                section = re.sub(r'\bprofile-id=0\b', 'profile-id=1', section)
+            if "vp9" in encoder and (fullcolor or ten_bit):
+                profile = (1 if fullcolor else 0) + (2 if ten_bit else 0)
+                section = re.sub(r'\bprofile-id=0\b', f'profile-id={profile}', section)
+            if "h265" in encoder and ten_bit and not fullcolor:
+                section = re.sub(r'\bprofile-id=1\b', 'profile-id=2', section)
+            if ("h264" in encoder or "x264" in encoder) and ten_bit and not fullcolor:
+                section = re.sub(r'profile-level-id=[0-9A-Fa-f]{6}', 'profile-level-id=6e001f', section)
             sections[i] = section
         sdp_text = ''.join(sections)
         if "opus/" in sdp_text.lower():
@@ -1284,10 +1488,19 @@ class RTCApp:
 
         return "\r\n".join(out)
 
+    def set_video_budget(self, display_id: str, bps: Optional[float]) -> None:
+        """Hold a display's video to the rate congestion control steered it to, or
+        lift the hold (None); see `PipelineBridge.set_budget`."""
+        graph = self.displays.get(display_id or "primary")
+        bridge = graph.get("video_bridge") if graph else None
+        if bridge is not None:
+            bridge.set_budget(bps)
+
     def consume_data(self, buf: Any, pts: Optional[int], kind: str,
                      keyframe: bool = True, display_id: str = "primary",
                      timing: Optional[tuple] = None,
-                     dependency: Optional[tuple] = None) -> None:
+                     dependency: Optional[tuple] = None,
+                     codec: Optional[str] = None, anchor: bool = False) -> None:
         """Feed one encoded frame from the capture side into a display's bridge.
 
         Synchronous: scheduled via `loop.call_soon_threadsafe` from the capture
@@ -1308,6 +1521,10 @@ class RTCApp:
             dependency: The frame's id and the id of the frame it predicts
                 from, where the encoder tracks them, for the dependency
                 descriptor and the bridge's drops.
+            codec: The MIME type of the codec that coded a video frame, which
+                a sender switched to another drops it for.
+            anchor: Whether a video delta frame is an anchor every peer can
+                decode (FRAME_ANCHOR).
         """
         graph = self.displays.get(display_id or "primary")
         if graph is None:
@@ -1316,17 +1533,18 @@ class RTCApp:
             if buf:
                 try:
                     RTP_VIDEO_CLOCK_RATE = 90000
-                    packet = EncodedPacket(buf, pts, Fraction(1, RTP_VIDEO_CLOCK_RATE), keyframe, timing, dependency)
+                    packet = EncodedPacket(buf, pts, Fraction(1, RTP_VIDEO_CLOCK_RATE), keyframe, timing, dependency,
+                                           codec, anchor)
                     bridge = graph.get("video_bridge")
                     if bridge is not None:
                         bridge.set_data(packet, keyframe)
                 except Exception as e:
                     logger.error(f"error processing video sample: {e}")
-        elif kind == "audio":
+        elif kind in ("audio", "audio_stereo"):
             if buf:
                 try:
                     packet = EncodedPacket(buf, pts, Fraction(1, 48000))
-                    bridge = graph.get("audio_bridge")
+                    bridge = graph.get("audio_bridge" if kind == "audio" else "audio_stereo_bridge")
                     if bridge is not None:
                         bridge.set_data(packet)
                 except Exception as e:
@@ -1655,6 +1873,50 @@ class RTCApp:
                      f"display '{display_id}' is held: it will paint nothing of this stream.")
         return True
 
+    async def _settle_ten_bit(self, client_peer_id: str, display_id: str, encoder: str,
+                              fullcolor: bool, tenbit_codecs: Optional[List[str]]) -> bool:
+        """Whether the offer to a peer may describe 10 bits.
+
+        The peer's hello named the formats it decodes at 10 bits, a codec name for
+        4:2:0 and the name with `444` after it for 4:4:4. When the format the
+        display emits is not among them, 10-bit goes off for the display through
+        `on_ten_bit_declined` before the offer is built, as full color does
+        (`_settle_fullcolor`); a peer that named none is taken at its word.
+
+        Args:
+            client_peer_id: The joining peer.
+            display_id: The display it joins.
+            encoder: The display's encoder.
+            fullcolor: Whether the display emits 4:4:4.
+            tenbit_codecs: The formats the peer decodes at 10 bits, or None.
+
+        Returns:
+            Whether the display emits 10 bits.
+        """
+        codec = TEN_BIT_CODECS.get(encoder)
+        if codec is None:
+            return False
+        try:
+            use_cpu = bool(self.get_use_cpu_for_display(display_id))
+        except Exception:
+            use_cpu = bool(app_settings.use_cpu[0])
+        if app_settings.encoder_ten_bit(encoder, use_cpu, fullcolor) is False:
+            return False
+        if tenbit_codecs is None or codec + ("444" if fullcolor else "") in tenbit_codecs:
+            return True
+        moved = False
+        if self.on_ten_bit_declined is not None:
+            try:
+                moved = bool(await self.on_ten_bit_declined(display_id))
+            except Exception:
+                logger.warning("on_ten_bit_declined failed", exc_info=True)
+        if moved:
+            logger.info(f"Peer {client_peer_id} decodes no 10-bit {codec}: display '{display_id}' streams 8-bit.")
+            return False
+        logger.error(f"Peer {client_peer_id} decodes no 10-bit {codec} and the 10-bit of "
+                     f"display '{display_id}' is held: it will paint nothing of this stream.")
+        return True
+
     async def _settle_video_codec(self, client_peer_id: str, peer_obj: Dict[str, Any]) -> None:
         """Take the video codec a peer's answer settled on.
 
@@ -1707,7 +1969,10 @@ class RTCApp:
         # Full color was settled for the codec offered; the one taken may carry a 4:4:4 this
         # peer decodes no better, so it is settled again before the display moves.
         if display_fullcolor:
-            await self._settle_fullcolor(client_peer_id, display_id, taken, fullcolor)
+            display_fullcolor = await self._settle_fullcolor(client_peer_id, display_id, taken, fullcolor)
+        if bool(self.get_ten_bit_for_display(display_id)):
+            await self._settle_ten_bit(client_peer_id, display_id, taken, display_fullcolor,
+                                       peer_obj.get("tenbit_codecs"))
         moved = False
         if self.on_video_codec_declined is not None:
             try:
@@ -1720,6 +1985,48 @@ class RTCApp:
             sender._enabled = False
             peer_obj["video_declined"] = wanted
             self._send_video_declined(peer_obj["data_channel"], client_peer_id)
+
+    async def _settle_audio_codec(self, client_peer_id: str, peer_obj: Dict[str, Any]) -> None:
+        """Take the audio codec a peer's answer settled on.
+
+        A surround session offers `multiopus` ahead of stereo RED and opus
+        (`configure_multiopus`), and a page whose engine decodes it takes it
+        (`takeMultiopus` in lib/webrtc.js) and receives the surround stream. A
+        page that answers with opus or RED is moved onto the stereo companion,
+        which the pipeline encodes while such a page receives audio
+        (`audio_layout`, read where the captures are settled); a sender reads
+        its track only once ICE and DTLS connect, so nothing of the surround
+        stream goes out under the stereo codec. A page whose answer holds no
+        Opus at all gets no audio, since one codec's bitstream must never be
+        packed as another's.
+        """
+        sender = peer_obj.get("audio_sender")
+        if sender is None:
+            return
+        transceiver = next(
+            (t for t in peer_obj["peer_conn"].getTransceivers() if t.sender is sender), None)
+        if transceiver is None or not transceiver._codecs:
+            return
+        taken = transceiver._codecs[0].mimeType.lower()
+        graph = self.displays.get(peer_obj.get("display_id") or "primary") or {}
+        if taken == "audio/multiopus":
+            peer_obj["audio_layout"] = "surround"
+        elif taken in ("audio/opus", "audio/red") and graph.get("audio_stereo_media") is not None:
+            peer_obj["audio_layout"] = "stereo"
+            first = sender.track
+            sender.replaceTrack(graph["relay"].subscribe(graph["audio_stereo_media"]))
+            if first is not None:
+                first.stop()
+        elif taken not in ("audio/opus", "audio/red"):
+            peer_obj["audio_declined"] = taken
+            sender._enabled = False
+            logger.error(f"Peer {client_peer_id} answered the audio with {taken}, which is not Opus: "
+                         "it gets no audio.")
+            return
+        else:
+            return
+        logger.info(f"Audio for peer {client_peer_id} negotiated {taken} ({peer_obj['audio_layout']}).")
+        await self._notify_consumers_changed("primary")
 
     def _send_video_declined(self, channel: RTCDataChannel, client_peer_id: str) -> None:
         """Tell a page that no video comes because its answer declined the codec
@@ -1980,7 +2287,10 @@ class RTCApp:
         if stats_wanted is not None:
             peer_obj = self.peer_connections.get(peer_id)
             if peer_obj is not None and client_type == ClientType.CONTROLLER:
+                opened = stats_wanted and not peer_obj.get("stats")
                 peer_obj["stats"] = stats_wanted
+                if opened and self.on_stats_open is not None:
+                    self.on_stats_open(peer_obj.get("display_id") or "primary")
             return
         if msg in ("STOP_AUDIO", "START_AUDIO"):
             # Per peer, so ahead of the viewer gate: the websockets verb is
@@ -2070,9 +2380,23 @@ class RTCApp:
         else:
             logger.debug(f"Unhandled peer connection state: {state}", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
 
+    def peer_recovery_taken(self, client_peer_id: str, kind: str) -> bool:
+        """Whether a peer's request to repair the stream (`kind`: a keyframe or a lost
+        frame) reaches its display's encoder: always from the display's owner, at most
+        once a second from any other peer (`peer_owns_display`)."""
+        if self.peer_owns_display(client_peer_id):
+            return True
+        now = time.monotonic()
+        if now - self._peer_recovery_times.get((client_peer_id, kind), 0.0) < 1.0:
+            return False
+        self._peer_recovery_times[(client_peer_id, kind)] = now
+        return True
+
     def on_pli(self, client_peer_id: str, client_type: str) -> None:
         """Translate a peer's RTP PLI into an IDR request for its display."""
         logger.debug("PLI occurred, triggering IDR frame request", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
+        if not self.peer_recovery_taken(client_peer_id, "keyframe"):
+            return
         peer_obj = self.peer_connections.get(client_peer_id) or {}
         display_id = peer_obj.get("display_id") or "primary"
         asyncio.run_coroutine_threadsafe(self.request_idr_frame(display_id), self.async_event_loop)
@@ -2080,8 +2404,49 @@ class RTCApp:
     def on_lost_frame(self, client_peer_id: str, frame_id: int) -> None:
         """A peer lost a frame past what retransmission recovered: its display's encoder
         leaves the frame out of every later prediction."""
+        if not self.peer_recovery_taken(client_peer_id, "lost"):
+            return
         peer_obj = self.peer_connections.get(client_peer_id) or {}
         self.invalidate_reference(peer_obj.get("display_id") or "primary", frame_id)
+
+    def common_frames_for(self, display_id: str, held: bool = True) -> CommonFrames:
+        """The frames every peer of the display holds, or where not `held` was sent
+        (`CommonFrames`)."""
+        common = self.common_frames.get((display_id, held))
+        if common is None:
+            common = self.common_frames[(display_id, held)] = CommonFrames(
+                lambda frame_id, did=display_id, h=held: self.acknowledge_reference(did, frame_id, h))
+        return common
+
+    def on_resync_frame(self, client_peer_id: str, frame_id: int, reach: bool) -> bool:
+        """A peer's sender left `frame_id` and the frames after it out (its link has
+        no room for them, or its pacer cut them): its display's encoder predicts past
+        them. The sender paces these itself; a run past the encoder's `reach`, which
+        may cost the shared stream a key frame, is taken as the peer's key-frame
+        requests are (`peer_recovery_taken`). False when refused."""
+        if not reach and not self.peer_recovery_taken(client_peer_id, "keyframe"):
+            return False
+        peer_obj = self.peer_connections.get(client_peer_id) or {}
+        self.invalidate_reference(peer_obj.get("display_id") or "primary", frame_id)
+        return True
+
+    def _note_connection(self, client_peer_id: str, frames: int, missed: int) -> None:
+        """Fold frames into a peer's connection verdict (`ConnectionVerdict`), with
+        those its display's bridge held back for the link's steered rate since the
+        last, and tell the page when the verdict changes."""
+        peer = self.peer_connections.get(client_peer_id)
+        if peer is None:
+            return
+        bridge = (self.displays.get(peer.get("display_id") or "primary") or {}).get("video_bridge")
+        if bridge is not None:
+            held = bridge.over_budget - peer.setdefault("over_budget_seen", bridge.over_budget)
+            peer["over_budget_seen"] = bridge.over_budget
+            frames += held
+            missed += held
+        poor = peer.setdefault("connection", ConnectionVerdict()).note(frames, missed, time.monotonic())
+        channel = peer.get("data_channel")
+        if poor is not None and channel is not None:
+            self.send_message_to_channel(channel, "connection", {"poor": poor})
 
     def _keyframe_request(self, display_id: str) -> Callable[[], None]:
         """Build the keyframe request of a display's video bridge.
@@ -2108,6 +2473,7 @@ class RTCApp:
         display_id: str = "primary",
         client_slot: Optional[int] = None,
         fullcolor_codecs: Optional[List[str]] = None,
+        tenbit_codecs: Optional[List[str]] = None,
     ) -> None:
         """Create a peer connection and send its offer over signaling.
 
@@ -2137,7 +2503,7 @@ class RTCApp:
         renegotiation the stack does not do. A locked-off microphone withholds
         the m-line entirely. The webcam has the same shape as one recvonly
         video transceiver. The input data channel is reliable and ordered:
-        input, clipboard and upload control all ride it and none tolerates
+        input, clipboard, and upload control all ride it and none tolerates
         loss.
 
         Args:
@@ -2161,11 +2527,16 @@ class RTCApp:
             graph = {"relay": MediaRelay()}
             graph["video_bridge"] = PipelineBridge(
                 request_keyframe=self._keyframe_request(display_id),
-                invalidate_reference=lambda frame_id, did=display_id: self.invalidate_reference(did, frame_id))
+                invalidate_reference=lambda frame_id, did=display_id: self.invalidate_reference(did, frame_id, True))
             graph["video_media"] = VideoMedia(graph["video_bridge"])
             if display_id == "primary":
                 graph["audio_bridge"] = PipelineBridge(maxsize=8)
                 graph["audio_media"] = AudioMedia(graph["audio_bridge"])
+                if int(app_settings.audio_channels) > 2:
+                    # The stereo companion of the surround stream, for pages whose
+                    # engine decodes no multiopus (`_settle_audio_codec`).
+                    graph["audio_stereo_bridge"] = PipelineBridge(maxsize=8)
+                    graph["audio_stereo_media"] = AudioMedia(graph["audio_stereo_bridge"])
             self.displays[display_id] = graph
             logger.debug(f"Media relay and pipeline bridges created for display '{display_id}' ({client_type.value} peer)")
         if graph is None:
@@ -2177,8 +2548,38 @@ class RTCApp:
         media_relay = graph["relay"]
 
         rtp_video_sender = peer_connection.addTrack(media_relay.subscribe(graph["video_media"]))
+        controller = client_type is ClientType.CONTROLLER
+
+        def frame_sent(capture_ns: int, size: int, cid: str = client_peer_id, did: str = display_id) -> None:
+            self._note_connection(cid, 0, -1)
+            if controller and self.on_frame_sent:
+                self.on_frame_sent(did, capture_ns, size)
+
+        def frame_lost(frame_id: int, cid: str = client_peer_id) -> None:
+            self.on_lost_frame(cid, frame_id)
+            self._note_connection(cid, 0, 1)
+
+        # A frame counts as missed from the pacer's hand until its last packet leaves,
+        # and again once the peer lost it past repair; one left out is missed outright.
+        rtp_video_sender.on_frame_sent = frame_sent
+        rtp_video_sender.on_frame_queued = lambda cid=client_peer_id: self._note_connection(cid, 1, 1)
+        rtp_video_sender.on_frame_left_out = lambda cid=client_peer_id: self._note_connection(cid, 1, 1)
+        rtp_video_sender.selective = lambda cid=client_peer_id: not self.peer_owns_display(cid)
+        rtp_video_sender.on_resync = (
+            lambda frame_id, reach, cid=client_peer_id: self.on_resync_frame(cid, frame_id, reach))
+        rtp_video_sender.on_frame_out = (
+            lambda frame_id, key, s=rtp_video_sender, did=display_id:
+                self.common_frames_for(did, False).hold(s, frame_id, key))
+        rtp_video_sender.on_frame_held = (
+            lambda frame_id, key, s=rtp_video_sender, did=display_id: self.common_frames_for(did).hold(s, frame_id, key))
+
+        def key_sent(s=rtp_video_sender, did=display_id) -> None:
+            for held in (False, True):
+                self.common_frames_for(did, held).join(s)
+
+        rtp_video_sender.on_key_sent = key_sent
         rtp_video_sender.on("pli", lambda cid=client_peer_id, ct=client_type: self.on_pli(cid, ct))
-        rtp_video_sender.on("lost_frame", lambda frame_id, cid=client_peer_id: self.on_lost_frame(cid, frame_id))
+        rtp_video_sender.on("lost_frame", frame_lost)
         rtp_audio_sender = None
         if graph.get("audio_media") is not None:
             rtp_audio_sender = peer_connection.addTrack(media_relay.subscribe(graph["audio_media"]))
@@ -2238,6 +2639,13 @@ class RTCApp:
             if display_fullcolor and fullcolor_codecs is not None:
                 display_fullcolor = await self._settle_fullcolor(client_peer_id, display_id, display_encoder, fullcolor_codecs)
             try:
+                display_ten_bit = bool(self.get_ten_bit_for_display(display_id))
+            except Exception:
+                display_ten_bit = bool(app_settings.video_10bit[0])
+            if display_ten_bit:
+                display_ten_bit = await self._settle_ten_bit(
+                    client_peer_id, display_id, display_encoder, display_fullcolor, tenbit_codecs)
+            try:
                 display_use_cpu = bool(self.get_use_cpu_for_display(display_id))
             except Exception:
                 display_use_cpu = bool(app_settings.use_cpu[0])
@@ -2250,7 +2658,7 @@ class RTCApp:
             offer = peer_connection.localDescription
 
             sdp = offer.sdp
-            sdp = self.munge_sdp(sdp, display_encoder, display_fullcolor, display_use_cpu)
+            sdp = self.munge_sdp(sdp, display_encoder, display_fullcolor, display_use_cpu, display_ten_bit)
             await self.on_sdp('offer', sdp, client_peer_id)
         except BaseException:
             input_consumer.cancel()
@@ -2282,6 +2690,7 @@ class RTCApp:
             "video_sender": rtp_video_sender,
             "video_mime": preferred_codec,
             "fullcolor_codecs": fullcolor_codecs,
+            "tenbit_codecs": tenbit_codecs,
             "video_paused": video_paused,
             "audio_sender": rtp_audio_sender,
             "audio_paused": audio_paused,
@@ -2320,14 +2729,19 @@ class RTCApp:
             `_stop_mic_playback_state` later tears down.
         """
         mic_tx = peer_connection.addTransceiver("audio", direction="recvonly")
-        if not bool(app_settings.audio_redundancy[0]):
-            try:
-                caps = RTCRtpSender.getCapabilities("audio")
-                opus_only = [c for c in caps.codecs if c.mimeType.lower() == "audio/opus"]
-                if opus_only:
-                    mic_tx.setCodecPreferences(opus_only)
-            except Exception as e:
-                logger.info(f"mic opus-only preference not applied: {e}")
+        try:
+            caps = RTCRtpSender.getCapabilities("audio").codecs
+            # The sink decodes Opus, RED-framed or not: never the multichannel
+            # codec a surround session offers first for the audio it sends,
+            # which a browser would otherwise send its microphone in.
+            if bool(app_settings.audio_redundancy[0]):
+                wanted = [c for c in caps if c.mimeType.lower() != "audio/multiopus"]
+            else:
+                wanted = [c for c in caps if c.mimeType.lower() == "audio/opus"]
+            if wanted and len(wanted) < len(caps):
+                mic_tx.setCodecPreferences(wanted)
+        except Exception as e:
+            logger.info(f"mic codec preference not applied: {e}")
 
         loop = self.async_event_loop
         state: Dict[str, Any] = {"pb": None, "starting": False, "closed": False}
@@ -2578,6 +2992,12 @@ class RTCApp:
                        role="controller" if peer_obj.get("client_type") is ClientType.CONTROLLER else "viewer",
                        slot=peer_obj.get("client_slot"),
                        duration_s=round(time.time() - peer_obj["connected_at"], 3))
+        for kind in ("keyframe", "lost"):
+            self._peer_recovery_times.pop((client_peer_id, kind), None)
+        for held in (False, True):
+            common = self.common_frames.get((peer_obj.get("display_id") or "primary", held))
+            if common is not None and peer_obj.get("video_sender") is not None:
+                common.leave(peer_obj["video_sender"])
         await self._cancel_channel_consumers(peer_obj)
         await self._stop_mic_playback_state(peer_obj.get("mic_state"))
         self._close_webcam_state(peer_obj.get("webcam_state"))
@@ -2683,18 +3103,20 @@ class RTCApp:
                 logger.debug(f"Error closing orphaned viewer '{pid}': {e}")
 
     async def start_rtc_connection(self, client_peer_id: str, client_type: str, client_token: Optional[str] = None, display_id: str = "primary", client_slot: Optional[int] = None,
-                                   fullcolor_codecs: Optional[List[str]] = None) -> None:
+                                   fullcolor_codecs: Optional[List[str]] = None,
+                                   tenbit_codecs: Optional[List[str]] = None) -> None:
         """Start a peer connection, cleaning up the half-built state on failure.
 
         A signaling socket that dies mid-handshake (refresh/eviction race) is
         routine churn, not a server fault, and is logged without a traceback.
-        `fullcolor_codecs` is what the peer's hello said it decodes at 4:4:4;
-        `None` is a client that did not say, taken at its word.
+        `fullcolor_codecs` is what the peer's hello said it decodes at 4:4:4 and
+        `tenbit_codecs` at 10 bits; `None` is a client that did not say, taken at
+        its word.
         """
         try:
             logger.debug("Starting RTC pipeline", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
             await self._start_rtc_pipeline(client_peer_id, client_type, client_token, display_id, client_slot,
-                                           fullcolor_codecs=fullcolor_codecs)
+                                           fullcolor_codecs=fullcolor_codecs, tenbit_codecs=tenbit_codecs)
         except (aiohttp.ClientConnectionResetError, ConnectionResetError) as e:
             logger.info(f"Peer went away during RTC setup: {e}", extra={'client_peer_id': client_peer_id, 'client_type': client_type})
             await self._cleanup_failed_start(client_peer_id, client_type, display_id)

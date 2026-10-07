@@ -1,7 +1,7 @@
 name: Capture stack wheels
 
 # Puts pixelflux and pcmflux into this run's artifacts, so container images,
-# native packages, AppImages and the suites ride wheels this run holds rather
+# native packages, AppImages, and the suites ride wheels this run holds rather
 # than an index. `pinned` says which build: the main branch (HEAD) of
 # selkies-project/pixelflux and selkies-project/pcmflux, which is what the
 # builds ahead of a release carry, or the versions this repository pins, which
@@ -41,11 +41,8 @@ jobs:
       pixelflux_ref: ${{ steps.probe.outputs.pixelflux_ref }}
       pcmflux_ref: ${{ steps.probe.outputs.pcmflux_ref }}
     steps:
-      # The pins a pinned run reads live in this repository's pyproject.toml;
-      # the branch an unpinned run builds is main unless .github/capture-stack
-      # names another (`pixelflux=ref-frames`), which a branch pairs itself
-      # with a sibling's branch through
-      - uses: actions/checkout@v7
+      # The pins a pinned run reads live in this repository's pyproject.toml
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: probe
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,14 +65,12 @@ jobs:
                         --jq '.assets[].name' 2>/dev/null || true)"
               case "${assets}" in *"${project}-${want}-"*) tag="${want}" ;; esac
             else
-              ref="$(sed -n "s/^${project}=//p" .github/capture-stack 2>/dev/null || true)"
-              ref="${ref:-main}"
-              # Pre-releases are cut from main alone and tagged with an
-              # abbreviated SHA, so match by prefix
+              ref=main
               sha="$(gh api "repos/${repo}/commits/main" --jq .sha 2>/dev/null || true)"
+              # Pre-releases are tagged with an abbreviated SHA, so match by prefix
               tags="$(gh release list --repo "${repo}" --limit 30 --json tagName \
                       --jq '.[].tagName' 2>/dev/null || true)"
-              [ "${ref}" = main ] && for candidate in ${tags}; do
+              for candidate in ${tags}; do
                 case "${sha:-none}" in "${candidate}"*) tag="${candidate}"; break ;; esac
               done
             fi
@@ -119,7 +114,7 @@ jobs:
             --repo "${{ github.repository_owner }}/${PROJECT}" \
             --pattern "${SLICE}" --dir wheelhouse
           ls -la wheelhouse
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.project }}-wheels-${{ matrix.target.arch }}-${{ matrix.platform }}
           path: wheelhouse/*.whl
@@ -155,7 +150,7 @@ jobs:
           - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/${{ matrix.project }}
           ref: ${{ needs.locate.outputs[format('{0}_ref', matrix.project)] || 'main' }}
@@ -164,7 +159,7 @@ jobs:
         env:
           # Every interpreter cibuildwheel offers, floored by python_requires.
           CIBW_BUILD: "*-${{ matrix.platform }}_${{ matrix.target.arch }}"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.project }}-wheels-${{ matrix.target.arch }}-${{ matrix.platform }}
           path: wheelhouse/*.whl

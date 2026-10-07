@@ -15,8 +15,10 @@ that too.
 import asyncio
 import logging
 import os
+import re
 import shutil
 import signal
+import stat
 import tempfile
 from importlib.resources import files
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -30,6 +32,13 @@ logger = logging.getLogger("printing")
 # counts as whole: one moved in from elsewhere is complete at once, one being
 # written in place is opened or modified well within this.
 SETTLE_SECONDS = 0.5
+
+
+def spool_path(configured: str) -> str:
+    """The print spool: `configured` when set, else selkies/print under the
+    XDG state directory, as the server's other state is."""
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.expanduser(configured) if configured else os.path.join(state, "selkies", "print")
 
 
 def document_name(name: str) -> Optional[str]:
@@ -116,6 +125,26 @@ class SpoolWatcher(FileSystemEventHandler):
         self.loop.create_task(self.on_document(name, size))
 
 
+def default_paper(ppd: str, requested: str) -> Tuple[str, Optional[str]]:
+    """`ppd` with its default paper set to `requested`, and the size it now
+    defaults to, or None where `requested` names no size the PPD offers.
+
+    `requested` is a paper name as libpaper's `PAPERSIZE` gives it (`letter`,
+    `a4`), matched against the PPD's sizes ignoring case. Only that explicit
+    choice moves the default: a host's /etc/papersize and locale are left
+    unread, because a container image sets both as an accident of its build
+    (an `en_US` locale, the paper its distribution's packaging chose) rather
+    than for the person printing, so following them would change the page
+    for users nobody asked about.
+    """
+    size = next((s for s in re.findall(r"^\*PageSize (\w+)/", ppd, re.M)
+                 if s.lower() == requested.strip().lower()), None)
+    if size:
+        ppd = re.sub(r"^(\*Default(?:PageSize|PageRegion|ImageableArea|PaperDimension):) \S+",
+                     rf"\1 {size}", ppd, flags=re.M)
+    return ppd, size
+
+
 def _die_with_parent() -> None:
     """Asks the kernel to end the scheduler when the server is gone, however
     it went: one killed outright would otherwise leave the scheduler holding
@@ -142,12 +171,17 @@ class PrintQueue:
             os.path.join(tempfile.gettempdir(), f"selkies-cups-{os.getuid()}")
         self.socket = os.path.join(self.root, "cups.sock")
         self.spool = spool
+        self.paper = "A4"
         self.process: Optional[asyncio.subprocess.Process] = None
+
+    #: Where the scheduler is looked for, beyond PATH: the sbin directories a
+    #: session's PATH usually leaves out.
+    SEARCH_PATH = ":/usr/sbin:/usr/local/sbin"
 
     @staticmethod
     def programs() -> Optional[Tuple[str, str, str]]:
         """`(cupsd, server bin, data dir)` of the installed CUPS, or None."""
-        path = os.environ.get("PATH", "") + ":/usr/sbin:/usr/local/sbin"
+        path = os.environ.get("PATH", "") + PrintQueue.SEARCH_PATH
         cupsd = shutil.which("cupsd", path=path)
         if not cupsd:
             return None
@@ -158,6 +192,18 @@ class PrintQueue:
                     and os.path.isdir(os.path.join(server_bin, "filter")):
                 return cupsd, server_bin, os.path.join(prefix, "share", "cups")
         return None
+
+    @staticmethod
+    def locked_scheduler() -> Optional[Tuple[str, int]]:
+        """`(path, mode)` of a cupsd on the search path that this user can
+        neither read nor run, which `programs` passes over, or None. The queue
+        runs a copy of the program as the session user, so a scheduler
+        installed for root alone cannot serve it however it is configured."""
+        path = os.environ.get("PATH", "") + PrintQueue.SEARCH_PATH
+        cupsd = shutil.which("cupsd", mode=os.F_OK, path=path)
+        if not cupsd or os.access(cupsd, os.R_OK | os.X_OK):
+            return None
+        return cupsd, stat.S_IMODE(os.stat(cupsd).st_mode)
 
     def _prepare(self, server_bin: str, data_dir: str) -> None:
         for sub in ("ppd", "state", "cache", "spool", "tmp", "bin/backend"):
@@ -173,8 +219,13 @@ class PrintQueue:
         with open(backend, "wb") as out:
             out.write((package / "backend").read_bytes())
         os.chmod(backend, 0o755)
-        with open(os.path.join(self.root, "ppd", "Selkies.ppd"), "wb") as out:
-            out.write((package / "selkies.ppd").read_bytes())
+        requested = os.environ.get("PAPERSIZE", "")
+        ppd, size = default_paper((package / "selkies.ppd").read_text("latin-1"), requested)
+        if requested and not size:
+            logger.warning("PAPERSIZE=%s names no size the Selkies queue offers; it stays on A4", requested)
+        self.paper = size or "A4"
+        with open(os.path.join(self.root, "ppd", "Selkies.ppd"), "w", encoding="latin-1") as out:
+            out.write(ppd)
         confs = {
             "cups-files.conf": f"""ServerRoot {self.root}
 ServerBin {os.path.join(self.root, "bin")}
@@ -215,9 +266,15 @@ ErrorPolicy retry-job
         """Start the scheduler; False where CUPS is not installed."""
         found = self.programs()
         if found is None:
-            logger.info("No CUPS scheduler on this host: documents printed into the spool are "
-                        "still handed over, but there is no Selkies queue to print to "
-                        "(cups-daemon and cups-filters provide one)")
+            locked = self.locked_scheduler()
+            if locked:
+                logger.warning("No print queue: %s is mode %o, which this user can neither read nor "
+                               "run; a Selkies queue needs the scheduler readable (Arch's cups "
+                               "package installs it for root alone)", *locked)
+            else:
+                logger.info("No CUPS scheduler on this host: documents printed into the spool are "
+                            "still handed over, but there is no Selkies queue to print to "
+                            "(cups-daemon and cups-filters provide one)")
             return False
         cupsd, server_bin, data_dir = found
         # The scheduler runs as a copy of the program: a distribution confines
@@ -250,7 +307,7 @@ ErrorPolicy retry-job
                            os.path.join(self.root, "error.log"))
             await self.stop()
             return False
-        logger.info("Print queue Selkies listening on %s, spooling to %s", self.socket, self.spool)
+        logger.info("Print queue Selkies listening on %s, spooling to %s, on %s paper", self.socket, self.spool, self.paper)
         return True
 
     async def stop(self) -> None:

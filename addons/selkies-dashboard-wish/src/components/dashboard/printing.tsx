@@ -61,11 +61,21 @@ export function Printing() {
                             <Printer className="h-4 w-4" />
                         </Button>
                     )}
-                    <Button variant="outline" size="icon" asChild>
-                        <a href={job.url} download={job.name} target={isMobileClient ? '_blank' : undefined}
-                            title={t('sections.printing.saveButton')} aria-label={t('sections.printing.saveButton')}>
-                            <Download className="h-4 w-4" />
-                        </a>
+                    <Button
+                        variant="outline" 
+                        size="icon" 
+                        nativeButton={false}
+                        render={
+                            <a
+                                href={job.url}
+                                download={job.name}
+                                target={isMobileClient ? '_blank' : undefined}
+                                title={t('sections.printing.saveButton')}
+                                aria-label={t('sections.printing.saveButton')}
+                            />
+                        }
+                    >
+                        <Download className="h-4 w-4" />
                     </Button>
                 </div>
             ))}

@@ -15,7 +15,7 @@
  * derivation too, so both dashboards and both cores agree on all of them.
  *
  * Core state cache: the core broadcasts `serverSettings` once per connection
- * and `clipboardContentUpdate`, `effectiveCursorState` and
+ * and `clipboardContentUpdate`, `effectiveCursorState`, and
  * `audioDeviceSelected` only when something changes, but the panel components
  * (Settings, Sharing, Files, Clipboard) mount lazily when their menu opens,
  * after those messages. The latest of each is cached at module scope so a
@@ -25,8 +25,11 @@
  */
 
 import { getRoutePrefix, getStorageAppName, isMobileClient, isMacDesktop } from "../../selkies-web-core/lib/util.js";
+import { urlFragmentKeyword } from "../../selkies-web-core/lib/page-url.js";
+import { hardwareKeyboard } from "../../selkies-web-core/lib/hardware-keyboard.js";
 
 export { isMobileClient };
+export { hardwareKeyboard };
 
 export { getRoutePrefix, getStorageAppName };
 
@@ -39,7 +42,7 @@ export { getRoutePrefix, getStorageAppName };
  * write the primary's key.
  */
 const PER_DISPLAY_SETTINGS = [
-  'framerate', 'video_crf', 'video_fullcolor',
+  'framerate', 'video_crf', 'video_fullcolor', 'video_10bit',
   'video_streaming_mode', 'jpeg_quality', 'paint_over_jpeg_quality', 'use_cpu',
   'video_paintover_crf', 'video_paintover_burst_frames', 'use_paint_over_quality',
   'manual_resolution', 'manual_width', 'manual_height',
@@ -47,7 +50,7 @@ const PER_DISPLAY_SETTINGS = [
   'video_bitrate', 'force_aligned_resolution', 'scaling_dpi',
 ];
 
-const urlHash = typeof window !== 'undefined' ? window.location.hash : '';
+const urlHash = typeof window !== 'undefined' ? urlFragmentKeyword() : '';
 /** Which display this page is, from the `#display2` URL hash. */
 export const displayId = urlHash.startsWith('#display2') ? 'display2' : 'primary';
 export const isSecondaryDisplay = displayId === 'display2';
@@ -75,7 +78,10 @@ export function getPrefixedKey(key: string): string {
 export interface PrintJob { name: string; url: string }
 
 let lastServerSettings: any = null;
-let lastClipboardContent: { text: string; truncated: boolean } | null = null;
+/** The server clipboard preview; a secret arrives as the flag alone, never its text. */
+export interface ClipboardPreview { text: string; truncated: boolean; secret: boolean }
+
+let lastClipboardContent: ClipboardPreview | null = null;
 let printJobs: PrintJob[] = [];
 let lastEffectiveCursorState: boolean | null = null;
 const lastAudioDevices: { input: string | null; output: string | null } = { input: null, output: null };
@@ -87,7 +93,8 @@ if (typeof window !== 'undefined') {
     if (message.type === 'serverSettings') {
       lastServerSettings = message.payload;
     } else if (message.type === 'clipboardContentUpdate' && typeof message.text === 'string') {
-      lastClipboardContent = { text: message.text, truncated: message.truncated === true };
+      lastClipboardContent = { text: message.text, truncated: message.truncated === true,
+        secret: message.secret === true };
     } else if (message.type === 'effectiveCursorState' && typeof message.value === 'boolean') {
       lastEffectiveCursorState = message.value;
     } else if (message.type === 'audioDeviceSelected' && message.deviceId) {
@@ -111,7 +118,7 @@ export function getLastServerSettings(): any {
 }
 
 /** The last server clipboard preview; the core emits it only on clipboard events. */
-export function getLastClipboardContent(): { text: string; truncated: boolean } | null {
+export function getLastClipboardContent(): ClipboardPreview | null {
   return lastClipboardContent;
 }
 
@@ -148,7 +155,7 @@ export function isSettingRenderable(setting: any): boolean {
  * Derives every visibility flag the panels read from a `serverSettings`
  * payload: the admin's `ui_*` toggles, per-control renderability from each
  * setting's own constraints, the sharing roles, the stream-control menu
- * entries and the file-transfer directions.
+ * entries, and the file-transfer directions.
  */
 export function computeRenderableSettings(serverSettings: any): Record<string, any> {
   if (!serverSettings) return {};
@@ -186,6 +193,7 @@ export function computeRenderableSettings(serverSettings: any): Record<string, a
   newRenderable.usePaintOverQuality = isSettingRenderable(s.use_paint_over_quality);
   newRenderable.videoStreamingMode = isSettingRenderable(s.video_streaming_mode);
   newRenderable.videoFullColor = isSettingRenderable(s.video_fullcolor);
+  newRenderable.video10Bit = isSettingRenderable(s.video_10bit);
   newRenderable.useCpu = isSettingRenderable(s.use_cpu);
   newRenderable.uiScaling = isSettingRenderable(s.scaling_dpi);
   newRenderable.binaryClipboard = isSettingRenderable(s.enable_binary_clipboard)

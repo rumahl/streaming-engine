@@ -4,16 +4,16 @@ An `LD_PRELOAD` library that presents a virtual V4L2 capture device
 (`/dev/video0`) fed by the pixelflux virtual camera, over its Unix domain socket
 or from its PipeWire node. It lets Selkies deliver a browser's webcam into a
 container — picked up by unmodified consumers such as Chromium, Firefox,
-`ffmpeg`, GStreamer, `v4l2-ctl` and libv4l2-based applications — without the
+`ffmpeg`, GStreamer, `v4l2-ctl`, and libv4l2-based applications — without the
 `v4l2loopback` kernel module, any `/dev/video*` device, or elevated privilege.
 
 The browser encodes its camera (H.264/VP8 over the WebRTC media track or
 WebCodecs over the WebSocket, MJPEG as the last-resort canvas path). The Selkies
 backend hands every encoded frame to `pixelflux.VirtualCamera`, which decodes it,
 fits it into the device's fixed raw format (I420 by default), publishes it into a
-shared-memory ring and rings a one-byte doorbell on the socket. This library
+shared-memory ring, and rings a one-byte doorbell on the socket. This library
 emulates the observable half of a fixed-function webcam: the `VIDIOC_*` ioctl
-surface, MMAP streaming buffers, `read()` I/O and `poll()` readiness.
+surface, MMAP streaming buffers, `read()` I/O, and `poll()` readiness.
 
 Where a v4l2loopback device is available (a desktop host, or a privileged
 container), pixelflux mirrors the same frames into it (`webcam_device`), and
@@ -34,11 +34,11 @@ from a PipeWire node alone.
   staging memfd once per connection via `SCM_RIGHTS`; `mmap()` of the device fd
   is redirected onto a per-handle buffer memfd, so the application maps real
   shared memory and `DQBUF` copies one frame into it.
-- Only a fixed format is advertised: the pixel format, resolution and frame
+- Only a fixed format is advertised: the pixel format, resolution, and frame
   rate the backend configures (`webcam_pixel_format`, `webcam_width`,
   `webcam_height`). Control ioctls return `EINVAL` per control (terminating
   enumeration loops the way the kernel does for a camera without controls);
-  events, cropping and output ioctls return `ENOTTY`, exactly as a minimal real
+  events, cropping, and output ioctls return `ENOTTY`, exactly as a minimal real
   webcam does.
 - The libc `syscall()` entry point is interposed as well, covering consumers
   built on the libv4l2 wrapper library (OBS, `v4l2-ctl`, distribution
@@ -110,7 +110,7 @@ export SELKIES_WEBCAM_INTERPOSER='/usr/$LIB/selkies_v4l2_interposer.so'
 export LD_PRELOAD="${SELKIES_WEBCAM_INTERPOSER}${LD_PRELOAD:+:${LD_PRELOAD}}"
 # Optional overrides (must match the backend):
 #   SELKIES_WEBCAM_DEVICE=0                     -> /dev/video0
-#   SELKIES_WEBCAM_SOCKET_PATH=/tmp             -> /tmp/selkies_webcam0.sock
+#   SELKIES_WEBCAM_SOCKET_PATH=/srv/cam         -> /srv/cam/selkies_webcam0.sock (default: $XDG_RUNTIME_DIR, else /tmp)
 #   SELKIES_WEBCAM_SOURCE=auto|socket|pipewire  -> where frames come from
 #   SELKIES_WEBCAM_PIPEWIRE_NODE=selkies-webcam -> the node the pipewire source uses
 #   WEBCAM_LOG=1                                -> stderr diagnostics

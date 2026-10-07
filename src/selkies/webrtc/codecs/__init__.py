@@ -42,7 +42,7 @@ from ..rtcrtpparameters import (
     RTCRtpHeaderExtensionCapability,
     RTCRtpHeaderExtensionParameters,
 )
-from ..rtp import DEPENDENCY_DESCRIPTOR_URI
+from ..rtp import ABS_CAPTURE_TIME_URI, DEPENDENCY_DESCRIPTOR_URI
 from .base import Decoder, Encoder
 from .g711 import PcmaDecoder, PcmaEncoder, PcmuDecoder, PcmuEncoder
 from .g722 import G722Decoder, G722Encoder
@@ -106,24 +106,27 @@ MULTIOPUS_LAYOUTS: dict[int, dict[str, str]] = {
 
 
 def configure_multiopus(channels: int) -> None:
-    """Offer surround audio as Chromium's non-standard `multiopus` codec instead of
-    stereo opus/RED (browsers do not RED multiopus). No-op for unknown layouts."""
+    """Offer surround audio as Chromium's non-standard `multiopus` codec, ahead of the
+    stereo RED and opus a peer without it answers with instead (browsers do not RED
+    multiopus). No engine lists multiopus in an answer of its own, so the client puts
+    it there where its engine decodes it. The payload type is the first dynamic one no
+    other codec of either kind holds, since bundled sections share the space. No-op for
+    unknown layouts."""
     layout = MULTIOPUS_LAYOUTS.get(channels)
     if layout is None:
         return
+    stereo = [c for c in CODECS["audio"] if c.mimeType.lower() != "audio/multiopus"]
+    taken = {c.payloadType for c in stereo + CODECS["video"]}
     CODECS["audio"] = [
         RTCRtpCodecParameters(
             mimeType="audio/multiopus",
             clockRate=48000,
             channels=channels,
-            payloadType=96,
+            payloadType=next(pt for pt in range(96, 128) if pt not in taken),
             rtcpFeedback=[RTCRtcpFeedback(type="transport-cc")],
             parameters=dict(layout),
         ),
-        G722_CODEC,
-        PCMU_CODEC,
-        PCMA_CODEC,
-    ]
+    ] + stereo
 # Note, the id space for these extensions is shared across media types when BUNDLE
 # is negotiated. If you add a audio- or video-specific extension, make sure it has
 # a unique id.
@@ -161,6 +164,7 @@ HEADER_EXTENSIONS: dict[str, list[RTCRtpHeaderExtensionParameters]] = {
             id=7, uri="http://www.webrtc.org/experiments/rtp-hdrext/color-space"
         ),
         RTCRtpHeaderExtensionParameters(id=8, uri=DEPENDENCY_DESCRIPTOR_URI),
+        RTCRtpHeaderExtensionParameters(id=9, uri=ABS_CAPTURE_TIME_URI),
     ],
 }
 
@@ -185,6 +189,11 @@ def init_codecs() -> None:
                     RTCRtcpFeedback(type="ccm", parameter="fir"),
                     RTCRtcpFeedback(type="goog-remb"),
                     RTCRtcpFeedback(type="transport-cc"),
+                    # Offered so a libwebrtc receiver sends reference times (RTCP XR)
+                    # for the round trip a receive-only stream needs to place its
+                    # frames' capture time; its answer never echoes it, so a sender
+                    # answers whatever reference time arrives.
+                    RTCRtcpFeedback(type="rrtr"),
                 ],
                 parameters=parameters or {},
             ),

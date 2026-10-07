@@ -31,6 +31,9 @@ PREFIX="${APP}/usr/conda"
 
 "${APP}/AppRun" --help > /dev/null
 echo "AppRun runs from an extracted copy"
+"${APP}/AppRun" selkies-session --help > /dev/null
+"${APP}/usr/libexec/selkies-session/pulseaudio" --version > /dev/null
+echo "AppRun runs the session launcher, and its sound server wrapper finds the daemon"
 
 # Through usr/bin too, the symlink farm linuxdeploy is given rather than the
 # scripts themselves, so an entry point that resolves its interpreter from its
@@ -65,16 +68,22 @@ if [ -n "${outside}" ]; then
     exit 1
 fi
 echo "every entry point names an interpreter inside this copy"
+# Nothing at run time reads a package cache, and building the interposers
+# leaves one in the prefix
+if [ -e "${PREFIX}/pkgs" ]; then
+    echo "::error::the prefix carries a conda package cache of $(du -sh "${PREFIX}/pkgs" | cut -f1)"
+    exit 1
+fi
+echo "the prefix carries no conda package cache"
 
 "${PREFIX}/bin/python" -c "import selkies, pixelflux, pcmflux"
-echo "selkies, pixelflux and pcmflux import"
+echo "selkies, pixelflux, and pcmflux import"
 
 # The sound server AppRun starts, started by AppRun: a daemon that finds no
 # module directory exits with "startup without any loaded modules", taking
 # audio out of the AppImage while everything else still streams. The Wayland
-# backend is selected so no X server is started, and the session AppRun goes on
-# to attempt is beside the point -- what is checked is the daemon it leaves
-# listening. Its own runtime directory, never a live session's.
+# backend is selected so no X server is started, and its compositor is checked
+# too. Its own runtime directory, never a live session's.
 RUNTIME="${WORK}/runtime"
 mkdir -p "${RUNTIME}"
 chmod 700 "${RUNTIME}"
@@ -91,6 +100,12 @@ while [ "${i}" -lt 40 ]; do
     sinks="$(env XDG_RUNTIME_DIR="${RUNTIME}" PULSE_SERVER="unix:${RUNTIME}/pulse/native" \
         "${PREFIX}/bin/pactl" list short sinks 2>/dev/null || true)"
     [ -n "${sinks}" ] && break
+    i=$((i + 1))
+    sleep 1
+done
+# The compositor names its socket once up, or says its startup window passed
+i=0
+while ! grep -q "Wayland compositor socket" "${WORK}/apprun.log" && [ "${i}" -lt 30 ]; do
     i=$((i + 1))
     sleep 1
 done
@@ -118,6 +133,25 @@ case "${modules}" in
         ;;
 esac
 echo "AppRun's sound server comes up with a sink, on this copy's modules"
+# The system bus it asks RTKit for real-time scheduling on, which the bundled
+# libdbus also has at the build path; a runner without a bus logs the one it tried
+bus="$(sed -n 's|.*Failed to connect to system bus: .*socket \(/[^:]*\):.*|\1|p' "${PULSE_LOG}" | tail -1)"
+case "${bus}" in
+    ""|/var/run/dbus/system_bus_socket) ;;
+    *)
+        echo "::error::AppRun's sound server looked for the system bus at ${bus}"
+        exit 1
+        ;;
+esac
+echo "AppRun's sound server looks for the system bus at the well-known address"
+# Its keyboard needs the keymaps AppRun points the bundled libxkbcommon at,
+# whose own default is the build path
+if ! grep -q "Wayland compositor socket: " "${WORK}/apprun.log"; then
+    echo "::error::the Wayland compositor AppRun starts never came up; its log:"
+    tail -n 20 "${WORK}/apprun.log"
+    exit 1
+fi
+echo "AppRun's Wayland compositor comes up"
 
 # The mount a user's own run takes: the runtime mounts the image read-only and
 # only extracts itself where FUSE is missing, so the checks above never see it.
@@ -139,6 +173,7 @@ if [ -e /dev/fuse ]; then
         exit 1
     fi
     "${point}/AppRun" --help > /dev/null
+    "${point}/AppRun" selkies-session --help > /dev/null
     "${point}/usr/conda/bin/selkies" --help > /dev/null
     kill "${mounted}" 2>/dev/null || true
     wait "${mounted}" 2>/dev/null || true

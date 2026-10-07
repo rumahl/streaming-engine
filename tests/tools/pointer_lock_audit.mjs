@@ -19,7 +19,9 @@
 // caller guards the request (gaming mode, stream fullscreen, not already locked,
 // an input context attached); the request it re-runs after a refusal must pass those
 // guards again, since the page can leave fullscreen while the first one is still
-// pending.
+// pending. Where the engine keeps its own record of the viewport's place on the
+// screen (Gecko), the request waits, for a bounded number of frames, until that
+// record puts the fullscreen viewport at the window's origin.
 //
 // Prints one PASS/FAIL line per check and exits non-zero if any failed.
 
@@ -82,6 +84,7 @@ function reset(element) {
     Input._rawMotionRefused = false;
     globalThis.document = { pointerLockElement: null, fullscreenElement: element,
                             getElementById: () => null };
+    globalThis.window = { screenX: 0, screenY: 0 };
 }
 
 // --- the request itself ---------------------------------------------------
@@ -361,6 +364,39 @@ function stage(ids, locked = null) {
           element.calls.join(','));
 }
 {
+    // Gecko warps a locked pointer to the viewport's center through its own
+    // record of where the viewport sits on the screen, which a fullscreen
+    // transition updates only once the toolbars it collapses are gone: the
+    // request waits a frame at a time for the viewport to reach the window's
+    // origin, and asks anyway after a bounded wait.
+    const frames = [];
+    globalThis.requestAnimationFrame = (cb) => frames.push(cb);
+    const step = (n) => { for (let i = 0; i < n; i++) frames.splice(0).forEach((cb) => cb()); };
+    const element = makeElement('ok');
+    reset(element);
+    Object.assign(window, { mozInnerScreenX: 0, mozInnerScreenY: 85 });
+    makeInput(element)._armPointerLock();
+    step(3);
+    const waited = element.calls.length;
+    window.mozInnerScreenY = 0;
+    step(1);
+    await sleep(10);
+    check('Gecko is asked for the lock once its viewport sits at the window origin',
+          waited === 0 && element.calls.join(',') === 'unadjusted', `${waited}, then ${element.calls.join(',')}`);
+
+    const stuck = makeElement('ok');
+    reset(stuck);
+    Object.assign(window, { mozInnerScreenX: 0, mozInnerScreenY: 85 });
+    makeInput(stuck)._armPointerLock();
+    step(29);
+    const early = stuck.calls.length;
+    step(1);
+    await sleep(10);
+    check('a viewport that never gets there is asked after a bounded wait',
+          early === 0 && stuck.calls.join(',') === 'unadjusted', `${early}, then ${stuck.calls.join(',')}`);
+    delete globalThis.requestAnimationFrame;
+}
+{
     // Plain fullscreen: the pointer is the browser's, so nothing is asked for.
     const element = makeElement('ok');
     reset(element);
@@ -445,7 +481,8 @@ function stage(ids, locked = null) {
     const element = makeElement('ok');
     reset(element);
     const events = [];
-    const keyboard = { calls: [], lock: (keys) => { keyboard.calls.push('lock'); return Promise.resolve(); },
+    const keyboard = { calls: [], keys: [],
+                       lock: (keys) => { keyboard.calls.push('lock'); keyboard.keys.push(keys); return Promise.resolve(); },
                        unlock: () => keyboard.calls.push('unlock') };
     Object.defineProperty(globalThis, 'navigator', { value: { keyboard }, configurable: true });
     const requested = [];
@@ -484,6 +521,10 @@ function stage(ids, locked = null) {
     check('gaming mode takes the pointer and the keyboard',
           element.calls.length > 0 && keyboard.calls.join(',') === 'lock',
           `${element.calls.join(',')} / ${keyboard.calls.join(',')}`);
+    // Every key, the browser's own shortcuts among them, as a fullscreen asked
+    // for with keyboardLock "browser" holds them in Firefox and Safari.
+    check('the keyboard lock names no keys, so it holds all of them',
+          keyboard.keys.length === 1 && keyboard.keys[0] === undefined, JSON.stringify(keyboard.keys));
 
     document.fullscreenElement = null;
     input._onFullscreenChange();
@@ -545,6 +586,46 @@ function stage(ids, locked = null) {
     check('an engine that locks the keyboard hears no notice',
           keyboard.calls.join(',') === 'lock' && notices.length === 0,
           `${keyboard.calls.join(',')} / ${notices.join(',')}`);
+}
+
+// --- a fullscreen the page holds already -----------------------------------
+// Firefox and Safari hold the keys only for a fullscreen asked for with
+// keyboardLock "browser". Gaming mode entered from a plain fullscreen asks for
+// the same element again with it, which by the Fullscreen spec sets its keyboard
+// lock with no transition; refused, the page says the keys are the browser's.
+// An engine with the Keyboard Lock API locks through it and is not asked again.
+{
+    const enter = async (element, navigatorValue, answer) => {
+        reset(element);
+        Object.defineProperty(globalThis, 'navigator', { value: navigatorValue, configurable: true });
+        Input._keyboardLockNoticed = false;
+        const asked = [];
+        element.requestFullscreen = (options) => {
+            asked.push(options && options.keyboardLock ? options.keyboardLock : 'none');
+            return answer;
+        };
+        document.fullscreenElement = element;
+        const input = makeInput(element, false);
+        const notices = [];
+        input.onnotice = (code) => notices.push(code);
+        input.enterGamingMode();
+        await sleep(10);
+        return { asked, notices, locked: element.calls.length > 0 };
+    };
+    let got = await enter(makeElement('ok'), {}, Promise.resolve());
+    check('from a fullscreen held already, an engine without the API is asked again with keyboardLock',
+          got.asked.join(',') === 'browser' && got.notices.length === 0 && got.locked,
+          `${got.asked.join(',')} / ${got.notices.join(',')} / locked ${got.locked}`);
+    got = await enter(makeElement('ok'), {}, Promise.reject(new Error('denied')));
+    check('and, refused, says that a single Escape leaves gaming mode',
+          got.notices.join(',') === 'keyboardLockUnavailable' && got.locked,
+          `${got.notices.join(',')} / locked ${got.locked}`);
+    const keyboard = { calls: [], lock: () => { keyboard.calls.push('lock'); return Promise.resolve(); },
+                       unlock: () => {} };
+    got = await enter(makeElement('ok'), { keyboard }, Promise.resolve());
+    check('an engine with the Keyboard Lock API locks through it and is not asked for fullscreen again',
+          got.asked.length === 0 && keyboard.calls.join(',') === 'lock' && got.locked,
+          `${got.asked.join(',')} / ${keyboard.calls.join(',')}`);
 }
 
 process.exit(failed === 0 ? 0 : 1);

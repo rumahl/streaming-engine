@@ -5,40 +5,45 @@
  */
 
 /**
- * The Settings panel of the wish dashboard: Video, Audio and Resolution tabs
+ * The Settings panel of the wish dashboard: Video, Audio, and Resolution tabs
  * over the streaming core.
  *
  * State arrives through the `message` events the core posts on `window`:
  * `serverSettings` (the server's settings payload, per key a `value`,
- * `allowed`, `min`/`max`, `default`, `locked` and `overridden`),
+ * `allowed`, `min`/`max`, `default`, `locked`, and `overridden`),
  * `effectiveCursorState`, `scalingDpiFollowed` (the UI-scaling default the
- * core re-derived) and `audioDeviceSelected`. Changes go back as
+ * core re-derived), `displayRefresh` (the display's measured refresh, also
+ * `window.displayRefreshRate`, which the frame-rate slider offers as a stop of
+ * its own), and `audioDeviceSelected`. Changes go back as
  * `window.postMessage` messages: `settings` (debounced key/value batches the
  * core forwards to the server), `mode`, `setScaleLocally`,
  * `setManualResolution`, `resetResolutionToWindow`, `setAntiAliasing`, and
  * whatever the shared conditional-setting specs post. The transport is seeded
- * from `window.__SELKIES_STREAMING_MODE__`, and `window.__selkiesModeSwitching`
- * is raised around a transport switch.
+ * from `window.__SELKIES_STREAMING_MODE__`, and a switch goes through the
+ * shared `switchStreamMode`.
  *
  * Every value persists under a localStorage key from `getPrefixedKey`, which
  * adds the `_display2` suffix for per-display settings on a secondary display;
  * the cores read the same keys. The cores also persist every value they are
  * told to apply, so a stored key alone cannot tell a user's explicit pick from
- * one the dashboard derived (HiDPI from the resolution mode, rate control from
- * the encoder). Settings that are also derived therefore carry an
+ * one the dashboard derived (HiDPI from the resolution mode) or applied from the
+ * server (paint-over). Those settings therefore carry an
  * `_explicit_choice` marker beside their value and resolve through the shared
  * specs of `selkies-web-core/lib/conditional-settings.js`, which honor pinned,
- * locked and operator-overridden server values: a derived write never pins
+ * locked, and operator-overridden server values: a derived write never pins
  * them, and an unmarked stored echo is dropped once the ladder moves on.
  * @module
  */
 
 import { Card, CardContent } from "@/components/ui/card";
-import { displayLabel, canPlayEncoder, decoderSupportReady, canDecodeFullColor, codecOfEncoder, codecCarriesFullColor, isMacDesktop } from "../../../../selkies-web-core/lib/util.js";
-import { sessionAuthHeaders } from "../../../../selkies-web-core/lib/session-token.js";
+import { displayLabel, canPlayEncoder, decoderSupportReady, canDecodeFullColor, canDecodeTenBit, tenBitFormat, codecOfEncoder, codecCarriesFullColor, codecCarriesTenBit, isMacDesktop } from "../../../../selkies-web-core/lib/util.js";
+import { switchStreamMode } from "../../../../selkies-web-core/lib/mode-switch.js";
+import { BITRATE_STOPS, CRF_STOPS, FRAMERATE_STOPS, framerateStopIndex, stopIndex, stopsWithin, withDisplayStop } from "../../../../selkies-web-core/lib/slider-stops.js";
+import { FRAMERATE_DISPLAY, followsDisplay, framerateLabel, matchDisplay } from "../../../../selkies-web-core/lib/display-refresh.js";
 import { resolveSpec, isSettingPinned, HIDPI_SPEC, RATE_CONTROL_SPEC,
-    USE_BROWSER_CURSORS_SPEC, VIDEO_FULLCOLOR_SPEC, VIDEO_STREAMING_MODE_SPEC,
+    USE_BROWSER_CURSORS_SPEC, VIDEO_FULLCOLOR_SPEC, VIDEO_10BIT_SPEC, VIDEO_STREAMING_MODE_SPEC,
     USE_PAINT_OVER_QUALITY_SPEC, USE_CPU_SPEC, FORCE_ALIGNED_RESOLUTION_SPEC, softwareChoiceAvailable,
+    tenBitStream,
     RAW_POINTER_MOTION_SPEC, MAC_CMD_AS_CTRL_SPEC } from "../../../../selkies-web-core/lib/conditional-settings.js";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Slider } from "@/components/ui/slider";
@@ -53,7 +58,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { ChevronUp } from "lucide-react";
 import React, { useState, useEffect, useCallback, useMemo } from "react";
-import { getPrefixedKey, getRoutePrefix, computeRenderableSettings, getLastServerSettings,
+import { getPrefixedKey, computeRenderableSettings, getLastServerSettings,
     getLastEffectiveCursorState, getLastAudioDevices, isSecondaryDisplay } from "@/utils";
 import { t, tl } from "@/i18n";
 
@@ -163,19 +168,6 @@ const encoderOptionsRTC = [
 /** Encoders that support both CBR and CRF (constant-QP) rate control. */
 const VIDEO_ENCODERS = ["h264enc", "h265enc", "vp8enc", "vp9enc", "av1enc", "h264enc-striped"];
 
-const FRAMERATE_STEPS = [8, 12, 15, 24, 25, 30, 48, 50, 60, 90, 100, 120, 144, 165, 240];
-
-/** CRF stops, inside the server-supported `video_crf` range (min 5). */
-const videoCRFOptions = [50, 45, 40, 35, 30, 25, 20, 10, 5];
-
-/** Sub-Mbps CBR stops (kbps) for constrained links, ahead of the 1000-kbps steps. */
-const SUB_MBPS_BITRATE_STEPS = [100, 250, 500, 750];
-/**
- * CBR stops above 100000 kbps, where per-1000 granularity stops mattering and
- * a 1000-position slider would be unusable.
- */
-const COARSE_MBPS_BITRATE_STEPS = [150000, 200000, 300000, 400000, 500000, 750000, 1000000];
-
 const readStored = (key: string) => localStorage.getItem(getPrefixedKey(key));
 
 /**
@@ -196,8 +188,8 @@ const readExplicitStored = (spec: any) => (key: string) => (
 
 /**
  * Drives a conditional setting: lazy init, then a re-resolve whenever the
- * server settings or any dependency in `deps` changes (server sync and
- * encoder or manual-resolution re-derivation alike). The resolver honors
+ * server settings or any dependency in `deps` changes (server sync and a
+ * dependency's re-derivation alike). The resolver honors
  * explicit choices, so a re-resolve never clobbers a pinned value.
  *
  * Re-resolving writes state rather than deriving during render because the
@@ -235,27 +227,27 @@ const roundDownToEven = (num: number) => {
     return Math.floor(n / 2) * 2;
 };
 
-/** Trailing-edge debounce: the last call within `delay` wins. */
-function debounce<A extends unknown[]>(func: (...args: A) => void, delay: number) {
+/**
+ * Trailing debounce of settings posts: a burst coalesces into one post
+ * carrying every setting changed in it, each at its last value, so a derived
+ * change never drops the one that caused it.
+ */
+function settingsPoster(delay: number) {
+    let pending: Record<string, unknown> = {};
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
-    return (...args: A) => {
+    return (setting: Record<string, unknown>) => {
+        Object.assign(pending, setting);
         clearTimeout(timeoutId);
-        timeoutId = setTimeout(() => func(...args), delay);
+        timeoutId = setTimeout(() => {
+            const settings = pending;
+            pending = {};
+            window.postMessage({ type: "settings", settings }, window.location.origin);
+        }, delay);
     };
 }
 
 /**
- * Sets the cross-script flag the cores read around a transport switch, so the
- * old peer's teardown does not surface a "Server disconnected" alert. Kept
- * outside the component: it is a signal to the runtime core, not component
- * state.
- */
-function setModeSwitching(active: boolean) {
-    window.__selkiesModeSwitching = active;
-}
-
-/**
- * The Settings panel: Video, Audio and Resolution tabs, each hidden when the
+ * The Settings panel: Video, Audio, and Resolution tabs, each hidden when the
  * server's UI customization disables it. Server settings are seeded from the
  * cached broadcast because the panel mounts after the core connects, and every
  * value stays editable afterwards with localStorage taking precedence.
@@ -328,7 +320,15 @@ export function Settings() {
         localStorage.getItem(getPrefixedKey("webcam_encoder"))
     );
     const [framerate, setFramerate] = useState(() =>
-        parseInt(localStorage.getItem(getPrefixedKey("framerate")) ?? "", 10) || 60
+        parseFloat(localStorage.getItem(getPrefixedKey("framerate")) ?? "") || 60
+    );
+    /** The stored frame-rate choice: a rate, `FRAMERATE_DISPLAY`, or null for none. */
+    const [framerateChoice, setFramerateChoice] = useState<string | null>(() =>
+        localStorage.getItem(getPrefixedKey("framerate"))
+    );
+    /** The display's refresh the core measured, null until it has. */
+    const [displayRate, setDisplayRate] = useState<number | null>(() =>
+        (window as any).displayRefreshRate ?? null
     );
     const [videoCRF, setVideoCRF] = useState(() => {
         const saved = localStorage.getItem(getPrefixedKey("video_crf"));
@@ -337,30 +337,26 @@ export function Settings() {
     /**
      * State the conditional settings read; rebuilt each render so the hooks
      * below re-resolve against current values when their deps change.
-     * `activeEncoder` is the one knob for both transports and reads storage
-     * first: an out-of-set stored value falls to the server's own fallback and
-     * the serverSettings sync re-seats it. `softwareEncoders` and `useCpu`
-     * (client choice, else the server's) feed the rate-control default;
      * `encoderBackends` decides whether the software encoding switch is shown.
      */
     const conditionalCtx = {
         manualActive: !!readStored("manual_width") || serverSettings?.manual_resolution?.value === true,
-        streamMode,
-        activeEncoder: readStored("encoder") || encoder,
-        softwareEncoders: serverSettings?.software_encoders?.value,
         encoderBackends: serverSettings?.encoder_backends?.value,
-        useCpu: readStored("use_cpu") !== null
-            ? readStored("use_cpu") === "true" : !!serverSettings?.use_cpu?.value,
         allowedRateControl: serverSettings?.rate_control_mode?.allowed || rateControlOptions,
         macDesktop: isMacDesktop(),
     };
+    /**
+     * Paint-over also reads the encoder and Turbo, Turbo resolved here rather
+     * than taken from its state, which trails the `serverSettings` sync by a
+     * render.
+     */
+    const paintOverCtx = {
+        ...conditionalCtx,
+        encoder,
+        videoStreamingMode: resolveSpec(VIDEO_STREAMING_MODE_SPEC, serverSettings, conditionalCtx, readStored),
+    };
     const DEBOUNCE_DELAY = 500;
-    const debouncedPostSetting = useMemo(() => debounce((setting: any) => {
-        window.postMessage(
-            { type: "settings", settings: setting },
-            window.location.origin
-        );
-    }, DEBOUNCE_DELAY), []);
+    const debouncedPostSetting = useMemo(() => settingsPoster(DEBOUNCE_DELAY), []);
 
     /** The two push channels a spec's `propagate` may use. */
     const conditionalIo = {
@@ -385,39 +381,33 @@ export function Settings() {
     const [hidpiEnabled, setHidpiEnabled] = useConditionalSetting(
         HIDPI_SPEC, serverSettings, conditionalCtx, [serverSettings], readHidpiStored);
     const [rateControlMode, setRateControlMode] = useConditionalSetting(
-        RATE_CONTROL_SPEC, serverSettings, conditionalCtx, [serverSettings, streamMode], readRateControlStored);
+        RATE_CONTROL_SPEC, serverSettings, conditionalCtx, [serverSettings], readRateControlStored);
     /**
      * With rate control disabled the server ignores rate_control_mode and
      * keeps the encoder's built-in default, so the dashboard neither pushes a
      * mode nor lets its own pick decide which quality slider is shown.
      */
     const rateControlEnabled = renderableSettings.enableRateControl ?? true;
-    // The hook only sets UI state; when the resolved default diverges from
-    // what the server applies (a transport switch seeds the previous mode's
-    // value), push it so the encoder follows. Pinned values post nothing.
+    // Stale-echo rule (module docblock): a stored mode without an explicit
+    // pick echoes a value a dashboard derived, and is dropped once it stops
+    // matching the ladder, which resolves to the server's own value; kept, it
+    // would hold the session to it and outlive an operator override.
     useEffect(() => {
         if (!serverSettings) return;
         if (serverSettings.enable_rate_control?.value === false) return;
         const rcKey = RATE_CONTROL_SPEC.storageKey;
         const resolved = resolveSpec(
             RATE_CONTROL_SPEC, serverSettings, conditionalCtx, readRateControlStored);
-        // Stale-echo rule (module docblock): an unmarked stored value that no
-        // longer matches the ladder is dropped, or it outlives the derivation.
         if (!isExplicitChoice(RATE_CONTROL_SPEC)
             && readStored(rcKey) !== null && readStored(rcKey) !== resolved) {
             localStorage.removeItem(getPrefixedKey(rcKey));
         }
-        if (isSettingPinned(RATE_CONTROL_SPEC, serverSettings, readRateControlStored)) return;
-        const serverValue = serverSettings[RATE_CONTROL_SPEC.serverKey]?.value;
-        if (resolved && serverValue !== undefined && resolved !== serverValue) {
-            writeConditional(RATE_CONTROL_SPEC, resolved, setRateControlMode, { persist: false });
-        }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [serverSettings]);
     // Same stale-echo rule for HiDPI, or a derived pick outlives its resolution
-    // mode, and the same push: the core starts from its own stored default, so
-    // a deployment that configures a resolution would stream pixel-perfect on
-    // every load with the toggle reading off.
+    // mode, and a push of the resolved value: the core starts from its own
+    // stored default, so a deployment that configures a resolution would stream
+    // pixel-perfect on every load with the toggle reading off.
     useEffect(() => {
         if (!serverSettings) return;
         const key = HIDPI_SPEC.storageKey;
@@ -463,18 +453,13 @@ export function Settings() {
     const [videoPaintoverBurstFrames, setVideoPaintoverBurstFrames] = useState(() =>
         parseInt(localStorage.getItem(getPrefixedKey("video_paintover_burst_frames")) ?? "", 10) || 5
     );
-    // Paint-over's default tracks rate control, so its resolution ctx carries
-    // the mode the rc hook just settled on.
-    const paintOverCtx = { ...conditionalCtx, rateControlMode };
     const [usePaintOverQuality, setUsePaintOverQuality] = useConditionalSetting(
-        USE_PAINT_OVER_QUALITY_SPEC, serverSettings, paintOverCtx, [serverSettings, rateControlMode], readPaintOverStored);
-    // Push the paint-over default the resolved rate control implies so the
-    // encoder agrees (same shape as the rate-control derivation above).
+        USE_PAINT_OVER_QUALITY_SPEC, serverSettings, paintOverCtx, [serverSettings], readPaintOverStored);
+    // Push the resolved paint-over value so the encoder agrees.
     useEffect(() => {
         if (!serverSettings) return;
         const key = USE_PAINT_OVER_QUALITY_SPEC.storageKey;
-        const resolved = resolveSpec(
-            USE_PAINT_OVER_QUALITY_SPEC, serverSettings, { ...conditionalCtx, rateControlMode }, readPaintOverStored);
+        const resolved = resolveSpec(USE_PAINT_OVER_QUALITY_SPEC, serverSettings, paintOverCtx, readPaintOverStored);
         // Same stale-echo rule as rate control.
         if (!isExplicitChoice(USE_PAINT_OVER_QUALITY_SPEC)
             && readStored(key) !== null
@@ -487,9 +472,33 @@ export function Settings() {
             writeConditional(USE_PAINT_OVER_QUALITY_SPEC, resolved, setUsePaintOverQuality, { persist: false });
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [serverSettings, rateControlMode]);
+    }, [serverSettings]);
+    // A later encoder or Turbo change re-derives paint-over where nothing pins it.
+    useEffect(() => {
+        if (!serverSettings || isSettingPinned(USE_PAINT_OVER_QUALITY_SPEC, serverSettings, readPaintOverStored)) return;
+        const resolved = resolveSpec(USE_PAINT_OVER_QUALITY_SPEC, serverSettings, paintOverCtx, readPaintOverStored);
+        if (resolved !== usePaintOverQuality) {
+            writeConditional(USE_PAINT_OVER_QUALITY_SPEC, resolved, setUsePaintOverQuality, { persist: false });
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [encoder, videoStreamingMode]);
     const [useCpu, setUseCpu] = useConditionalSetting(
         USE_CPU_SPEC, serverSettings, conditionalCtx, [serverSettings]);
+    const [video10Bit, setVideo10Bit] = useConditionalSetting(
+        VIDEO_10BIT_SPEC, serverSettings, conditionalCtx, [serverSettings]);
+    /** 10-bit is offered only where this engine shows a 10-bit picture of the stream's format. */
+    const [tenBitAnswer, setTenBitAnswer] = useState({ format: "", ok: false });
+    const tenBitOffered = tenBitStream(encoder, conditionalCtx.encoderBackends, useCpu, videoFullColor);
+    const tenBitFullColor = !!tenBitOffered && tenBitOffered.fullcolor;
+    const tenBitAsked = tenBitFormat(fullColorCodec, tenBitFullColor);
+    useEffect(() => {
+        let live = true;
+        canDecodeTenBit(fullColorCodec, tenBitFullColor).then((ok: boolean) => {
+            if (live) setTenBitAnswer({ format: tenBitFormat(fullColorCodec, tenBitFullColor), ok });
+        });
+        return () => { live = false; };
+    }, [fullColorCodec, tenBitFullColor]);
+    const tenBitDecodable = tenBitAnswer.ok && tenBitAnswer.format === tenBitAsked;
 
     // Anti-aliasing stays client-only (no server truth), so it keeps its own state.
     const [antiAliasing, setAntiAliasing] = useState(() => {
@@ -531,6 +540,9 @@ export function Settings() {
             if (event.data?.type === "effectiveCursorState" && typeof event.data.value === "boolean") {
                 setEffectiveCursor(event.data.value);
             }
+            if (event.data?.type === "displayRefresh" && Number.isFinite(event.data.rate)) {
+                setDisplayRate(event.data.rate);
+            }
             // The core's derived pick; a stored pick is the user's and stays.
             if (event.data?.type === "scalingDpiFollowed" && typeof event.data.value === "number"
                     && localStorage.getItem(getPrefixedKey("scaling_dpi")) === null) {
@@ -571,7 +583,7 @@ export function Settings() {
 
         const s_framerate = serverSettings.framerate;
         if (s_framerate) {
-            const stored = getStoredInt("framerate");
+            const stored = parseFloat(localStorage.getItem(getPrefixedKey("framerate")) ?? "");
             const final = !isNaN(stored)
                 ? Math.max(s_framerate.min, Math.min(s_framerate.max, stored))
                 : s_framerate.default;
@@ -673,8 +685,10 @@ export function Settings() {
      *
      * Output selection is probed on the sink the active core plays through,
      * `HTMLMediaElement.setSinkId` for the WebRTC core's video element and
-     * `AudioContext.setSinkId` (which Firefox lacks) for the WebSocket core;
-     * probing the wrong one would render a picker that does nothing.
+     * `AudioContext.setSinkId` for the WebSocket core, or where that is
+     * missing, as in Firefox, the media element that core then plays its
+     * context through; probing the wrong one would render a picker that does
+     * nothing.
      */
     const ensureAudioDevices = useCallback(() => {
         if (audioDevicesRequested.current) return;
@@ -685,9 +699,8 @@ export function Settings() {
             setAudioInputDevices([]);
             setAudioOutputDevices([]);
 
-            const supportsSinkId = isWebrtc
-                ? 'setSinkId' in HTMLMediaElement.prototype
-                : typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype;
+            const supportsSinkId = 'setSinkId' in HTMLMediaElement.prototype
+                || (!isWebrtc && typeof AudioContext !== 'undefined' && 'setSinkId' in AudioContext.prototype);
             setIsOutputSelectionSupported(supportsSinkId);
 
             try {
@@ -729,7 +742,7 @@ export function Settings() {
     /**
      * A half-typed size stays in component state: the stored `manual_width` and
      * `manual_height` mean "a manual resolution is applied", which the HiDPI
-     * and UI-scaling derivations read, so only Set, a preset and Reset write them.
+     * and UI-scaling derivations read, so only Set, a preset, and Reset write them.
      */
     const handleManualWidthChange = (event: React.ChangeEvent<HTMLInputElement>) => {
         setManualWidth(event.target.value);
@@ -760,82 +773,16 @@ export function Settings() {
         debouncedPostSetting({ scaling_dpi: newDpi });
     };
 
-    /**
-     * Asks the server to swap transports, then lets the core loader persist
-     * the mode and reload the page into the new stack.
-     *
-     * The request carries this client's own session token, which a controller's
-     * is enough for; a stored master token overrides it, and where neither is
-     * accepted a 401 prompts for the master token once, keeps it in
-     * sessionStorage and retries. A viewer is refused 403 and asked nothing.
-     */
+    /** Switches the transport (`switchStreamMode`); the core reloads into it. */
     const handleStreamModeChange = async (mode: string) => {
         if (mode === streamMode) return;
-        // /api/switch tears down the old peer (WS close 4000) before responding, so
-        // the flag must precede the request or the core alerts "Server disconnected".
-        setModeSwitching(true);
-        try {
-            const MASTER_TOKEN_KEY = "selkies_master_token";
-            const doSwitch = () => {
-                const headers: Record<string, string> = sessionAuthHeaders(
-                    { "Content-Type": "application/json" });
-                let storedToken: string | null = null;
-                try { storedToken = sessionStorage.getItem(MASTER_TOKEN_KEY); } catch { /* sessionStorage unavailable */ }
-                if (storedToken) headers["Authorization"] = `Bearer ${storedToken}`;
-                return fetch(`${getRoutePrefix()}/api/switch`, {
-                    method: "POST",
-                    headers,
-                    credentials: "same-origin",
-                    body: JSON.stringify({ mode }),
-                });
-            };
-            let response = await doSwitch();
-            if (response.status === 401) {
-                const entered = (typeof window !== "undefined" && window.prompt)
-                    ? window.prompt("Switching the stream mode requires the Selkies master token:")
-                    : null;
-                if (entered && entered.trim()) {
-                    try { sessionStorage.setItem(MASTER_TOKEN_KEY, entered.trim()); } catch { /* sessionStorage unavailable */ }
-                    response = await doSwitch();
-                }
-            }
-            if (!response.ok) {
-                // Drop a stale token on 401 so the next attempt re-prompts.
-                if (response.status === 401) { try { sessionStorage.removeItem(MASTER_TOKEN_KEY); } catch { /* sessionStorage unavailable */ } }
-                throw new Error(`Request failed with status ${response.status}`);
-            }
-            setStreamMode(mode);
-            window.postMessage({ type: "mode", mode }, window.location.origin);
-        } catch (error) {
-            // The switch failed, so no reload follows; clear the flag or a real
-            // disconnect afterwards would be silently suppressed.
-            setModeSwitching(false);
-            console.error("Error switching stream mode:", error);
-        }
+        if (await switchStreamMode(mode)) setStreamMode(mode);
     };
 
-    /**
-     * Re-derives rate control from the encoder and software encoding unless
-     * it is pinned by an explicit client or server choice. A derived change
-     * is not persisted, so it keeps following. `ctxOverrides` carries the
-     * value just chosen, ahead of the re-render that would put it in
-     * conditionalCtx.
-     */
-    const rederiveRateControl = (ctxOverrides: Record<string, unknown>) => {
-        if (!rateControlEnabled
-            || isSettingPinned(RATE_CONTROL_SPEC, serverSettings, readRateControlStored)) return;
-        const rcResolved = resolveSpec(
-            RATE_CONTROL_SPEC, serverSettings,
-            { ...conditionalCtx, ...ctxOverrides }, readRateControlStored);
-        if (rcResolved !== rateControlMode) {
-            writeConditional(RATE_CONTROL_SPEC, rcResolved, setRateControlMode, { persist: false });
-        }
-    };
     const handleEncoderChange = (selectedEncoder: string) => {
         setEncoder(selectedEncoder);
         localStorage.setItem(getPrefixedKey('encoder'), selectedEncoder);
         debouncedPostSetting({ encoder: selectedEncoder });
-        rederiveRateControl({ activeEncoder: selectedEncoder });
     };
 
     const handleWebcamEncoderChange = (preference: string) => {
@@ -850,10 +797,15 @@ export function Settings() {
     const wceChoice = webcamEncoderOptions.includes(webcamEncoderChoice ?? "") ? webcamEncoderChoice : null;
     const webcamEncoder = (wceServer?.locked && wceServerValue) || wceChoice || wceServerValue || "auto";
 
-    const handleFramerateChange = (selectedFramerate: number) => {
+    /** The display's own stop asks for the display's refresh wherever it moves. */
+    const handleFramerateChange = (index: number) => {
+        const selectedFramerate = framerateOptions.stops[index];
+        if (selectedFramerate === undefined) return;
+        const choice = index === framerateOptions.display ? FRAMERATE_DISPLAY : String(selectedFramerate);
         setFramerate(selectedFramerate);
-        localStorage.setItem(getPrefixedKey('framerate'), selectedFramerate.toString());
-        debouncedPostSetting({ framerate: selectedFramerate });
+        setFramerateChoice(choice);
+        localStorage.setItem(getPrefixedKey('framerate'), choice);
+        debouncedPostSetting({ framerate: choice === FRAMERATE_DISPLAY ? choice : selectedFramerate });
     };
 
     const handleVideoCRFChange = (selectedCRF: number) => {
@@ -862,7 +814,7 @@ export function Settings() {
         debouncedPostSetting({ video_crf: selectedCRF });
     };
 
-    /** An explicit choice is persisted, which pins it against encoder changes. */
+    /** An explicit choice is persisted, which pins it over the server's default. */
     const handleRateControlChange = (mode: string) => {
         writeConditional(RATE_CONTROL_SPEC, mode, setRateControlMode, { persist: true });
     };
@@ -901,6 +853,10 @@ export function Settings() {
         writeConditional(VIDEO_FULLCOLOR_SPEC, !videoFullColor, setVideoFullColor, { persist: true });
     };
 
+    const handle10BitToggle = () => {
+        writeConditional(VIDEO_10BIT_SPEC, !video10Bit, setVideo10Bit, { persist: true });
+    };
+
     const handleH264StreamingModeToggle = () => {
         writeConditional(VIDEO_STREAMING_MODE_SPEC, !videoStreamingMode, setVideoStreamingMode, { persist: true });
     };
@@ -911,7 +867,6 @@ export function Settings() {
 
     const handleUseCpuToggle = () => {
         writeConditional(USE_CPU_SPEC, !useCpu, setUseCpu, { persist: true });
-        rederiveRateControl({ useCpu: !useCpu });
     };
 
     /** Anti-aliasing is client-only; the core persists antiAliasingEnabled itself. */
@@ -1042,51 +997,22 @@ export function Settings() {
         resetDpiToDerivedDefault();
     };
 
-    /** CBR stops: the sub-Mbps steps, whole-Mbps steps to 100000, then the coarse steps, clipped to the server range. */
-    const videoBitrateOptions = (() => {
-        const min = serverSettings?.video_bitrate?.min ?? 100;
-        const max = serverSettings?.video_bitrate?.max ?? 1000000;
-        const stops = SUB_MBPS_BITRATE_STEPS.filter(v => v >= min && v <= max);
-        for (let v = Math.max(1000, Math.ceil(min / 1000) * 1000); v <= Math.min(100000, Math.floor(max / 1000) * 1000); v += 1000) stops.push(v);
-        stops.push(...COARSE_MBPS_BITRATE_STEPS.filter(v => v >= min && v <= max));
-        return stops.length ? stops : [min];
-    })();
-    /** Framerate stops clipped to the server-allowed span, as the stored value itself is clamped. */
-    const framerateOptions = (() => {
-        const min = serverSettings?.framerate?.min ?? 8;
-        const max = serverSettings?.framerate?.max ?? 240;
-        const stops = FRAMERATE_STEPS.filter(v => v >= min && v <= max);
-        return stops.length ? stops : [min];
-    })();
-    const framerateIndex = (() => {
-        const exact = framerateOptions.indexOf(framerate);
-        if (exact >= 0) return exact;
-        const above = framerateOptions.findIndex(v => v >= framerate);
-        return above >= 0 ? above : framerateOptions.length - 1;
-    })();
-    const bitrateIndex = (() => {
-        const exact = videoBitrateOptions.indexOf(videoBitRate);
-        if (exact >= 0) return exact;
-        const above = videoBitrateOptions.findIndex(v => v >= videoBitRate);
-        return above >= 0 ? above : videoBitrateOptions.length - 1;
-    })();
     /**
-     * CRF stops clipped to the server-allowed span. The list descends (higher
-     * quality to the right), so the nearest fallback for an off-stop value
-     * (server default, clamp) is the first stop at or below it.
+     * The slider stops inside the server's ranges; a stored value between stops
+     * (a server default, a clamp) shows at the nearest one.
      */
-    const videoCRFChoices = (() => {
-        const min = serverSettings?.video_crf?.min ?? 5;
-        const max = serverSettings?.video_crf?.max ?? 50;
-        const stops = videoCRFOptions.filter(v => v >= min && v <= max);
-        return stops.length ? stops : [min];
-    })();
-    const videoCRFIndex = (() => {
-        const exact = videoCRFChoices.indexOf(videoCRF);
-        if (exact >= 0) return exact;
-        const below = videoCRFChoices.findIndex(v => v <= videoCRF);
-        return below >= 0 ? below : videoCRFChoices.length - 1;
-    })();
+    const videoBitrateOptions = stopsWithin(BITRATE_STOPS, serverSettings?.video_bitrate?.min ?? 100, serverSettings?.video_bitrate?.max ?? 1000000);
+    const bitrateIndex = stopIndex(videoBitrateOptions, videoBitRate);
+    const framerateSpan = serverSettings?.framerate
+        ? { min: serverSettings.framerate.min, max: serverSettings.framerate.max }
+        : null;
+    const displayFramerate = displayRate ? matchDisplay(displayRate, framerateSpan?.min ?? 8, framerateSpan?.max ?? 240) : null;
+    const framerateOptions = withDisplayStop(stopsWithin(FRAMERATE_STOPS, framerateSpan?.min ?? 8, framerateSpan?.max ?? 240), displayFramerate);
+    const framerateFollows = followsDisplay(framerateChoice, framerateSpan) && displayFramerate !== null;
+    const framerateIndex = framerateStopIndex(framerateOptions, framerate, framerateFollows);
+    const videoCRFChoices = stopsWithin(CRF_STOPS, serverSettings?.video_crf?.min ?? 5, serverSettings?.video_crf?.max ?? 50);
+    const videoCRFIndex = stopIndex(videoCRFChoices, videoCRF);
+    const videoPaintoverCRFChoices = stopsWithin(CRF_STOPS, serverSettings?.video_paintover_crf?.min ?? 5, serverSettings?.video_paintover_crf?.max ?? 50);
     const formatBitrate = (v: number) => `${v / 1000} Mbps`;
 
     const audioBitrateChoices = (serverSettings?.audio_bitrate?.allowed?.map((v: string) => parseInt(v, 10))) || audioBitrateOptions;
@@ -1103,6 +1029,8 @@ export function Settings() {
     const activeEncoder = encoder;
     const isH264 = VIDEO_ENCODERS.includes(activeEncoder);
     const showFullColor = isH264 && codecCarriesFullColor(codecOfEncoder(activeEncoder));
+    const show10Bit = isH264 && codecCarriesTenBit(codecOfEncoder(activeEncoder))
+        && !!tenBitOffered;
     const showJpegOptions = !isWebrtc && activeEncoder === 'jpeg';
     const showRateControl = rateControlEnabled && isH264;
     /**
@@ -1131,7 +1059,7 @@ export function Settings() {
     }
 
     return (
-        <Card className="w-[300px] p-0 pb-4 bg-background/95 backdrop-blur-sm border shadow-sm">
+        <Card className="w-[300px] p-0 pb-4 bg-background border shadow-sm">
             <Tabs
                 defaultValue={defaultTab}
                 onValueChange={(value) => { if (value === "audio") ensureAudioDevices(); }}
@@ -1241,11 +1169,11 @@ export function Settings() {
                                     <div className="space-y-2">
                                         <label className="text-sm font-medium">{t('sections.screen.uiScalingLabel')}</label>
                                         <DropdownMenu>
-                                            <DropdownMenuTrigger asChild>
-                                                <Button variant="outline" className="w-full justify-between" disabled={dpiScalingDisabled}>
-                                                    {dpiScalingChoices.find(option => option.value === selectedDpi)?.label || "100%"}
-                                                    <ChevronUp className="h-4 w-4 rotate-180" />
-                                                </Button>
+                                            <DropdownMenuTrigger
+                                                render={<Button variant="outline" className="w-full justify-between" disabled={dpiScalingDisabled} />}
+                                            >
+                                                {dpiScalingChoices.find(option => option.value === selectedDpi)?.label || "100%"}
+                                                <ChevronUp className="h-4 w-4 rotate-180" />
                                             </DropdownMenuTrigger>
                                             <DropdownMenuContent className="w-full">
                                                 {dpiScalingChoices.map((option) => (
@@ -1263,16 +1191,17 @@ export function Settings() {
                             </>
                         )}
 
-                        {!serverSettings?.manual_resolution?.locked && (
+                        {!serverSettings?.manual_resolution?.locked
+                            && (isSecondaryDisplay || serverSettings?.enable_resize?.value !== false) && (
                             <>
                                 <div className="space-y-2">
                                     <label className="text-sm font-medium">{tl('sections.screen.presetLabel')}</label>
                                     <DropdownMenu>
-                                        <DropdownMenuTrigger asChild>
-                                            <Button variant="outline" className="w-full justify-between">
-                                                {presetValue || t('sections.screen.resolutionPresetSelect')}
-                                                <ChevronUp className="h-4 w-4 rotate-180" />
-                                            </Button>
+                                        <DropdownMenuTrigger
+                                            render={<Button variant="outline" className="w-full justify-between" />}
+                                        >
+                                            {presetValue || t('sections.screen.resolutionPresetSelect')}
+                                            <ChevronUp className="h-4 w-4 rotate-180" />
                                         </DropdownMenuTrigger>
                                         <DropdownMenuContent className="w-full">
                                             {commonResolutionValues.slice(1).map((res) => (
@@ -1371,11 +1300,11 @@ export function Settings() {
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">{t('streamingModeTitle')}</label>
                                 <DropdownMenu>
-                                    <DropdownMenuTrigger asChild>
-                                        <Button variant="outline" className="w-full justify-between">
-                                            {displayLabel(streamMode)}
-                                            <ChevronUp className="h-4 w-4 rotate-180" />
-                                        </Button>
+                                    <DropdownMenuTrigger
+                                        render={<Button variant="outline" className="w-full justify-between" />}
+                                    >
+                                        {displayLabel(streamMode)}
+                                        <ChevronUp className="h-4 w-4 rotate-180" />
                                     </DropdownMenuTrigger>
                                     <DropdownMenuContent className="w-full">
                                         {STREAMING_MODES.map(mode => (
@@ -1395,11 +1324,11 @@ export function Settings() {
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">{tl('sections.video.encoderLabel')}</label>
                                 <DropdownMenu>
-                                    <DropdownMenuTrigger asChild>
-                                        <Button variant="outline" className="w-full justify-between">
-                                            {displayLabel(activeEncoder)}
-                                            <ChevronUp className="h-4 w-4 rotate-180" />
-                                        </Button>
+                                    <DropdownMenuTrigger
+                                        render={<Button variant="outline" className="w-full justify-between" />}
+                                    >
+                                        {displayLabel(activeEncoder)}
+                                        <ChevronUp className="h-4 w-4 rotate-180" />
                                     </DropdownMenuTrigger>
                                     <DropdownMenuContent className="w-full">
                                         {dynamicEncoderOptions.map(enc => (
@@ -1425,12 +1354,17 @@ export function Settings() {
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">{tl('sections.video.webcamEncoderLabel')}</label>
                                 <DropdownMenu>
-                                    <DropdownMenuTrigger asChild>
-                                        <Button variant="outline" className="w-full justify-between"
-                                            disabled={!!serverSettings?.webcam_encoder?.locked}>
-                                            {displayLabel(webcamEncoder)}
-                                            <ChevronUp className="h-4 w-4 rotate-180" />
-                                        </Button>
+                                    <DropdownMenuTrigger
+                                        render={
+                                            <Button
+                                                variant="outline"
+                                                className="w-full justify-between"
+                                                disabled={!!serverSettings?.webcam_encoder?.locked}
+                                            />
+                                        }
+                                    >
+                                        {displayLabel(webcamEncoder)}
+                                        <ChevronUp className="h-4 w-4 rotate-180" />
                                     </DropdownMenuTrigger>
                                     <DropdownMenuContent className="w-full">
                                         {webcamEncoderOptions.map(pref => (
@@ -1448,20 +1382,17 @@ export function Settings() {
 
                         {(renderableSettings.framerate ?? true) && (
                             <div className="space-y-2">
-                                <label className="text-sm font-medium">{tl('sections.video.framerateLabel', { framerate })}</label>
+                                <label className="text-sm font-medium">
+                                    {tl(framerateFollows ? 'sections.video.framerateDisplayLabel' : 'sections.video.framerateLabel',
+                                        { framerate: framerateLabel(framerateFollows && displayFramerate !== null ? displayFramerate : framerate) })}
+                                </label>
                                 <div className="flex items-center gap-2">
                                     <Slider
                                         min={0}
-                                        max={framerateOptions.length - 1}
+                                        max={framerateOptions.stops.length - 1}
                                         step={1}
                                         value={[framerateIndex]}
-                                        onValueChange={(value) => {
-                                            const index = value[0];
-                                            const selectedFramerate = framerateOptions[index];
-                                            if (selectedFramerate !== undefined) {
-                                                handleFramerateChange(selectedFramerate);
-                                            }
-                                        }}
+                                        onValueChange={(value) => handleFramerateChange(Array.isArray(value) ? value[0] : value)}
                                         className="flex-1"
                                     />
                                 </div>
@@ -1475,11 +1406,11 @@ export function Settings() {
                                 <div className="space-y-2">
                                     <label className="text-sm font-medium">{t('sections.video.rateControlLabel')}</label>
                                     <DropdownMenu>
-                                        <DropdownMenuTrigger asChild>
-                                            <Button variant="outline" className="w-full justify-between">
-                                                {displayLabel(rateControlMode)}
-                                                <ChevronUp className="h-4 w-4 rotate-180" />
-                                            </Button>
+                                        <DropdownMenuTrigger
+                                            render={<Button variant="outline" className="w-full justify-between" />}
+                                        >
+                                            {displayLabel(rateControlMode)}
+                                            <ChevronUp className="h-4 w-4 rotate-180" />
                                         </DropdownMenuTrigger>
                                         <DropdownMenuContent className="w-full">
                                             {(serverSettings?.rate_control_mode?.allowed || rateControlOptions).map((mode: string) => (
@@ -1502,7 +1433,7 @@ export function Settings() {
                                             step={1}
                                             value={[bitrateIndex]}
                                             onValueChange={(value) => {
-                                                const selected = videoBitrateOptions[value[0]];
+                                                const selected = videoBitrateOptions[Array.isArray(value) ? value[0] : value];
                                                 if (selected !== undefined) handleVideoBitRateChange(selected);
                                             }}
                                             disabled={!serverSettings || serverSettings.video_bitrate?.min === serverSettings.video_bitrate?.max}
@@ -1522,7 +1453,7 @@ export function Settings() {
                                             step={1}
                                             value={[videoCRFIndex]}
                                             onValueChange={(value) => {
-                                                const newCRF = videoCRFChoices[value[0]];
+                                                const newCRF = videoCRFChoices[Array.isArray(value) ? value[0] : value];
                                                 if (newCRF !== undefined) handleVideoCRFChange(newCRF);
                                             }}
                                             disabled={!serverSettings || serverSettings.video_crf?.min === serverSettings.video_crf?.max}
@@ -1534,7 +1465,7 @@ export function Settings() {
                             </>
                         )}
 
-                        {/* Paint-over, Turbo and 4:4:4 are pixelflux encoder features shared by both transports. */}
+                        {/* Paint-over, Turbo, and 4:4:4 are pixelflux encoder features shared by both transports. */}
                         {isH264 && (
                             <>
                                 {showFullColor && (renderableSettings.videoFullColor ?? true) && fullColorDecodable && (
@@ -1546,6 +1477,19 @@ export function Settings() {
                                         checked={videoFullColor}
                                         onCheckedChange={handleH264FullColorToggle}
                                         disabled={!serverSettings || serverSettings.video_fullcolor?.locked}
+                                    />
+                                </div>
+                                )}
+
+                                {show10Bit && (renderableSettings.video10Bit ?? true) && tenBitDecodable && (
+                                <div className="flex items-center justify-between">
+                                    <div className="space-y-0.5">
+                                        <label className="text-sm font-medium">{t('sections.video.tenBitLabel')}</label>
+                                    </div>
+                                    <Switch
+                                        checked={video10Bit}
+                                        onCheckedChange={handle10BitToggle}
+                                        disabled={!serverSettings || serverSettings.video_10bit?.locked}
                                     />
                                 </div>
                                 )}
@@ -1576,7 +1520,7 @@ export function Settings() {
                                         max={serverSettings?.jpeg_quality?.max || 100}
                                         step={1}
                                         value={[jpegQuality]}
-                                        onValueChange={(value) => handleJpegQualityChange(value[0])}
+                                        onValueChange={(value) => handleJpegQualityChange(Array.isArray(value) ? value[0] : value)}
                                         disabled={!serverSettings || serverSettings.jpeg_quality?.min === serverSettings.jpeg_quality?.max}
                                         className="flex-1"
                                     />
@@ -1605,11 +1549,14 @@ export function Settings() {
                                     <label className="text-sm font-medium">{tl('sections.video.paintoverCrfLabel', { crf: videoPaintoverCRF })}</label>
                                     <div className="flex items-center gap-2">
                                         <Slider
-                                            min={serverSettings?.video_paintover_crf?.min || 5}
-                                            max={serverSettings?.video_paintover_crf?.max || 50}
+                                            min={0}
+                                            max={videoPaintoverCRFChoices.length - 1}
                                             step={1}
-                                            value={[videoPaintoverCRF]}
-                                            onValueChange={(value) => handleH264PaintoverCRFChange(value[0])}
+                                            value={[stopIndex(videoPaintoverCRFChoices, videoPaintoverCRF)]}
+                                            onValueChange={(value) => {
+                                                const newCRF = videoPaintoverCRFChoices[Array.isArray(value) ? value[0] : value];
+                                                if (newCRF !== undefined) handleH264PaintoverCRFChange(newCRF);
+                                            }}
                                             disabled={!serverSettings || serverSettings.video_paintover_crf?.min === serverSettings.video_paintover_crf?.max}
                                             className="flex-1"
                                         />
@@ -1625,7 +1572,7 @@ export function Settings() {
                                             max={serverSettings?.video_paintover_burst_frames?.max || 30}
                                             step={1}
                                             value={[videoPaintoverBurstFrames]}
-                                            onValueChange={(value) => handleH264PaintoverBurstChange(value[0])}
+                                            onValueChange={(value) => handleH264PaintoverBurstChange(Array.isArray(value) ? value[0] : value)}
                                             disabled={!serverSettings || serverSettings.video_paintover_burst_frames?.min === serverSettings.video_paintover_burst_frames?.max}
                                             className="flex-1"
                                         />
@@ -1644,7 +1591,7 @@ export function Settings() {
                                         max={serverSettings?.paint_over_jpeg_quality?.max || 100}
                                         step={1}
                                         value={[paintOverJpegQuality]}
-                                        onValueChange={(value) => handlePaintOverJpegQualityChange(value[0])}
+                                        onValueChange={(value) => handlePaintOverJpegQualityChange(Array.isArray(value) ? value[0] : value)}
                                         disabled={!serverSettings || serverSettings.paint_over_jpeg_quality?.min === serverSettings.paint_over_jpeg_quality?.max}
                                         className="flex-1"
                                     />
@@ -1681,7 +1628,7 @@ export function Settings() {
                                     step={1}
                                     value={[Math.max(0, audioBitrateChoices.indexOf(audioBitRate))]}
                                     onValueChange={(value) => {
-                                        const index = value[0];
+                                        const index = Array.isArray(value) ? value[0] : value;
                                         const selectedBitrate = audioBitrateChoices[index];
                                         if (selectedBitrate !== undefined) {
                                             setAudioBitRate(selectedBitrate);
@@ -1702,13 +1649,13 @@ export function Settings() {
                         <div className="space-y-2">
                             <label className="text-sm font-medium">{tl('sections.audio.inputLabel')}</label>
                             <DropdownMenu>
-                                <DropdownMenuTrigger asChild>
-                                    <Button variant="outline" className="w-full justify-between" disabled={isLoadingAudioDevices || !!audioDeviceError}>
-                                        <span className="truncate">
-                                            {audioInputDevices.find(d => d.deviceId === selectedInputDeviceId)?.label || t('audio.defaultDevice')}
-                                        </span>
-                                        <ChevronUp className="h-4 w-4 rotate-180 flex-shrink-0" />
-                                    </Button>
+                                <DropdownMenuTrigger
+                                    render={<Button variant="outline" className="w-full justify-between" disabled={isLoadingAudioDevices || !!audioDeviceError} />}
+                                >
+                                    <span className="truncate">
+                                        {audioInputDevices.find(d => d.deviceId === selectedInputDeviceId)?.label || t('audio.defaultDevice')}
+                                    </span>
+                                    <ChevronUp className="h-4 w-4 rotate-180 flex-shrink-0" />
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent className="w-[280px] max-w-[90vw]">
                                     {audioInputDevices.map(device => (
@@ -1733,13 +1680,13 @@ export function Settings() {
                             <div className="space-y-2">
                                 <label className="text-sm font-medium">{tl('sections.audio.outputLabel')}</label>
                                 <DropdownMenu>
-                                    <DropdownMenuTrigger asChild>
-                                        <Button variant="outline" className="w-full justify-between" disabled={isLoadingAudioDevices || !!audioDeviceError}>
-                                            <span className="truncate">
-                                                {audioOutputDevices.find(d => d.deviceId === selectedOutputDeviceId)?.label || t('audio.defaultDevice')}
-                                            </span>
-                                            <ChevronUp className="h-4 w-4 rotate-180 flex-shrink-0" />
-                                        </Button>
+                                    <DropdownMenuTrigger
+                                        render={<Button variant="outline" className="w-full justify-between" disabled={isLoadingAudioDevices || !!audioDeviceError} />}
+                                    >
+                                        <span className="truncate">
+                                            {audioOutputDevices.find(d => d.deviceId === selectedOutputDeviceId)?.label || t('audio.defaultDevice')}
+                                        </span>
+                                        <ChevronUp className="h-4 w-4 rotate-180 flex-shrink-0" />
                                     </DropdownMenuTrigger>
                                     <DropdownMenuContent className="w-[280px] max-w-[90vw]">
                                         {audioOutputDevices.map(device => (

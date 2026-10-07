@@ -177,8 +177,15 @@ HALF_TURN_JS = C.wire_hook_js("""
 """)
 
 
+def interposer_env(sock_dir: str) -> dict:
+    """Environment of a process whose /dev/video0 is the camera serving `sock_dir` and no other:
+    the interposer's default source falls back to a PipeWire node named selkies-webcam, which on
+    a shared session daemon may be another suite's camera."""
+    return dict(os.environ, LD_PRELOAD=INTERPOSER, SELKIES_WEBCAM_SOCKET_PATH=sock_dir, SELKIES_WEBCAM_SOURCE="socket")
+
+
 def probe(frames: int, timeout_ms: int = 4000, samples=((320, 240),)) -> dict:
-    env = dict(os.environ, LD_PRELOAD=INTERPOSER, SELKIES_WEBCAM_SOCKET_PATH=os.environ.get("SELKIES_WEBCAM_SOCKET_PATH", "/tmp"))
+    env = interposer_env(os.environ.get("SELKIES_WEBCAM_SOCKET_PATH", H.RUNTIME_DIR))
     cmd = [PROBE, "--timeout", str(timeout_ms)]
     for x, y in samples:
         cmd += ["--sample", f"{x},{y}"]
@@ -223,8 +230,7 @@ def wait_format(fourcc: str, timeout: float = 20) -> bool:
 
 def start_reader() -> subprocess.Popen:
     """An interposer client that holds the device open until it is terminated."""
-    env = dict(os.environ, LD_PRELOAD=INTERPOSER,
-               SELKIES_WEBCAM_SOCKET_PATH=os.environ.get("SELKIES_WEBCAM_SOCKET_PATH", "/tmp"))
+    env = interposer_env(os.environ.get("SELKIES_WEBCAM_SOCKET_PATH", H.RUNTIME_DIR))
     return subprocess.Popen([PROBE, "--timeout", "60000", "/dev/video0", "100000"],
                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -284,6 +290,15 @@ NO_WEBCODECS_JS = """
   })();
 """
 
+# And OffscreenCanvas, as Safari before 16.4 and Firefox before 105 lack it: the
+# JPEG rung then draws on a page canvas.
+NO_OFFSCREEN_JS = """
+  (() => {
+    try { Object.defineProperty(window, 'OffscreenCanvas', { value: undefined, configurable: true, writable: true }); } catch (e) {}
+    try { delete HTMLCanvasElement.prototype.transferControlToOffscreen; } catch (e) {}
+  })();
+"""
+
 
 def launch(p, engine: str, cam_sock: str, mode: str, init_js: Optional[str] = None):
     """Open the dashboard in `engine` with the published camera as its only device.
@@ -294,7 +309,7 @@ def launch(p, engine: str, cam_sock: str, mode: str, init_js: Optional[str] = No
     Returns:
         `(browser, page, errors)`, where `errors` collects page errors as they occur.
     """
-    env = dict(os.environ, LD_PRELOAD=INTERPOSER, SELKIES_WEBCAM_SOCKET_PATH=cam_sock)
+    env = interposer_env(cam_sock)
     if engine == "firefox":
         prefs = {
             "media.navigator.permission.disabled": True,
@@ -310,15 +325,12 @@ def launch(p, engine: str, cam_sock: str, mode: str, init_js: Optional[str] = No
         }
         if C.openh264_version():
             # The side-loaded OpenH264 lives in the persistent e2e profile.
-            ctx = p.firefox.launch_persistent_context(user_data_dir=C.FF_E2E_PROFILE, headless=True,
-                                                      viewport={"width": 1280, "height": 720},
-                                                      firefox_user_prefs=prefs, env=env)
+            ctx = p.firefox.launch_persistent_context(**C.installed_firefox({
+                "user_data_dir": C.FF_E2E_PROFILE, "headless": True, "viewport": {"width": 1280, "height": 720},
+                "firefox_user_prefs": prefs, "env": env}))
             browser = ctx.browser or ctx
         else:
-            kw = {"headless": True, "firefox_user_prefs": prefs, "env": env}
-            if C.FIREFOX_PATH:
-                kw["executable_path"] = C.FIREFOX_PATH
-            browser = p.firefox.launch(**kw)
+            browser = p.firefox.launch(**C.installed_firefox({"headless": True, "firefox_user_prefs": prefs, "env": env}))
             ctx = browser.new_context(viewport={"width": 1280, "height": 720})
     elif engine == "webkit":
         # The Safari stand-in. It takes no capture flags, so the grant is the context's
@@ -358,17 +370,19 @@ def jpeg_center(path: str):
         return None
 
 
-def nowebcodecs_block() -> "H.Results":
+def nowebcodecs_block(offscreen: bool = True) -> "H.Results":
     """Chromium with every WebCodecs global removed: the screen degrades to striped
     JPEG, the camera goes up the JPEG rung, and the server's default device format
-    follows that uplink into an MJPEG device whose frames carry the camera picture."""
-    res = H.Results("webcam-nowebcodecs")
+    follows that uplink into an MJPEG device whose frames carry the camera picture.
+    Without `offscreen` OffscreenCanvas goes too, and the rung draws on a page canvas."""
+    res = H.Results("webcam-nowebcodecs" + ("" if offscreen else "-canvas"))
     cam = PublishedCamera(flat_frames()).start()
     dump = os.path.join(cam.sock_dir, "frame.jpg")
     H.server_start(mode="websockets", wayland=False, extra_env={"SELKIES_WEBCAM_ENABLED": "false"})
     try:
         with sync_playwright() as p:
-            browser, page, errors = launch(p, "chromium", cam.sock_dir, "websockets", init_js=NO_WEBCODECS_JS)
+            browser, page, errors = launch(p, "chromium", cam.sock_dir, "websockets",
+                                           init_js=NO_WEBCODECS_JS + ("" if offscreen else NO_OFFSCREEN_JS))
             logs = []
             page.on("console", lambda m: logs.append(m.text) if "[Webcam]" in m.text else None)
             video = C.wait_ws_video(page, timeout=30)
@@ -380,7 +394,7 @@ def nowebcodecs_block() -> "H.Results":
             deadline = time.time() + 25
             while time.time() < deadline and probe(2, timeout_ms=1500).get("rc") != 0:
                 time.sleep(0.5)
-            env = dict(os.environ, LD_PRELOAD=INTERPOSER, SELKIES_WEBCAM_SOCKET_PATH="/tmp")
+            env = interposer_env(H.RUNTIME_DIR)
             p2 = subprocess.run([PROBE, "--timeout", "4000", "--dump", dump, "/dev/video0", "30"], env=env,
                                 capture_output=True, text=True, timeout=40)
             r = dict(line.split("=", 1) for line in p2.stdout.splitlines() if "=" in line and not line.startswith("sample"))
@@ -393,6 +407,9 @@ def nowebcodecs_block() -> "H.Results":
                       px is not None and px[0] == (1280, 720) and px[1][1] > 200 and px[1][0] < 60 and px[1][2] < 60
                       and max(px[2]) < 40, str(px))
             res.check("client took the JPEG rung", any("JPEG" in line for line in logs), "; ".join(logs)[:200])
+            drawn = "OffscreenCanvas" if offscreen else "a page canvas"
+            res.check(f"drawn on {drawn}", any(f"encoder: JPEG through {drawn}" in line for line in logs),
+                      "; ".join(logs)[:200])
             toggle(page, False)
             res.check("webcam reports inactive", wait_status(page, False), str(page.evaluate("window.__camStatus")))
             res.check("no page errors", not errors, "; ".join(errors)[:200])
@@ -936,6 +953,8 @@ def main() -> int:
         ok = locked_block().summary()
     elif sel == "nowebcodecs":
         ok = nowebcodecs_block().summary()
+    elif sel == "nowebcodecs-canvas":
+        ok = nowebcodecs_block(offscreen=False).summary()
     elif sel == "reformat":
         ok = reformat_block().summary()
     elif sel == "detail":

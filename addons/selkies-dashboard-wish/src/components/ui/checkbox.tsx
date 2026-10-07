@@ -4,16 +4,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import * as React from "react"
-import { Checkbox as CheckboxPrimitive } from "radix-ui"
+import { Checkbox as CheckboxPrimitive } from "@base-ui/react/checkbox"
 import { CheckIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 
-function Checkbox({
-  className,
-  ...props
-}: React.ComponentProps<typeof CheckboxPrimitive.Root>) {
+function Checkbox({ className, ...props }: CheckboxPrimitive.Root.Props) {
   return (
     <CheckboxPrimitive.Root
       data-slot="checkbox"

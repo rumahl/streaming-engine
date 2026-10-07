@@ -35,7 +35,7 @@ import base64
 import aiohttp
 import asyncio
 import logging
-from typing import Any, Callable, Dict, Optional, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Awaitable
 from aiohttp import ClientWebSocketResponse, WSMsgType
 
 logger = logging.getLogger("signaling")
@@ -66,9 +66,10 @@ class WebRTCSignalingClient:
             peer's SDP; assigned by the consumer.
         on_disconnect: Async callback fired when the socket closes.
         on_session_start: Async callback `(client_peer_id, client_type,
-            client_token, display_id, display_position, fullcolor_codecs=None)`
-            for SESSION_START; `fullcolor_codecs` is what the client's hello
-            said it decodes at 4:4:4, `None` when it did not say.
+            client_token, display_id, display_position, fullcolor_codecs=None,
+            tenbit_codecs=None)` for SESSION_START; `fullcolor_codecs` is what
+            the client's hello said it decodes at 4:4:4 and `tenbit_codecs` at
+            10 bits, `None` when it did not say.
         on_session_end: Async callback `(client_peer_id, client_type)` for
             SESSION_END.
         on_error: Async callback receiving a `WebRTCSignalingError` for a
@@ -83,6 +84,7 @@ class WebRTCSignalingClient:
         basic_auth_user: Optional[str] = None,
         basic_auth_password: Optional[str] = None,
         server_token: Optional[str] = None,
+        unix_socket: Optional[str] = None,
     ) -> None:
         """Initialize the signaling client.
 
@@ -90,8 +92,12 @@ class WebRTCSignalingClient:
             server: WebSocket server URL (e.g., 'ws://localhost:8080/ws').
             server_token: Master token proving this peer may claim the server
                 role; required by the signaling server in secure mode.
+            unix_socket: Path of the Unix domain socket the signaling server
+                listens on instead of a TCP port; the connection goes there and
+                `server` supplies only the scheme, host, and path.
         """
         self.server = server
+        self.unix_socket = unix_socket
         self.peer_type = "server"
         self.enable_https = enable_https
         self.enable_basic_auth = enable_basic_auth
@@ -168,7 +174,8 @@ class WebRTCSignalingClient:
         while not self._stop_event.is_set():
             try:
                 logger.debug("Connecting to signaling server")
-                self._session = aiohttp.ClientSession()
+                connector = aiohttp.UnixConnector(path=self.unix_socket) if self.unix_socket else None
+                self._session = aiohttp.ClientSession(connector=connector)
                 self._ws = await self._session.ws_connect(
                     self.server,
                     headers=headers,
@@ -287,7 +294,7 @@ class WebRTCSignalingClient:
         token is the secure-mode collaboration token; `SESSION_END <peer_id>
         <client_type>`; `ERROR ...`; otherwise `<peer_id> <json>` carrying an
         `sdp` or `ice` object. A client's text is relayed here verbatim, so a
-        malformed, non-object or unrecognized payload — and a callback that
+        malformed, non-object, or unrecognized payload — and a callback that
         raises on a stale SDP/ICE — is logged and dropped rather than treated
         as a transport failure, which would tear down every peer's session.
         """
@@ -296,18 +303,20 @@ class WebRTCSignalingClient:
 
         elif message.startswith("SESSION_START"):
             toks = message.strip().split(" ")
-            if len(toks) == 3 or 5 <= len(toks) <= 7:
+            if len(toks) == 3 or 5 <= len(toks) <= 8:
                 client_peer_id = toks[1]
                 client_type = toks[2]
                 display_id = toks[3] if len(toks) >= 5 else "primary"
                 display_position = toks[4] if len(toks) >= 5 else "right"
                 extras = toks[5:]
-                client_token = next((t for t in extras if not t.startswith("fullcolor=")), None)
-                fullcolor = next((t[len("fullcolor="):] for t in extras if t.startswith("fullcolor=")), None)
-                fullcolor_codecs = [c for c in fullcolor.split(",") if c] if fullcolor is not None else None
+                def named(prefix: str) -> Optional[List[str]]:
+                    listed = next((t[len(prefix):] for t in extras if t.startswith(prefix)), None)
+                    return [c for c in listed.split(",") if c] if listed is not None else None
+
+                client_token = next((t for t in extras if not t.startswith(("fullcolor=", "tenbit="))), None)
                 await self.on_session_start(
                     client_peer_id, client_type, client_token, display_id, display_position,
-                    fullcolor_codecs=fullcolor_codecs,
+                    fullcolor_codecs=named("fullcolor="), tenbit_codecs=named("tenbit="),
                 )
             else:
                 logger.error(f"invalid SESSION_START message: {message}")

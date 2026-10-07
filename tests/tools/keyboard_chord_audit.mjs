@@ -15,6 +15,10 @@
 // Reading those flags to tell a level shift from a shortcut therefore gives a
 // different answer per browser, which is the defect this matrix exists to catch.
 //
+// They disagree about macOS Command too: WebKit and Gecko never deliver the keyup
+// of a key let go while Command is down, where Blink does (Safari 26, Firefox 157
+// and Chrome 154, measured from a HID keyboard).
+//
 // Prints one PASS/FAIL line per check and exits non-zero if any failed.
 
 import { Input } from '../../addons/selkies-web-core/lib/input.js';
@@ -80,7 +84,7 @@ const ENGINES = {
         // The dashboards' on-screen modifiers: a constructed KeyboardEvent
         // naming the modifier it wants held, with no platform behind it.
         platform: 'MacIntel', ua: 'Mozilla/5.0 (Macintosh) Chrome/151', chrome: true,
-        trusted: false, flags: (down) => ({ altGraph: false }),
+        trusted: false, flags: () => ({ altGraph: false }),
     },
 };
 
@@ -103,7 +107,6 @@ function makeInput() {
     input._altKeysymByCode = new Map();
     input._altGrArmed = false;
     input._altGrTimeout = null;
-    input._macCmdSwapped = false;
     input.isComposing = false;
     input.gamingMode = false;
     input._isSynth = false;
@@ -116,13 +119,15 @@ function makeInput() {
 /**
  * Run one action under one engine and return the wire it produced.
  *
- * An action is physical: `['down'|'up', code, character?, forced?]` steps, with
- * the character the layout produces for that key under the modifiers then down.
- * The engine supplies everything else the browser would say about it; `forced`
- * overrides a flag, for a modifier whose own keydown never reached the page, or
- * carries `replay` for a step clipboard-sync re-dispatched and `physical` for a
- * real keypress among page-built ones. `opts.synth` raises synthetic mode, as
- * the dashboards do while a soft modifier is held.
+ * An action is physical: `['down'|'up'|'lost', code, character?, forced?]` steps,
+ * with the character the layout produces for that key under the modifiers then
+ * down; a `lost` key comes up with no event reaching the page. The engine
+ * supplies everything else the browser would say about it; `forced` overrides a
+ * flag, for a modifier whose own keydown never reached the page, or carries
+ * `replay` for a step clipboard-sync re-dispatched, `physical` for a real
+ * keypress among page-built ones, `repeat` for an autorepeat, and `native` for
+ * an event on a control the dashboards keep native. `opts.synth` raises
+ * synthetic mode, as the dashboards do while a soft modifier is held.
  */
 function wire(engineName, steps, opts = {}) {
     const engine = ENGINES[engineName];
@@ -132,7 +137,8 @@ function wire(engineName, steps, opts = {}) {
     const down = new Set();
     for (const [action, code, char, forced] of steps) {
         if (action === 'down') down.add(code); else down.delete(code);
-        const { replay, physical, ...override } = forced || {};
+        if (action === 'lost') continue;
+        const { replay, physical, repeat, native, ...override } = forced || {};
         const flags = {
             shift: held(down, 'Shift'), ctrl: held(down, 'Control'),
             alt: held(down, 'Alt'), meta: held(down, 'Meta'),
@@ -144,10 +150,11 @@ function wire(engineName, steps, opts = {}) {
                         Shift: flags.shift, AltGraph: flags.altGraph };
         const event = {
             key, code, location: LOCATION[code] || 0, keyCode: 0, isComposing: false,
-            timeStamp: 0,
+            timeStamp: 0, repeat: !!repeat,
             isTrusted: physical === true || (!replay && engine.trusted !== false),
             altKey: flags.alt, ctrlKey: flags.ctrl, metaKey: flags.meta, shiftKey: flags.shift,
-            target: { classList: { contains: () => false }, parentElement: null },
+            target: { classList: { contains: (name) => !!native && name === 'allow-native-input' },
+                      parentElement: null },
             getModifierState: (name) => !!state[name],
             preventDefault() {}, stopPropagation() {},
         };
@@ -161,7 +168,7 @@ function wire(engineName, steps, opts = {}) {
 
 const XK = { Alt_L: 65513, Mode_switch: 65406, ISO_Level3_Shift: 65027, Control_L: 65507,
              Control_R: 65508, Super_L: 65515, Meta_L: 65511, Omega: 0x7d9, lstroke: 435,
-             Tab: 65289, Left: 65361 };
+             Tab: 65289, Left: 65361, BackSpace: 65288, Escape: 65307, Return: 65293 };
 
 /**
  * One physical action, the engines that can perform it, and the wire it means.
@@ -196,18 +203,84 @@ const ACTIONS = [
       engines: ['blink-mac', 'gecko-mac'],
       steps: [['down', 'AltLeft'], ['down', 'ArrowLeft']],
       wire: `kd,LEVEL3 kd,${XK.Alt_L} kd,${XK.Left} ku,${XK.Alt_L}` },
-    { name: 'Cmd+Option+Z is a shortcut on the physical key',
+    { name: 'Cmd+Option+Z is a shortcut on the physical key, and a tap since Command can lose the keyup',
       engines: ['blink-mac', 'gecko-mac'],
       steps: [['down', 'MetaLeft'], ['down', 'AltLeft'], ['down', 'KeyZ', 'Ω']],
-      wire: `kd,${XK.Alt_L} kd,LEVEL3 kd,${XK.Super_L} kd,122 ku,${XK.Super_L}` },
+      wire: `kd,${XK.Alt_L} kd,LEVEL3 kd,${XK.Super_L} kd,122 ku,122 ku,${XK.Super_L}` },
     { name: 'Ctrl+Option+X is a shortcut on the physical key',
       engines: ['blink-mac', 'gecko-mac'],
       steps: [['down', 'ControlLeft'], ['down', 'AltLeft'], ['down', 'KeyX', '≈']],
       wire: `kd,${XK.Control_L} kd,LEVEL3 kd,${XK.Alt_L} kd,120 ku,${XK.Alt_L}` },
-    { name: 'Cmd+C reaches the server as its Ctrl chord',
+    { name: 'Cmd+C reaches the server as a tap of its Ctrl chord',
       engines: ['blink-mac', 'gecko-mac'],
       steps: [['down', 'MetaLeft'], ['down', 'KeyC', 'c']],
-      wire: `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,99` },
+      wire: `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,99 ku,99` },
+    // -- macOS Command: under WebKit and Gecko a key let go while it is down is
+    // -- lost, so a key pressed under it goes out as a tap on every engine, and
+    // -- Spotlight can take Command's own keyup as it opens.
+    { name: 'Cmd+A then Cmd+C keeps the Control Command stands for',
+      engines: ['blink-mac', 'webkit-mac', 'gecko-mac'],
+      steps: [['down', 'MetaLeft'], ['down', 'KeyA', 'a'], ['lost', 'KeyA'],
+              ['down', 'KeyC', 'c'], ['lost', 'KeyC'], ['up', 'MetaLeft']],
+      wire: `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,97 ku,97 kd,99 ku,99 ku,${XK.Control_L}` },
+    { name: 'Cmd+A then Cmd+C keeps it where the keyups arrive',
+      engines: ['blink-mac'],
+      steps: [['down', 'MetaLeft'], ['down', 'KeyA', 'a'], ['up', 'KeyA', 'a'],
+              ['down', 'KeyC', 'c'], ['up', 'KeyC', 'c'], ['up', 'MetaLeft']],
+      wire: `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,97 ku,97 kd,99 ku,99 ku,${XK.Control_L}` },
+    { name: 'a held Cmd+Backspace keeps its Control and taps once per autorepeat',
+      engines: ['blink-mac', 'webkit-mac', 'gecko-mac'],
+      steps: [['down', 'MetaLeft'], ['down', 'Backspace'],
+              ['down', 'Backspace', undefined, { repeat: true }]],
+      wire: `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,${XK.BackSpace} ku,${XK.BackSpace} `
+          + `kd,${XK.BackSpace} ku,${XK.BackSpace}` },
+    { name: 'a space rolled into Cmd+Space lets go at the next key once Spotlight took Command',
+      engines: ['blink-mac', 'webkit-mac', 'gecko-mac'],
+      steps: [['down', 'Space', ' '], ['down', 'MetaLeft'], ['lost', 'Space'], ['lost', 'MetaLeft'],
+              ['down', 'Escape']],
+      wire: `kd,32 kd,${XK.Alt_L} ku,${XK.Alt_L} ku,32 kd,${XK.Escape}` },
+    { name: 'so does the Control of a Cmd+Return before it, whose Return was a tap',
+      engines: ['blink-mac', 'webkit-mac', 'gecko-mac'],
+      steps: [['down', 'MetaLeft'], ['down', 'Enter'], ['lost', 'Enter'], ['lost', 'MetaLeft'],
+              ['down', 'Escape']],
+      wire: `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,${XK.Return} ku,${XK.Return} `
+          + `ku,${XK.Control_L} kd,${XK.Escape}` },
+    { name: 'and the next Command press lets go of it as well',
+      engines: ['blink-mac', 'webkit-mac', 'gecko-mac'],
+      steps: [['down', 'MetaLeft'], ['down', 'Enter'], ['lost', 'Enter'], ['lost', 'MetaLeft'],
+              ['down', 'MetaLeft']],
+      wire: `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,${XK.Return} ku,${XK.Return} `
+          + `ku,${XK.Control_L} kd,${XK.Alt_L}` },
+    { name: 'Cmd+C with Command held from before the page had the keyboard is still the Ctrl chord',
+      engines: ['gecko-mac'],
+      steps: [['down', 'KeyC', 'c', { meta: true }], ['up', 'KeyC', 'c', { meta: true }], ['up', 'MetaLeft']],
+      wire: `kd,${XK.Control_L} kd,99 ku,99 ku,${XK.Control_L}` },
+    { name: 'and with its keyup lost, Command\'s own keyup lets go of both',
+      engines: ['blink-mac', 'webkit-mac', 'gecko-mac'],
+      steps: [['down', 'KeyC', 'c', { meta: true }], ['lost', 'KeyC'], ['up', 'MetaLeft']],
+      wire: `kd,${XK.Control_L} kd,99 ku,99 ku,${XK.Control_L}` },
+    { name: 'Cmd+Backspace pressed twice deletes twice',
+      engines: ['blink-mac', 'webkit-mac', 'gecko-mac'],
+      steps: [['down', 'MetaLeft'], ['down', 'Backspace'], ['lost', 'Backspace'],
+              ['down', 'Backspace'], ['lost', 'Backspace'], ['up', 'MetaLeft']],
+      wire: `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,${XK.BackSpace} ku,${XK.BackSpace} `
+          + `kd,${XK.BackSpace} ku,${XK.BackSpace} ku,${XK.Control_L}` },
+    // -- Anywhere: a key pressed again with no keyup between them was let go,
+    // -- and its autorepeat is not a press.
+    { name: 'a key pressed again with no keyup between goes down again',
+      engines: ['blink-mac', 'gecko-mac', 'webkit-mac', 'blink-pc', 'gecko-pc'],
+      steps: [['down', 'Space', ' '], ['lost', 'Space'], ['down', 'Space', ' '], ['up', 'Space', ' ']],
+      wire: 'kd,32 ku,32 kd,32 ku,32' },
+    { name: 'a held key\'s autorepeat stays one press',
+      engines: ['blink-mac', 'gecko-mac', 'webkit-mac', 'blink-pc', 'gecko-pc'],
+      steps: [['down', 'Space', ' '], ['down', 'Space', ' ', { repeat: true }], ['up', 'Space', ' ']],
+      wire: 'kd,32 ku,32' },
+    // -- A key the stream holds is let go wherever focus has moved meanwhile.
+    { name: 'a key let go in a dashboard field is released, and typing there is not sent',
+      engines: ['blink-mac', 'gecko-mac', 'webkit-mac', 'blink-pc', 'gecko-pc'],
+      steps: [['down', 'KeyW', 'w'], ['up', 'KeyW', 'w', { native: true }],
+              ['down', 'KeyQ', 'q', { native: true }], ['up', 'KeyQ', 'q', { native: true }]],
+      wire: 'kd,119 ku,119' },
     // -- PC: AltGr is the level-3 shift and Alt is the action modifier, whether
     // -- or not the engine has an AltGraph flag to say so.
     { name: 'AltGr+L types the Polish l-stroke',
@@ -335,20 +408,96 @@ check('a soft modifier survives a physical key pressed under it',
 const cmdChord = [['down', 'MetaLeft'], ['down', 'KeyC', 'c']];
 const asCtrl = wire('blink-mac', cmdChord);
 check('Cmd+C reaches the server as its Ctrl chord while the setting is on',
-      asCtrl === `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,99`, asCtrl);
+      asCtrl === `kd,${XK.Alt_L} ku,${XK.Alt_L} kd,${XK.Control_L} kd,99 ku,99`, asCtrl);
 Input.macCmdAsCtrl = false;
 try {
     const asSuper = wire('blink-mac', cmdChord);
     check('Cmd+C reaches it as Super with the setting off',
-          asSuper === `kd,${XK.Super_L} kd,99`, asSuper);
+          asSuper === `kd,${XK.Super_L} kd,99 ku,99`, asSuper);
     const cmdReturn = wire('blink-mac', [['down', 'MetaLeft'], ['down', 'Enter']]);
     check('Cmd+Return keeps Super too, which is what a Super-modifier session binds',
-          cmdReturn === `kd,${XK.Super_L} kd,65293`, cmdReturn);
+          cmdReturn === `kd,${XK.Super_L} kd,65293 ku,65293`, cmdReturn);
 } finally {
     Input.macCmdAsCtrl = true;
 }
 const restored = wire('blink-mac', cmdChord);
 check('the setting back on restores the Ctrl chord',
       restored === asCtrl, restored);
+
+// macOS dead keys: Option+E then E types an e-acute. The steps are the events
+// Chrome 154 and Safari 26 were recorded delivering for it from a HID keyboard,
+// in their order: Blink's dead keydown comes before the composition it starts,
+// and WebKit commits the letter with no update before it and then reports the
+// keydown.
+const DEAD_KEY = {
+    'blink-mac': [
+        ['keydown', { key: 'Alt', code: 'AltLeft', alt: true }],
+        ['keydown', { key: 'Dead', code: 'KeyE', alt: true, keyCode: 229 }],
+        ['compositionstart', ''], ['compositionupdate', '´'],
+        ['keyup', { key: 'Dead', code: 'KeyE', alt: true, composing: true }],
+        ['keyup', { key: 'Alt', code: 'AltLeft', composing: true }],
+        ['keydown', { key: 'é', code: 'KeyE', keyCode: 229, composing: true }],
+        ['compositionupdate', 'é'], ['textInput', 'é'], ['compositionend', 'é'],
+        ['keyup', { key: 'e', code: 'KeyE' }],
+    ],
+    'webkit-mac': [
+        ['keydown', { key: 'Alt', code: 'AltLeft', alt: true }],
+        ['compositionstart', ''], ['compositionupdate', '´'],
+        ['keydown', { key: 'Dead', code: 'KeyE', alt: true, keyCode: 229, composing: true }],
+        ['keyup', { key: '´', code: 'KeyE', alt: true, composing: true }],
+        ['keyup', { key: 'Alt', code: 'AltLeft', composing: true }],
+        ['textInput', 'é'], ['compositionend', 'é'],
+        ['keydown', { key: 'é', code: 'KeyE', keyCode: 229 }],
+        ['keyup', { key: 'e', code: 'KeyE' }],
+    ],
+};
+
+/** Runs recorded key and composition events through the handlers and returns the wire. */
+async function compose(engineName, steps) {
+    setPlatform(ENGINES[engineName]);
+    const input = makeInput();
+    input.compositionString = '';
+    input._lastTextInputCommit = null;
+    input._pendingChord = null;
+    input._chordKeySent = false;
+    input._clearCompositionHostSoon = () => {};
+    const target = { classList: { contains: () => false }, parentElement: null };
+    for (const [type, arg] of steps) {
+        const base = { type, target, isTrusted: true, timeStamp: 0, preventDefault() {}, stopPropagation() {} };
+        if (type === 'keydown' || type === 'keyup') {
+            const event = { ...base, key: arg.key, code: arg.code, location: LOCATION[arg.code] || 0,
+                            keyCode: arg.keyCode || 0, isComposing: !!arg.composing, repeat: false,
+                            altKey: !!arg.alt, ctrlKey: false, metaKey: false, shiftKey: false,
+                            getModifierState: (name) => name === 'Alt' && !!arg.alt };
+            if (type === 'keydown') input._handleKeyDown(event); else input._handleKeyUp(event);
+        } else if (type === 'compositionstart') input._compositionStart({ ...base, data: arg });
+        else if (type === 'compositionupdate') input._compositionUpdate({ ...base, data: arg });
+        else if (type === 'compositionend') input._compositionEnd({ ...base, data: arg });
+        else input._handleTextInput({ ...base, data: arg });
+    }
+    // The chord a composition held back goes out on a timer once it ends.
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+    return input.sent;
+}
+
+/** What a wire of presses leaves typed, a BackSpace erasing the character before it. */
+function typed(sent) {
+    const text = [];
+    for (const msg of sent) {
+        const [verb, keysym] = msg.split(',');
+        if (verb !== 'kd') continue;
+        const k = Number(keysym);
+        if (k === XK.BackSpace) text.pop();
+        else if (k < 0x100) text.push(String.fromCodePoint(k));
+    }
+    return text.join('');
+}
+
+for (const [engineName, steps] of Object.entries(DEAD_KEY)) {
+    const sent = await compose(engineName, steps);
+    check(`${engineName}: Option+E then E leaves the e-acute typed`, typed(sent) === 'é',
+          `${JSON.stringify(typed(sent))} from ${sent.join(' ')}`);
+    check(`${engineName}: and its dead key is no Alt+E`, !sent.includes(`kd,${XK.Alt_L}`), sent.join(' '));
+}
 
 process.exit(failed === 0 ? 0 : 1);

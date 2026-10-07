@@ -27,7 +27,7 @@ import {
 
 /**
  * The apps modal: the proot-apps catalog, fetched from its GitHub metadata,
- * with install, remove, update and launch actions.
+ * with install, remove, update, and launch actions.
  *
  * Actions go through the apps command contract both dashboards share
  * (`selkies-web-core/lib/app-commands.js`): it posts the selkies-proot wrapper
@@ -74,7 +74,7 @@ interface AppsProps {
 }
 
 /**
- * Renders the catalog grid, its search box and the per-app detail view
+ * Renders the catalog grid, its search box, and the per-app detail view
  * inside a dialog controlled by the parent.
  *
  * The catalog is fetched once per modal open, plus explicit Retry presses; a
@@ -324,7 +324,7 @@ export function Apps({ isOpen = false, onClose }: AppsProps = {}) {
                                             <ChevronLeft className="mr-2 h-4 w-4" />
                                             {t('appsModal.backButton')}
                                         </Button>
-                                        <Card className="bg-background/95 backdrop-blur-sm">
+                                        <Card className="bg-background/95">
                                             <CardHeader className="space-y-4">
                                                 <section className="flex items-center gap-4">
                                                     <img 
@@ -396,7 +396,7 @@ export function Apps({ isOpen = false, onClose }: AppsProps = {}) {
                                             filteredApps.map(app => (
                                                 <Card 
                                                     key={app.name} 
-                                                    className="cursor-pointer hover:bg-accent/50 transition-colors bg-background/95 backdrop-blur-sm relative aspect-square group"
+                                                    className="cursor-pointer hover:bg-accent/50 transition-colors bg-background/95 relative aspect-square group"
                                                     onClick={() => handleAppClick(app)}
                                                 >
                                                     {isAppInstalled(app.name) && (

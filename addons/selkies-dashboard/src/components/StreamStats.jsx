@@ -6,16 +6,18 @@
 
 /**
  * The sidebar's stats: what the stream runs on, the graphs that grow while the
- * section stays open, the figures under them and the host's meters.
+ * section stays open, the figures under them, and the host's meters.
  *
  * Everything drawn comes from the core's `window.stream_info`,
- * `window.stream_client` and `window.stream_stats`
- * (`selkies-web-core/lib/stream-stats.js`), read once a second and only while
- * the section is on screen; what a row says and when it warns is
+ * `window.stream_client`, and `window.stream_stats`
+ * (`selkies-web-core/lib/stream-stats.js`), read each time the core announces
+ * a change (`STATS_EVENT`) and only while the section is on screen; what a row
+ * says and when it warns is
  * `lib/stream-stats-view.js`, shared with the wish dashboard. Being on screen
  * is what turns the numbers on: the component posts `statsOpen` to the core,
  * which asks the server for them, and posts it again with `open: false` when
- * the section folds, the sidebar shuts or the tab hides.
+ * the section folds, the sidebar shuts, or the tab hides, unless the strip
+ * over the stream (`StreamStrip.jsx`) still holds them (`holdStats`).
  * @module
  */
 import { useEffect, useMemo, useState } from "react";
@@ -27,23 +29,12 @@ import {
   seriesOf,
   graphPath,
 } from "../../../selkies-web-core/lib/stream-stats-view.js";
+import { STATS_EVENT } from "../../../selkies-web-core/lib/stream-stats.js";
+import StatusIcon from "./StatusIcon.jsx";
+import { holdStats } from "./stats-hold.js";
 
-const READ_INTERVAL_MS = 1000;
 const GRAPH_WIDTH = 240;
 const GRAPH_HEIGHT = 44;
-
-const STATUS_ICONS = {
-  good: <path d="M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z" />,
-  warn: <path d="M1 21h22L12 2zm12-3h-2v-2h2zm0-4h-2v-4h2z" />,
-  neutral: <circle cx="12" cy="12" r="4" />,
-};
-
-/** The mark beside a row: its state as a shape, so color never carries it alone. */
-const StatusIcon = ({ status }) => (
-  <svg className={`stream-status-icon ${status}`} viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
-    {STATUS_ICONS[status]}
-  </svg>
-);
 
 const CopyIcon = () => (
   <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
@@ -144,7 +135,7 @@ export default function StreamStats({ t, active, framerate }) {
 
   useEffect(() => {
     if (!shown) return undefined;
-    window.postMessage({ type: "statsOpen", open: true }, window.location.origin);
+    holdStats(1);
     const read = () => {
       const stats = window.stream_stats || { latest: null, history: [] };
       setSnapshot({
@@ -156,10 +147,10 @@ export default function StreamStats({ t, active, framerate }) {
       });
     };
     read();
-    const id = setInterval(read, READ_INTERVAL_MS);
+    window.addEventListener(STATS_EVENT, read);
     return () => {
-      clearInterval(id);
-      window.postMessage({ type: "statsOpen", open: false }, window.location.origin);
+      window.removeEventListener(STATS_EVENT, read);
+      holdStats(-1);
     };
   }, [shown]);
 
@@ -168,6 +159,8 @@ export default function StreamStats({ t, active, framerate }) {
     software: t("sections.stats.software"),
     unknown: t("sections.stats.tooltipMemoryNA"),
     throttled: t("sections.stats.throttled"),
+    hardware_available: t("sections.stats.hardwareAvailable"),
+    software_preferred: t("sections.stats.softwarePreferred"),
   }), [t]);
 
   const graphs = useMemo(() => {
@@ -194,7 +187,7 @@ export default function StreamStats({ t, active, framerate }) {
   if (!snapshot) return null;
   const { info, client, latest } = snapshot;
   const rows = streamRows(info, client, latest, words);
-  const tiles = streamTiles(latest, client ? client.transport : "websockets");
+  const tiles = streamTiles(latest, client ? client.transport : "websockets", snapshot.history);
   const meters = streamMeters(latest);
   const meterLabels = {
     cpu: t("sections.stats.cpuLabel"),
@@ -220,7 +213,7 @@ export default function StreamStats({ t, active, framerate }) {
             <StatusIcon status={row.status} />
             <span className="stream-row-text">
               <span>
-                <span className="stream-row-label">{t(`sections.stats.${row.key}Label`)}</span>
+                <span className="stream-row-label">{t(`sections.stats.${row.key}Label`)}</span>{" "}
                 <span className="stream-row-value">{row.value || t("sections.stats.tooltipMemoryNA")}</span>
               </span>
               {row.detail && <span className="stream-row-detail">{row.detail}</span>}
@@ -245,9 +238,11 @@ export default function StreamStats({ t, active, framerate }) {
       {(
         <div className="stream-tiles">
           {tiles.map((tile) => (
-            <div key={tile.key} className="stream-tile">
-              <b>{tile.value}</b>
-              <span>{tile.label}</span>
+            <div key={tile.key} className={`stream-tile${tile.warn ? " warn" : ""}`}
+              title={tile.warn ? t("sections.stats.overshoot") : undefined}>
+              <b>{tile.warn && <StatusIcon status="warn" />}{tile.value}</b>
+              {tile.detail && <small className="stream-tile-detail">{tile.detail}</small>}
+              <span>{t(`sections.stats.tiles.${tile.key}`, tile.label)}</span>
             </div>
           ))}
         </div>
@@ -261,7 +256,7 @@ export default function StreamStats({ t, active, framerate }) {
               <span className="stream-meter-label">{meterLabels[meter.key]}</span>
               {meter.bar && (
                 <span className="stream-meter-track">
-                  <span className="stream-meter-fill" style={{ width: `${meter.percent}%` }} />
+                  <span className="stream-meter-fill" style={{ transform: `translateX(${meter.percent - 100}%)` }} />
                 </span>
               )}
               <span className="stream-meter-text">{meter.text}</span>

@@ -80,9 +80,9 @@ export OUTPUT="selkies-${SELKIES_VERSION:-0.0.0}-${ARCH}.AppImage"
 # root, the directory holding noarch/
 CONDA_CHANNELS="${WORK}/conda-output;conda-forge"
 CONDA_PYTHON_VERSION="3.12"
-# ffmpeg pinned to the LGPL-only conda-forge variant so pixelflux sees an
-# x264-free avcodec stack inside the AppImage
-CONDA_PACKAGES="selkies;ffmpeg=*=*lgpl*;libxcb;pulseaudio;libva;libxkbcommon;zlib"
+# libva is what pixelflux's VA-API session opens at run time, and pixman is
+# what its wheel links but does not carry
+CONDA_PACKAGES="selkies;libxcb;pulseaudio;libva;libxkbcommon;pixman;zlib"
 # Runtime dependencies with no conda-forge package. pixelflux and pcmflux come
 # from the wheels the run resolved (the AppImage env always runs Python 3.12,
 # see CONDA_PYTHON_VERSION above); the index only where the run chose it.
@@ -105,7 +105,10 @@ done
 # conda and pip read CONDA_*/PIP_* names of their own, where a ';'-separated
 # channel list parses as one channel. These four address the plugin, so they
 # reach linuxdeploy alone and the toolchain solve below stays on conda-forge.
-env CONDA_CHANNELS="${CONDA_CHANNELS}" \
+# CONDA_OVERRIDE_GLIBC is the solver's own: it solves for the AppImage's glibc
+# floor rather than the runner's, where conda-forge carries a build for both.
+env CONDA_OVERRIDE_GLIBC="2.28" \
+    CONDA_CHANNELS="${CONDA_CHANNELS}" \
     CONDA_PYTHON_VERSION="${CONDA_PYTHON_VERSION}" \
     CONDA_PACKAGES="${CONDA_PACKAGES}" \
     PIP_REQUIREMENTS="${PIP_REQUIREMENTS}" \
@@ -144,22 +147,36 @@ ln -sf selkies_input_interposer.so AppDir/usr/lib/selkies_joystick_interposer.so
 "${CONDA_CC}" --sysroot="${CONDA_SYSROOT}" -shared -fPIC -O2 \
     -o AppDir/usr/lib/selkies_v4l2_interposer.so \
     addons/v4l2-interposer/v4l2_interposer.c -ldl -lpthread
-rm -rf "${CC_ENV}"
+# The toolchain's packages stay in the cache of the conda that fetched them,
+# which is the AppImage's own
+rm -rf "${CC_ENV}" AppDir/usr/conda/pkgs
 
-# The floor is the whole point of compiling these with conda, and the fallback
-# above would raise it silently, so each result is checked rather than assumed
-for lib in selkies_input_interposer selkies_v4l2_interposer; do
-    floor="$(objdump -T "AppDir/usr/lib/${lib}.so" \
-        | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1)"
-    echo "${lib} requires at most ${floor}"
-    if [ "$(printf '%s\n%s\n' "${floor}" "GLIBC_2.28" | sort -uV | tail -n1)" != "GLIBC_2.28" ]; then
-        echo "${lib} needs ${floor}, newer than the pinned sysroot provides" >&2
-        exit 1
-    fi
-done
+# The floor is the whole point of building from conda, and one package built
+# for a newer glibc, or the toolchain fallback above, raises it silently, so
+# every ELF file in the AppDir is checked rather than assumed
+AppDir/usr/conda/bin/python - <<'FLOOR'
+import os, re, subprocess, sys
+over = []
+for base, _, names in os.walk("AppDir"):
+    for name in names:
+        path = os.path.join(base, name)
+        if os.path.islink(path):
+            continue
+        with open(path, "rb") as fh:
+            if fh.read(4) != b"\x7fELF":
+                continue
+        symbols = subprocess.run(["objdump", "-T", path], capture_output=True, text=True).stdout
+        need = max(((int(a), int(b)) for a, b in re.findall(r"GLIBC_(\d+)\.(\d+)", symbols)), default=(0, 0))
+        if need > (2, 28):
+            over.append(f"GLIBC_{need[0]}.{need[1]} {path}")
+if over:
+    sys.exit("these need a glibc newer than 2.28:\n" + "\n".join(sorted(over)))
+print("every ELF file in the AppDir needs at most GLIBC_2.28")
+FLOOR
 
 # 4) Custom AppRun + desktop integration. No desktop session is bundled: the
-#    AppImage streams an existing X display/Xvfb or a Wayland compositor.
+#    AppImage streams an existing X display/Xvfb or a Wayland compositor, or
+#    runs selkies-session with the host's own desktop.
 mkdir -p AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/512x512/apps
 cat > AppDir/usr/share/applications/selkies.desktop <<'DESKTOP'
 [Desktop Entry]
@@ -172,15 +189,32 @@ Categories=Network;RemoteAccess;
 Terminal=true
 DESKTOP
 cp docs/assets/logo/icon-512x512.png AppDir/usr/share/icons/hicolor/512x512/apps/selkies.png
+# The bundled PulseAudio for selkies-session, which starts its sound server by
+# name: the daemon is told the module directory and startup script its build
+# prefix compiled in, and keeps the libraries AppRun preloads for selkies out.
+mkdir -p AppDir/usr/libexec/selkies-session
+cat > AppDir/usr/libexec/selkies-session/pulseaudio <<'PULSE'
+#!/bin/sh
+HERE="$(dirname "$(readlink -f "${0}")")/../../.."
+unset LD_PRELOAD
+exec "${HERE}/usr/conda/bin/pulseaudio" -p "${HERE}/usr/conda/lib/pulseaudio/modules" \
+    -F "${HERE}/usr/conda/etc/pulse/default.pa" "$@"
+PULSE
+chmod +x AppDir/usr/libexec/selkies-session/pulseaudio
 cat > AppDir/AppRun <<'APPRUN'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "${0}")")"
 ENV_BIN="${HERE}/usr/conda/bin"
+HOST_PATH="${PATH}"
 export PATH="${ENV_BIN}:${PATH}"
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
-export PULSE_SERVER="${PULSE_SERVER:-unix:${XDG_RUNTIME_DIR}/pulse/native}"
-export PIPEWIRE_LATENCY="${PIPEWIRE_LATENCY:-256/48000}"
-export PULSE_RUNTIME_PATH="${PULSE_RUNTIME_PATH:-${XDG_RUNTIME_DIR}/pulse}"
+# The bundled libdbus names the system bus under its build prefix; the
+# well-known address reaches the host's, where RTKit schedules the sound server
+export DBUS_SYSTEM_BUS_ADDRESS="${DBUS_SYSTEM_BUS_ADDRESS:-unix:path=/var/run/dbus/system_bus_socket}"
+# The bundled libxkbcommon looks for keymaps under its build prefix too: the
+# host's, which the session's applications read as well, or the copy carried here
+xkb_root="${HERE}/usr/conda/share/X11/xkb"
+[ ! -d /usr/share/X11/xkb ] || xkb_root="/usr/share/X11/xkb"
+export XKB_CONFIG_ROOT="${XKB_CONFIG_ROOT:-${xkb_root}}"
 # Paths to the bundled interposers, for LD_PRELOADing into an application that
 # needs gamepads where /dev/uinput is unreachable, or the webcam where no
 # v4l2loopback device is. Deliberately not added to LD_PRELOAD here: selkies
@@ -205,6 +239,26 @@ first_present_if() {
     done
     return 1
 }
+
+system_xcb="$(first_present_if /etc/nv_tegra_release \
+    /usr/lib/aarch64-linux-gnu/libxcb.so.1 /usr/lib/libxcb.so.1)" || system_xcb=""
+
+# selkies-session brings up its own display, sound server, and desktop in a
+# runtime directory of its own, so it starts before the defaults and servers
+# below; the interposers above are preloaded into its desktop, and the libxcb
+# below into Selkies alone. Those are the host's, with the bundled PulseAudio and
+# tools after them: a bundled session bus names its build machine's paths.
+if [ "${1:-}" = "selkies-session" ]; then
+    shift
+    export PATH="${HOST_PATH}:${HERE}/usr/libexec/selkies-session:${ENV_BIN}"
+    [ -z "${system_xcb}" ] || export SELKIES_PRELOAD="${system_xcb}"
+    exec "${ENV_BIN}/selkies-session" "$@"
+fi
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+export PULSE_SERVER="${PULSE_SERVER:-unix:${XDG_RUNTIME_DIR}/pulse/native}"
+export PIPEWIRE_LATENCY="${PIPEWIRE_LATENCY:-256/48000}"
+export PULSE_RUNTIME_PATH="${PULSE_RUNTIME_PATH:-${XDG_RUNTIME_DIR}/pulse}"
 
 # A help or version query prints and exits, so it starts no display or audio server
 for arg in "$@"; do
@@ -249,8 +303,6 @@ fi
 
 # Preloaded for selkies alone: the servers started above, and whatever the
 # session runs under them, keep resolving the libraries their own binaries name.
-system_xcb="$(first_present_if /etc/nv_tegra_release \
-    /usr/lib/aarch64-linux-gnu/libxcb.so.1 /usr/lib/libxcb.so.1)" || system_xcb=""
 if [ -n "${system_xcb}" ]; then
     echo "L4T detected; preloading the system ${system_xcb} into selkies"
     exec env LD_PRELOAD="${system_xcb}${LD_PRELOAD:+:${LD_PRELOAD}}" "${ENV_BIN}/selkies" "$@"

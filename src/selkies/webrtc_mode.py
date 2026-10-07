@@ -54,10 +54,11 @@ from .sessions import current_session_tokens
 from .webrtc_media_pipeline import (MediaPipelinePixel,
                                     ScreenCapture as PixelfluxScreenCapture)
 from .webrtc.codecs import configure_multiopus
+from .webrtc.rtcdtlstransport import TWCC_QUEUE_MS
 from .webrtc_signaling_client import WebRTCSignalingClient
 from .webrtc_signaling_server import WebRTCPeerManagement
 from .input_handler import WebRTCInput
-from .display_utils import (resize_display, applied_dpi, set_dpi, set_cursor_size, parse_gpu_id,
+from .display_utils import (resize_display, refresh_output_mode, applied_dpi, set_dpi, set_cursor_size, parse_gpu_id,
                             compute_dual_layout, apply_extended_layout, get_new_res,
                             retire_displays, clamp_primary_feedback,
                             WAYLAND_SCREEN_OUTPUT_ID, wayland_output_id,
@@ -68,14 +69,15 @@ from .webrtc_ice_config import get_rtc_configuration
 from .metrics import Metrics
 from . import resource_stats
 from . import stream_stats
-from .settings import (settings, AppSettings, SETTING_DEFINITIONS, RateControlMode, SCALING_DPI_MIN, SCALING_DPI_MAX,
-                       build_client_settings_payload, sanitize_client_setting)
+from .settings import (settings, AppSettings, SETTING_DEFINITIONS, STREAM_SETTINGS, RateControlMode, SCALING_DPI_MIN,
+                       SCALING_DPI_MAX, build_client_settings_payload, sanitize_client_setting, socket_dir)
 from types import SimpleNamespace
 from .webrtc_ice_config import HMACRTCMonitor, RESTRTCMonitor, RTCConfigFileMonitor, CloudflareRTCMonitor
-from .stream_server import BaseStreamingService, CentralizedStreamServer
+from .stream_server import BaseStreamingService, CentralizedStreamServer, CongestionSteer, RateHold, start_kbps
 from .audio_control import AudioControl
 
 logger = logging.getLogger("webrtc")
+
 
 
 def _selkies_is_aioice_frame_chain(exc: BaseException) -> bool:
@@ -148,47 +150,14 @@ def _install_webrtc_teardown_noise_filters(loop: asyncio.AbstractEventLoop) -> N
 CURSOR_SIZE: Optional[int] = settings.cursor_size if settings.cursor_size > 0 else None
 # The input backend must match the capture backend (CaptureSettings.use_wayland).
 IS_WAYLAND: bool = bool(settings.wayland[0])
+# Seconds a first capture of the primary waits for its page's size: the resize
+# the page sends once its data channel opens, or its settings from a page that
+# keeps the server's size. Started first, it streams the old size's picture.
+PRIMARY_SIZE_WAIT_S = 2.0
 
 def get_server_settings() -> Dict[str, Any]:
     """The server-settings payload every client is greeted with."""
     return {"settings": build_client_settings_payload()}
-
-
-class CongestionSteer:
-    """The steer of one display's CBR target over the congestion loop's one-second
-    ticks. A tick whose loss fraction passes LOSS is a strike, and only two strikes
-    in a row back the target off, by BACKOFF: one window is a few tens of packets,
-    too few for its loss to mean anything on its own. A backoff then holds the
-    target for HOLD_S, so the recovery does not climb straight back onto the loss
-    that caused it. A clean tick clears the strikes and, outside a hold, raises the
-    target by STEP, or to HEADROOM of the measured goodput where that is higher,
-    never past the ceiling.
-    """
-
-    LOSS = 0.10
-    BACKOFF = 0.7
-    HOLD_S = 2.0
-    STEP = 1.15
-    HEADROOM = 0.85
-
-    def __init__(self) -> None:
-        self.strikes = 0
-        self.hold_until = 0.0
-
-    def target(self, current: float, ceiling: float, floor: float,
-               goodput_bps: float, loss: float, now: float) -> float:
-        """The next target in kbps for a tick that measured `goodput_bps` and `loss`."""
-        if loss > self.LOSS:
-            self.strikes += 1
-            if self.strikes < 2:
-                return current
-            self.strikes = 0
-            self.hold_until = now + self.HOLD_S
-            return max(floor, min(ceiling, current * self.BACKOFF))
-        self.strikes = 0
-        if now < self.hold_until:
-            return current
-        return max(floor, min(ceiling, max(current * self.STEP, goodput_bps * self.HEADROOM / 1_000)))
 
 
 class WebRTCService(BaseStreamingService):
@@ -236,6 +205,8 @@ class WebRTCService(BaseStreamingService):
             when self-compositing (outputs are minted on demand there).
         _congestion_steer: Each display's `CongestionSteer`, the state its
             CBR target is steered with.
+        _rate_holds: Each display's `RateHold`, which tells its controllers
+            a steered rate that held.
         _wm_swap: Swaps heavy DEs, which tile poorly across the per-display
             regions, for a minimal Openbox once a secondary joins.
         _primary_stop_grace_task: The pending deferred primary-capture stop.
@@ -290,8 +261,19 @@ class WebRTCService(BaseStreamingService):
         self._wayland_ctl_module: Optional[Any] = None
         self._host_output_capacity: Optional[int] = None
         self._last_resize_request: Optional[Tuple[int, int]] = None
+        # Set once the primary's controller sent its size or its settings.
+        self._primary_sized = asyncio.Event()
+        # The primary's size before its controller's hello resized it, which the size wait reads a change against.
+        self._unsized_dims: Optional[Tuple[int, int]] = None
         self._wm_swap = MultiMonitorWindowManager()
         self._congestion_steer: Dict[str, CongestionSteer] = {}
+        self._rate_holds: Dict[str, RateHold] = {}
+        # The browser tab of each peer (its signaling HELLO), and per display the
+        # tab whose controller owns it: a controller of another tab streams and
+        # drives input beside it, and what would size or configure the display
+        # waits until it owns it (`_on_peer_data_message`, `_succeed_display_owner`).
+        self._peer_tabs: Dict[str, Optional[str]] = {}
+        self._display_owner_tabs: Dict[str, str] = {}
         self.RECONNECT_GRACE_S = 3.0
         self._primary_stop_grace_task: Optional[asyncio.Task] = None
 
@@ -349,9 +331,9 @@ class WebRTCService(BaseStreamingService):
 
         The settings are re-snapshotted first: the service is constructed once
         at boot, but a live transport switch lands here with the settings
-        singleton already re-resolved for webrtc (encoder filter, rate-control
-        default). Metrics backs both the Prometheus endpoint and the WebRTC
-        CSV statistics, so it is built when either flag is on. A configured
+        singleton already re-resolved for webrtc (encoder filter). Metrics
+        backs both the Prometheus endpoint and the WebRTC CSV statistics, so
+        it is built when either flag is on. A configured
         manual resolution is applied before the pipeline is sized: on X11 the
         screen is resized now and the pipeline takes what the X server
         realized (CVT cell alignment can widen the mode); on Wayland the
@@ -379,7 +361,7 @@ class WebRTCService(BaseStreamingService):
         self.media_pipeline = MediaPipelinePixel(
             async_event_loop=asyncio.get_running_loop(),
             encoder=self.args.encoder,
-            framerate=int(self.args.framerate),
+            framerate=self.args.framerate,
             # kbps, as consumed by pixelflux.
             video_bitrate=int(self.args.video_bitrate),
             # Enum with a wider server-side value_range: an operator override can
@@ -390,6 +372,7 @@ class WebRTCService(BaseStreamingService):
             audio_device_name=self.args.audio_device_name,
             crf=int(self.args.video_crf),
             video_fullcolor=bool(self.args.video_fullcolor),
+            video_10bit=bool(self.args.video_10bit),
             use_cpu=bool(self.args.use_cpu),
             video_streaming_mode=bool(self.args.video_streaming_mode),
             use_paint_over_quality=bool(self.args.use_paint_over_quality),
@@ -398,7 +381,8 @@ class WebRTCService(BaseStreamingService):
         )
         if self._manual_dims:
             if not IS_WAYLAND:
-                realized = await resize_display(f"{self._manual_dims[0]}x{self._manual_dims[1]}")
+                realized = await resize_display(
+                    f"{self._manual_dims[0]}x{self._manual_dims[1]}", self.media_pipeline.framerate)
                 if realized:
                     self._manual_dims = realized
             self.media_pipeline.width, self.media_pipeline.height = self._manual_dims
@@ -430,7 +414,7 @@ class WebRTCService(BaseStreamingService):
         self.input_handler = WebRTCInput(
             rtc_app=self.rtc_app,
             uinput_mouse_socket_path=getattr(self.args, "uinput_mouse_socket", "") or "",
-            js_socket_path_prefix=getattr(self.args, "js_socket_path", "/tmp"),
+            js_socket_path_prefix=socket_dir(getattr(self.args, "js_socket_path", "")),
             enable_clipboard=self.args.enable_clipboard,
             enable_binary_clipboard="true"
             if self.args.enable_binary_clipboard
@@ -457,7 +441,7 @@ class WebRTCService(BaseStreamingService):
         stats_gpu_id = parse_gpu_id(getattr(self.args, "gpu_id", ""))
         self.resource_monitor = resource_stats.ResourceMonitor(
             gpu_id=stats_gpu_id if (stats_gpu_id or 0) > 0 else 0,
-            dri_node=getattr(self.args, "encode_dri", "") or "",
+            dri_node=resource_stats.gpu_node(stats_gpu_id, getattr(self.args, "encode_dri", "") or ""),
             metrics=self.metrics,
         )
 
@@ -472,13 +456,17 @@ class WebRTCService(BaseStreamingService):
         prefix = self.settings.subfolder
         username = self.settings.basic_auth_user
         password = self.settings.basic_auth_password
+        # A server bound to a Unix socket has no TCP port to dial.
+        sock_path = (self.args.unix_socket or "").strip()
+        host = "localhost" if sock_path else f"localhost:{self.args.port}"
         client = WebRTCSignalingClient(
-            f"{ws_protocol}//localhost:{self.args.port}{prefix}/api/ws",
+            f"{ws_protocol}//{host}{prefix}/api/ws",
             enable_https=using_https,
             enable_basic_auth=using_basic_auth,
             basic_auth_user=username,
             basic_auth_password=password,
             server_token=getattr(self.settings, "master_token", None),
+            unix_socket=sock_path or None,
         )
         return client
 
@@ -501,6 +489,7 @@ class WebRTCService(BaseStreamingService):
         self, session_peer_id: str, client_type: str, client_token: Optional[str] = None,
         display_id: str = "primary", display_position: str = "right",
         fullcolor_codecs: Optional[List[str]] = None,
+        tenbit_codecs: Optional[List[str]] = None,
     ) -> None:
         """Start an RTC connection for a joining peer.
 
@@ -523,6 +512,11 @@ class WebRTCService(BaseStreamingService):
         # the claim is this process, and the relay's fields are positional.
         peer = self.peer_manager.peers.get(session_peer_id) if self.peer_manager else None
         client_slot = getattr(peer, "client_slot", None) if peer else None
+        tab_id = getattr(peer, "tab_id", None) if peer else None
+        self._peer_tabs[session_peer_id] = tab_id
+        if client_type == "controller" and tab_id and self._display_owner_tabs.get(display_id) not in (
+                self._display_tabs(display_id, but=session_peer_id)):
+            self._display_owner_tabs[display_id] = tab_id
         logger.debug(
             f"starting session for client peer id: {session_peer_id} of type: {client_type} (display '{display_id}')"
         )
@@ -542,9 +536,15 @@ class WebRTCService(BaseStreamingService):
                 entry = self.display_clients.setdefault(display_id, {"width": 0, "height": 0})
                 entry["position"] = display_position
                 self._seed_display_settings(entry)
+            if display_id == "primary" and client_type == "controller":
+                self._primary_sized.clear()
+                await self._apply_hello_size(getattr(peer, "page_size", None) if peer else None)
             await self.rtc_app.start_rtc_connection(
                 session_peer_id, client_type, client_token, display_id, client_slot,
-                fullcolor_codecs=fullcolor_codecs)
+                fullcolor_codecs=fullcolor_codecs, tenbit_codecs=tenbit_codecs)
+            if client_type == "controller":
+                await self._seed_start_rate(session_peer_id, display_id,
+                                            getattr(peer, "cc_start_kbps", None) if peer else None)
             if self.args.enable_webrtc_statistics and self.metrics:
                 await self.metrics.initialize_webrtc_csv_file(self.args.webrtc_statistics_dir)
             logger.info(f"Session started for peer {session_peer_id} ({client_type}, display '{display_id}').")
@@ -554,6 +554,30 @@ class WebRTCService(BaseStreamingService):
                 exc_info=True,
             )
             await self.rtc_app.stop_rtc_connection(session_peer_id, client_type)
+
+    async def _seed_start_rate(self, peer_id: str, display_id: str, remembered: Any) -> None:
+        """Start a steered display at the rate its page last held it at
+        (`RateHold`) rather than at the configured one, when this page is the
+        display's only controller: another's stream carries a steer fresher
+        than any page's memory."""
+        if not self.args.congestion_control or not self.rtc_app:
+            return
+        pipeline = self.display_pipelines.get(display_id)
+        if pipeline is None or getattr(pipeline, "rc_mode", None) != RateControlMode.CBR:
+            return
+        others = [pid for pid, obj in self.rtc_app.peer_connections.items()
+                  if pid != peer_id and obj.get("client_type") == ClientType.CONTROLLER
+                  and (obj.get("display_id") or "primary") == display_id]
+        lo_kbps, hi_kbps = settings.video_bitrate
+        seeded = start_kbps(remembered, float(lo_kbps), float(hi_kbps))
+        if others or seeded is None:
+            return
+        ceiling = float(self._display_setting(display_id, "video_bitrate") or hi_kbps)
+        seeded = min(seeded, ceiling)
+        if round(seeded) < round(float(pipeline.video_bitrate)):
+            logger.info(f"Congestion control[{display_id}]: starting at {seeded:.0f} kbps, "
+                        f"from the rate its page last held")
+            await pipeline.set_video_bitrate(round(seeded))
 
     async def handle_session_end(self, session_peer_id: str, client_type: str) -> None:
         """Handle end of a session initiated by a client.
@@ -595,7 +619,7 @@ class WebRTCService(BaseStreamingService):
         self.peer_manager.on_client_presence = self.supervisor.set_clients_present
 
     def setup_callbacks(self) -> None:
-        """Wire signaling, RTC app, media pipeline, input handler and monitor
+        """Wire signaling, RTC app, media pipeline, input handler, and monitor
         callbacks to each other.
 
         Cursors come from pixelflux on both backends (Wayland compositor / X11
@@ -628,7 +652,9 @@ class WebRTCService(BaseStreamingService):
 
         self.rtc_app.request_idr_frame = self.request_idr_for_display
         self.rtc_app.invalidate_reference = self.invalidate_reference_for_display
-        self._invalidation_log: Dict[str, tuple] = {}
+        self.rtc_app.acknowledge_reference = self.acknowledge_reference_for_display
+        self.rtc_app.peer_owns_display = self._peer_owns_display
+        self._invalidation_log: Dict[tuple, tuple] = {}
         self.rtc_app.start_display_media = self.start_display_media
         self.rtc_app.stop_display_media = self.stop_display_media
         self.rtc_app.on_sdp = self.signaling_client.send_sdp
@@ -636,7 +662,7 @@ class WebRTCService(BaseStreamingService):
         self.rtc_app.on_data_open = self.handle_data_channel_open
         self.rtc_app.on_data_close = lambda: logger.info("Data channel closed")
         self.rtc_app.on_data_error = lambda e: logger.error(f"Data channel error: {e}")
-        self.rtc_app.on_data_message = self.input_handler.on_message
+        self.rtc_app.on_data_message = self._on_peer_data_message
         self.rtc_app.on_peer_gone = self.handle_peer_gone
         self.input_handler.on_request_keyframe = self.request_idr_for_display
 
@@ -673,6 +699,8 @@ class WebRTCService(BaseStreamingService):
         self.rtc_app.on_video_codec_declined = self._video_codec_declined
         self.rtc_app.on_fullcolor_declined = self._fullcolor_declined
         self.rtc_app.get_fullcolor_for_display = self._fullcolor_for_display
+        self.rtc_app.on_ten_bit_declined = self._ten_bit_declined
+        self.rtc_app.get_ten_bit_for_display = self._ten_bit_for_display
         self.rtc_app.get_use_cpu_for_display = self._use_cpu_for_display
         self.rtc_app.on_video_consumer_active = self.handle_video_consumer_active
         self.rtc_app.on_audio_consumer_active = self.handle_audio_consumer_active
@@ -683,9 +711,12 @@ class WebRTCService(BaseStreamingService):
         self.input_handler.on_scaling_ratio = self.handle_scaling
         self.input_handler.on_resize = self.on_resize_handler
         self.input_handler.on_session_compositor_adopted = self._resync_wayland_session_scale
+        self.input_handler.on_session_screens_changed = self._republish_second_screen
 
         self.resource_monitor.on_tick = self.handle_resource_tick
         self.resource_monitor.watched = lambda: bool(self.rtc_app and self.rtc_app.stats_displays())
+        self.rtc_app.on_stats_open = self._rush_stream_stats
+        self.rtc_app.on_frame_sent = self._note_frame_sent
 
     def _second_screen_availability(self) -> Tuple[bool, str]:
         """Whether this session can actually attach a second display, and the
@@ -800,6 +831,8 @@ class WebRTCService(BaseStreamingService):
                 settled = getattr(getattr(self.display_pipelines.get(did), "stream_watch", None), "info", None)
                 if settled:
                     self.rtc_app.send_stream_info(did, settled, channel)
+                if any(p is peer for p in self._peers_beside_owner(did)):
+                    self._tell_display_settings(did, [peer])
         else:
             self.rtc_app.send_media_data_over_channel(
                 "server_settings", server_settings_payload
@@ -869,7 +902,7 @@ class WebRTCService(BaseStreamingService):
             await self.media_pipeline.set_audio_bitrate(int(sanitized))
         self.args.audio_bitrate = sanitized
 
-    async def handle_fps_change(self, fps: int, display_id: str = "primary") -> None:
+    async def handle_fps_change(self, fps: float, display_id: str = "primary") -> None:
         """Framerate change for the display whose page sent it; sanitized against
         the server's configured range like the SETTINGS path."""
         sanitized = sanitize_client_setting("framerate", fps, self.settings, logger)
@@ -946,9 +979,12 @@ class WebRTCService(BaseStreamingService):
                     return
                 entry["width"], entry["height"] = w, h
             await self.reconfigure_displays()
+            if display_id == "primary":
+                self._primary_sized.set()
             return
         self._primary_dims = None
         await self._resize_primary_display(res)
+        self._primary_sized.set()
 
     def _server_locked_dims(self) -> Optional[Tuple[int, int]]:
         """The geometry an admin-configured manual-resolution lock pins the desktop
@@ -1030,18 +1066,7 @@ class WebRTCService(BaseStreamingService):
                 if self.media_pipeline.is_screen_capturing():
                     await self._size_wayland_screen(target_w, target_h, grow_only=True)
                     await self.media_pipeline.restart_screen_capture()
-                    await self._push_wayland_realized_geometry("primary", self.media_pipeline)
-                    await self._size_wayland_screen(
-                        self.media_pipeline.width, self.media_pipeline.height)
-                    # A nested session's screen is its own compositor's, not the
-                    # capture's: sizing only the capture leaves its applications
-                    # laid out for the size the last DPI change realized.
-                    if self.input_handler is not None:
-                        await self.input_handler.realize_wayland_dpi(
-                            getattr(self, "_last_applied_dpi", None)
-                            or getattr(settings, "scaling_dpi", 96) or 96,
-                            "primary",
-                            (self.media_pipeline.width, self.media_pipeline.height))
+                    await self._settle_wayland_primary()
                 self.media_pipeline.last_resize_success = True
                 self._last_resize_request = (target_w, target_h)
                 logger.info(
@@ -1050,7 +1075,7 @@ class WebRTCService(BaseStreamingService):
                 )
                 return
 
-            realized = await resize_display(f"{target_w}x{target_h}")
+            realized = await resize_display(f"{target_w}x{target_h}", self.media_pipeline.framerate)
             if realized:
                 realized_w, realized_h = realized
                 if (realized_w, realized_h) != (target_w, target_h):
@@ -1059,22 +1084,32 @@ class WebRTCService(BaseStreamingService):
                     )
                 else:
                     logger.debug(f"resize_display('{target_w}x{target_h}') reported success")
-                # A zero-size region re-reads the live root now and keeps root-follow;
-                # the auto-adjust poll trails ~30 frames, leaving new bands out of frame.
-                capture_module = getattr(self.media_pipeline, "capture_module", None)
-                if capture_module is not None:
-                    try:
-                        await asyncio.to_thread(
-                            capture_module.update_capture_region, 0, 0, 0, 0
-                        )
-                    except Exception as e:
-                        logger.warning(f"Capture re-follow after resize failed: {e}")
-                self.media_pipeline.width = realized_w
-                self.media_pipeline.height = realized_h
+                if (realized_w, realized_h) != (target_w, target_h) and (
+                        realized_w >= target_w and realized_h >= target_h):
+                    # A mode rounded past the request (RandR's 8-pixel cells) streams the
+                    # requested size from its origin, as WebSockets does, so the page draws
+                    # it 1:1 rather than scaled down by the rounding.
+                    await self.media_pipeline.update_capture_region(0, 0, target_w, target_h)
+                    stream_w, stream_h = target_w, target_h
+                else:
+                    self.media_pipeline.capture_region = None
+                    # A zero-size region re-reads the live root now and keeps root-follow;
+                    # the auto-adjust poll trails ~30 frames, leaving new bands out of frame.
+                    capture_module = getattr(self.media_pipeline, "capture_module", None)
+                    if capture_module is not None:
+                        try:
+                            await asyncio.to_thread(
+                                capture_module.update_capture_region, 0, 0, 0, 0
+                            )
+                        except Exception as e:
+                            logger.warning(f"Capture re-follow after resize failed: {e}")
+                    stream_w, stream_h = realized_w, realized_h
+                self.media_pipeline.width = stream_w
+                self.media_pipeline.height = stream_h
                 self.media_pipeline.last_resize_success = True
                 self._last_resize_request = (target_w, target_h)
                 if self.rtc_app is not None:
-                    self.rtc_app.send_remote_resolution(f"{realized_w}x{realized_h}", "primary")
+                    self.rtc_app.send_remote_resolution(f"{stream_w}x{stream_h}", "primary")
             else:
                 logger.error(
                     f"resize_display('{target_w}x{target_h}') reported failure"
@@ -1117,23 +1152,37 @@ class WebRTCService(BaseStreamingService):
         self._last_idr_request_times[display_id] = now
         await pipeline.dynamic_idr_frame()
 
-    def invalidate_reference_for_display(self, display_id: str, frame_id: int) -> None:
-        """Tell the display's encoder a peer lost `frame_id`, so the frames after it stop
-        predicting from it (websockets LOST_FRAME parity). Logged once per display per
-        five seconds with the count of the rest, since loss comes in bursts."""
+    def acknowledge_reference_for_display(self, display_id: str, frame_id: int, held: bool = True) -> None:
+        """Tell the display's encoder every peer holds `frame_id`, or where not `held`
+        was sent it (`CommonFrames`)."""
+        pipeline = self.display_pipelines.get(display_id or "primary")
+        if pipeline is not None:
+            try:
+                pipeline.acknowledge_reference(frame_id, held)
+            except Exception:
+                pass
+
+    def invalidate_reference_for_display(self, display_id: str, frame_id: int,
+                                         dropped: bool = False) -> None:
+        """Tell the display's encoder a peer lost `frame_id`, or its video bridge dropped
+        it (`dropped`), so the frames after it stop predicting from it (websockets
+        LOST_FRAME parity). Logged once per display and cause per five seconds with the
+        count of the rest, since both come in bursts."""
         display_id = display_id or "primary"
         pipeline = self.display_pipelines.get(display_id)
         if pipeline is None:
             return
         pipeline.invalidate_reference(frame_id)
         now = time.monotonic()
-        last, more = self._invalidation_log.get(display_id, (0.0, 0))
+        key = (display_id, dropped)
+        last, more = self._invalidation_log.get(key, (0.0, 0))
         if now - last >= 5.0:
             suffix = f" (+{more} more in the last 5 s)" if more else ""
-            logger.info(f"Display '{display_id}': frame {frame_id} lost by a peer; the encoder predicts past it.{suffix}")
-            self._invalidation_log[display_id] = (now, 0)
+            cause = "dropped before sending" if dropped else "lost by a peer"
+            logger.info(f"Display '{display_id}': frame {frame_id} {cause}; the encoder predicts past it.{suffix}")
+            self._invalidation_log[key] = (now, 0)
         else:
-            self._invalidation_log[display_id] = (last, more + 1)
+            self._invalidation_log[key] = (last, more + 1)
 
     async def _provision_webrtc_virtual_mic(self) -> None:
         """Bring up the SelkiesVirtualMic once for the WebRTC transport (shared
@@ -1172,9 +1221,11 @@ class WebRTCService(BaseStreamingService):
         await control.aclose()
 
     async def start_display_media(self, display_id: str) -> None:
-        """A display's consumer connected: the primary starts its pipeline right
-        away; a secondary waits for its dimensions (the client's first resize
-        message), which trigger the layout pass that creates its pipeline.
+        """A display's consumer connected: the primary starts its pipeline once
+        its controller's page has sent its size, at most `PRIMARY_SIZE_WAIT_S`
+        later (`_await_primary_size`); a secondary waits for its dimensions
+        (the client's first resize message), which trigger the layout pass that
+        creates its pipeline.
 
         A consumer reclaiming the primary cancels a pending grace stop, and
         `start_media_pipeline` is idempotent, so a controller tab reload that
@@ -1195,6 +1246,12 @@ class WebRTCService(BaseStreamingService):
         """
         if display_id == "primary" and self.media_pipeline:
             self._cancel_primary_stop_grace()
+            resized = await self._await_primary_size()
+            if resized and IS_WAYLAND:
+                # The page's size reached a capture yet to start, which sizes
+                # the view alone: the screen has to hold it first.
+                await self._size_wayland_screen(
+                    self.media_pipeline.width, self.media_pipeline.height, grow_only=True)
             consumers = self._display_consumers("primary")
             video_wanted = any(not p.get("video_paused", False) for p in consumers) or not consumers
             audio_wanted = any(not p.get("audio_paused", False) for p in consumers) or not consumers
@@ -1212,10 +1269,51 @@ class WebRTCService(BaseStreamingService):
                       if IS_WAYLAND else None)
             if caveat:
                 logger.warning(f"Primary Wayland capture started with a caveat: {caveat}")
+            if resized and IS_WAYLAND and self.media_pipeline.is_screen_capturing():
+                await self._settle_wayland_primary()
             if await self._refresh_second_screen_capacity() and self.rtc_app:
                 self.rtc_app.send_media_data_over_channel(
                     "server_settings", self._server_settings_payload()
                 )
+
+    async def _apply_hello_size(self, size: Optional[Tuple[int, int]]) -> None:
+        """Resize the primary to the size its controller's hello named, which
+        the page's first resize will ask for again, so its capture starts at
+        once (`_await_primary_size`) rather than once the data channel opens,
+        25-50 ms later. Only alone and before a capture runs; a page whose
+        hello names no size waits as before."""
+        if (size is None or self.display_clients or not self.media_pipeline
+                or self.media_pipeline.is_screen_capturing()):
+            return
+        self._unsized_dims = (self.media_pipeline.width, self.media_pipeline.height)
+        await self.on_resize_handler(f"{size[0]}x{size[1]}")
+
+    async def _await_primary_size(self) -> bool:
+        """Hold a first capture of the primary until its controller's page has
+        sent its size (`on_resize_handler`) or its settings, which a page that
+        keeps the server's size sends instead, for `PRIMARY_SIZE_WAIT_S` at
+        most. A capture started first opens on the display's old size, and
+        that picture is the page's first key frame, shown until the resized
+        one arrives: seconds at a low rate. A running capture, a display the
+        page cannot resize, and viewers alone start at once.
+
+        Returns:
+            Whether the page's size, from its hello or while it waited, changed
+            the pipeline's.
+        """
+        unsized, self._unsized_dims = self._unsized_dims, None
+        if (not any(p.get("client_type") == ClientType.CONTROLLER
+                    for p in self._display_consumers("primary"))
+                or self.media_pipeline.is_screen_capturing() or not self.args.enable_resize
+                or self._server_locked_dims() is not None):
+            return False
+        size = unsized or (self.media_pipeline.width, self.media_pipeline.height)
+        try:
+            await asyncio.wait_for(self._primary_sized.wait(), PRIMARY_SIZE_WAIT_S)
+        except asyncio.TimeoutError:
+            logger.info(f"No size from the primary's page within {PRIMARY_SIZE_WAIT_S} s; "
+                        "starting its capture at the display's size.")
+        return (self.media_pipeline.width, self.media_pipeline.height) != size
 
     async def stop_display_media(self, display_id: str) -> None:
         """Release a display's pipeline: the primary's stop is deferred by a
@@ -1296,6 +1394,21 @@ class WebRTCService(BaseStreamingService):
             self._wayland_ctl_module = PixelfluxScreenCapture()
         return self._wayland_ctl_module
 
+    async def _settle_wayland_primary(self) -> None:
+        """After the primary's capture started at a new size: push what the
+        compositor realized to the pages, fit the screen to it, and size a
+        nested session's screen too, which is its own compositor's, not the
+        capture's: sizing only the capture leaves its applications laid out
+        for the size the last DPI change realized."""
+        await self._push_wayland_realized_geometry("primary", self.media_pipeline)
+        await self._size_wayland_screen(self.media_pipeline.width, self.media_pipeline.height)
+        if self.input_handler is not None:
+            await self.input_handler.realize_wayland_dpi(
+                getattr(self, "_last_applied_dpi", None)
+                or getattr(settings, "scaling_dpi", 96) or 96,
+                "primary",
+                (self.media_pipeline.width, self.media_pipeline.height))
+
     async def _size_wayland_screen(self, width: int, height: int,
                                    grow_only: bool = False) -> None:
         """Size the primary's screen (output 0) to its display rectangle.
@@ -1349,7 +1462,7 @@ class WebRTCService(BaseStreamingService):
             # Which of the session's own screens a capture drives changed.
             self.input_handler.resync_session_screens()
 
-    async def _apply_wayland_extension(self, did: str, layouts: Dict[str, Dict[str, int]]) -> bool:
+    async def _apply_wayland_extension(self, did: str, layouts: Dict[str, Dict[str, int]]) -> Optional[str]:
         """Realize the extended layout as compositor screens, BEFORE the
         secondary's pipeline binds a capture — the Wayland counterpart of
         apply_extended_layout.
@@ -1365,12 +1478,15 @@ class WebRTCService(BaseStreamingService):
         still finds in the primary's way is recreated after all.
 
         Returns:
-            False when the output cannot be created or the primary cannot move
-            (the caller drops the display).
+            None once the display's screen is in place, else why it is not --
+            the session compositor refused it a screen, or the capture
+            compositor cannot create its output or move the primary -- which
+            the caller drops the display with.
         """
+        no_output = "The compositor cannot create an output for this display."
         module = self._wayland_capture_handle()
         if module is None:
-            return False
+            return no_output
         oid = wayland_output_id(did)
         s = layouts[did]
         dpi = self._display_dpi(did)
@@ -1402,9 +1518,9 @@ class WebRTCService(BaseStreamingService):
                 existing = None
                 moved = await wayland_reposition_primary(module, p["x"], p["y"])
             if not moved:
-                return False
+                return no_output
         if existing is not None:
-            return True
+            return None
         pw, ph = p.get("w"), p.get("h")
         if (existing0 is not None and pw and ph
                 and (pw < existing0[3] or ph < existing0[4])):
@@ -1423,19 +1539,22 @@ class WebRTCService(BaseStreamingService):
             # The screen this display owns, grown just ahead of the output
             # that adopts its host window, then given the display's own DPI;
             # what the session leaves is this output's capture scale.
-            await self.input_handler.ensure_session_screen(
-                did, size=(s["w"], s["h"]), scale=scale)
+            if not await self.input_handler.ensure_session_screen(
+                    did, size=(s["w"], s["h"]), scale=scale):
+                return "The session compositor cannot add a screen for this display."
             scale = await self.input_handler.realize_wayland_dpi(dpi, did, (s["w"], s["h"]))
         try:
             created = bool(await asyncio.to_thread(
                 module.create_output, oid, s["w"], s["h"], s["x"], s["y"], scale))
         except Exception as e:
             logger.error(f"Wayland create_output {oid} failed: {e}")
-            return False
-        if created and self.input_handler:
+            return no_output
+        if not created:
+            return no_output
+        if self.input_handler:
             # Which of the session's own screens a capture drives changed.
             self.input_handler.resync_session_screens()
-        return created
+        return None
 
     async def _wayland_capture_live(self, did: str, pipeline: MediaPipelinePixel) -> bool:
         """Whether the display's capture really runs in the compositor. The
@@ -1565,6 +1684,151 @@ class WebRTCService(BaseStreamingService):
             if (p.get("display_id") or "primary") == display_id
         ]
 
+    # What sizes or configures the display a peer streams: its owner's alone apply.
+    OWNER_ONLY_PREFIXES = ("SETTINGS,", "r,", "s,")
+    # The live verbs of the stream settings. A page beside the owner sends its
+    # user's picks in a SETTINGS too, so these from it are its own changes.
+    STREAM_VERB_PREFIXES = ("_arg_fps,", "vb,", "ab,", "_crf,", "_rc,")
+
+    def _display_tabs(self, display_id: str, but: Optional[str] = None) -> set:
+        """The tabs of the peers streaming `display_id`, leaving out peer `but`."""
+        peers = self.rtc_app.peer_connections if self.rtc_app else {}
+        return {tab for pid, tab in self._peer_tabs.items()
+                if tab and pid != but and ((peers.get(pid) or {}).get("display_id") or "primary") == display_id}
+
+    def _on_peer_data_message(self, msg: Any, display_id: str = "primary", conn_id: Optional[str] = None) -> Any:
+        """Hand a peer's data-channel message to the input handler. From a
+        controller beside the display's owner, what would size the display is
+        held back, the latest of each kind replayed once that controller owns
+        the display (`_succeed_display_owner`); its SETTINGS changes the stream
+        by its user's picks alone (`_settings_beside_owner`), and its stream
+        verbs, its page's own changes, are dropped. The owner's changes to the
+        stream reach the pages beside it. A keyframe request from a peer that
+        does not own the display is taken once a second (`peer_recovery_taken`)."""
+        if msg == "REQUEST_KEYFRAME" and self.rtc_app is not None \
+                and not self.rtc_app.peer_recovery_taken(conn_id, "keyframe"):
+            return None
+        if not isinstance(msg, str) or not msg.startswith(self.OWNER_ONLY_PREFIXES + self.STREAM_VERB_PREFIXES):
+            return self.input_handler.on_message(msg, display_id, conn_id=conn_id)
+        display_id = display_id or "primary"
+        tab = self._peer_tabs.get(conn_id)
+        owner = self._display_owner_tabs.get(display_id)
+        if tab and owner and tab != owner:
+            peer = self.rtc_app.peer_connections.get(conn_id) if self.rtc_app else None
+            if msg.startswith("SETTINGS,"):
+                return self._settings_beside_owner(msg, display_id, peer)
+            if peer is not None and msg.startswith(self.OWNER_ONLY_PREFIXES):
+                peer.setdefault("held_owner_messages", {})[msg.split(",", 1)[0]] = msg
+            return None
+        result = self.input_handler.on_message(msg, display_id, conn_id=conn_id)
+        if msg.startswith(("SETTINGS,",) + self.STREAM_VERB_PREFIXES) and self._peers_beside_owner(display_id):
+            return self._tell_beside_after(result, display_id)
+        return result
+
+    def _peer_owns_display(self, client_peer_id: str) -> bool:
+        """Whether a peer is the owner of the display it streams, which any peer
+        is while no owner's tab is known (`peer_recovery_taken`)."""
+        peer = (self.rtc_app.peer_connections.get(client_peer_id) if self.rtc_app else None) or {}
+        owner = self._display_owner_tabs.get(peer.get("display_id") or "primary")
+        return owner is None or self._peer_tabs.get(client_peer_id) == owner
+
+    def _owner_peer(self, display_id: str) -> Optional[Dict[str, Any]]:
+        """The peer entry of the display's owner."""
+        owner = self._display_owner_tabs.get(display_id)
+        peers = self.rtc_app.peer_connections if self.rtc_app else {}
+        return next((p for pid, p in peers.items() if owner and self._peer_tabs.get(pid) == owner
+                     and (p.get("display_id") or "primary") == display_id), None)
+
+    def _peers_beside_owner(self, display_id: str) -> List[Dict[str, Any]]:
+        """The controller peers streaming `display_id` from another tab than its owner's."""
+        owner = self._display_owner_tabs.get(display_id)
+        peers = self.rtc_app.peer_connections if self.rtc_app else {}
+        return [p for pid, p in peers.items() if owner and self._peer_tabs.get(pid) not in (None, owner)
+                and p.get("client_type") == ClientType.CONTROLLER
+                and (p.get("display_id") or "primary") == display_id]
+
+    def _holds_full_control(self, peer: Optional[Dict[str, Any]]) -> bool:
+        """Whether a peer holds a display's full permissions: a controller that
+        may drive keyboard and mouse, not a viewer, which only watches, nor a
+        gamepad player."""
+        return (peer is not None and peer.get("client_type") == ClientType.CONTROLLER
+                and self.rtc_app is not None and self.rtc_app.peer_holds_input_authority(peer))
+
+    def _tell_display_settings(self, display_id: str, peers: List[Optional[Dict[str, Any]]]) -> None:
+        """Tell peers what `display_id` streams with (`display_settings`): a
+        page beside the display's owner holds it for its tab, as does the owner
+        once another page's pick changed it."""
+        values = {key: self._display_setting(display_id, key) for key in STREAM_SETTINGS}
+        data = {"displayId": display_id, "settings": {k: v for k, v in values.items() if v is not None}}
+        for peer in peers:
+            channel = (peer or {}).get("data_channel")
+            if channel is not None:
+                self.rtc_app.send_message_to_channel(channel, "display_settings", data)
+
+    async def _tell_beside_after(self, result: Any, display_id: str) -> Any:
+        """Run the owner's change, then tell the pages beside it."""
+        if asyncio.iscoroutine(result):
+            result = await result
+        self._tell_display_settings(display_id, self._peers_beside_owner(display_id))
+        return result
+
+    async def _settings_beside_owner(self, msg: str, display_id: str, peer: Optional[Dict[str, Any]]) -> None:
+        """A SETTINGS from a controller beside the display's owner. What its
+        user picked of the stream (`picked`) applies where both pages hold full
+        permissions, and the display's pages are told; the rest of it waits
+        until that controller owns the display, without the stream settings,
+        which stay as they are then, and the page is told what they are now."""
+        try:
+            settings_json = json.loads(msg.split(",", 1)[1])
+        except (IndexError, ValueError):
+            return
+        if not isinstance(settings_json, dict):
+            return
+        picked = settings_json.get("picked") if isinstance(settings_json.get("picked"), list) else []
+        picks = {key: settings_json[key] for key in picked
+                 if key in STREAM_SETTINGS and settings_json.get(key) is not None}
+        rest = {k: v for k, v in settings_json.items() if k not in STREAM_SETTINGS and k != "picked"}
+        if peer is not None and rest:
+            held = peer.setdefault("held_owner_messages", {})
+            try:
+                rest = dict(json.loads(held["SETTINGS"].split(",", 1)[1]), **rest) if "SETTINGS" in held else rest
+            except (IndexError, ValueError, TypeError):
+                pass
+            held["SETTINGS"] = "SETTINGS," + json.dumps(rest)
+        owner_peer = self._owner_peer(display_id)
+        if not (picks and self._holds_full_control(peer) and self._holds_full_control(owner_peer)):
+            self._tell_display_settings(display_id, [peer])
+            return
+        logger.info(f"Applying {', '.join(sorted(picks))} picked by the controller beside the owner of '{display_id}'.")
+        await self.handle_update_settings(picks, display_id)
+        self._tell_display_settings(display_id, [owner_peer, *self._peers_beside_owner(display_id)])
+
+    async def _succeed_display_owner(self, display_id: str, tab: str) -> None:
+        """Once the owner's tab has been gone through the reconnect grace, hand
+        the display to its oldest controller that holds full permissions, else
+        to its oldest controller: the density and size that controller asked
+        for meanwhile apply now, and its own changes from then on."""
+        await asyncio.sleep(self.RECONNECT_GRACE_S)
+        if self._display_owner_tabs.get(display_id) != tab or tab in self._display_tabs(display_id):
+            return
+        peers = self.rtc_app.peer_connections if self.rtc_app else {}
+        controllers = [pid for pid, p in peers.items()
+                       if (p.get("display_id") or "primary") == display_id
+                       and p.get("client_type") == "controller" and self._peer_tabs.get(pid)]
+        heir = next((pid for pid in controllers if self._holds_full_control(peers[pid])),
+                    controllers[0] if controllers else None)
+        if heir is None:
+            self._display_owner_tabs.pop(display_id, None)
+            return
+        self._display_owner_tabs[display_id] = self._peer_tabs[heir]
+        logger.info(f"Controller {heir} owns display '{display_id}' now.")
+        held = peers[heir].pop("held_owner_messages", {})
+        for kind in ("SETTINGS", "s", "r"):
+            if kind in held:
+                result = self.input_handler.on_message(held[kind], display_id, conn_id=heir)
+                if asyncio.iscoroutine(result):
+                    await result
+
     async def handle_peer_gone(
         self, peer_id: str, peer: Optional[Dict[str, Any]] = None
     ) -> None:
@@ -1575,7 +1839,15 @@ class WebRTCService(BaseStreamingService):
         drive input and no input-capable peer is left, so a viewer (or a second
         display's peer) leaving never drops the controller's held keys or its
         in-flight drag. A controller that vanishes while others remain is covered
-        by the input handler's heartbeat stale-sweep."""
+        by the input handler's heartbeat stale-sweep. A departing owner's display
+        passes to the controller beside it unless its tab comes back within the
+        reconnect grace."""
+        tab = self._peer_tabs.pop(peer_id, None)
+        gone_from = ((peer or {}).get("display_id") or "primary")
+        if tab and self._display_owner_tabs.get(gone_from) == tab and self.input_handler is not None:
+            task = asyncio.create_task(self._succeed_display_owner(gone_from, tab))
+            self.tasks.append(task)
+            task.add_done_callback(lambda t: self.tasks.remove(t) if t in self.tasks else None)
         if self.input_handler is None:
             return
         try:
@@ -1637,17 +1909,22 @@ class WebRTCService(BaseStreamingService):
         peer["audio_paused"] = not active
         sender = peer.get("audio_sender")
         if sender is not None:
-            sender._enabled = active
+            sender._enabled = active and not peer.get("audio_declined")
         await self._settle_primary_audio()
 
     async def _settle_primary_audio(self) -> None:
         """Pause the primary's audio capture once every peer is audio-paused,
         and resume it while any peer receives audio; a no-op on a pipeline
-        that is not running (start_display_media decides what starts)."""
+        that is not running (start_display_media decides what starts). A
+        surround capture encodes its stereo companion exactly while a peer
+        whose answer took stereo receives audio (`RTCApp._settle_audio_codec`)."""
         pipeline = self.media_pipeline
         if pipeline is None or not pipeline.is_media_pipeline_running():
             return
         consumers = self._display_consumers("primary")
+        if int(self.args.audio_channels) > 2:
+            pipeline.set_stereo_companion(any(
+                p.get("audio_layout") == "stereo" and not p.get("audio_paused", False) for p in consumers))
         if consumers and all(p.get("audio_paused", False) for p in consumers):
             if await pipeline.pause_audio_capture():
                 logger.info("No peer receives audio; audio capture stopped.")
@@ -1689,7 +1966,9 @@ class WebRTCService(BaseStreamingService):
         the media stream and the client-side grant, which otherwise persist
         until the peer disconnects itself. A slot-only change keeps the peer
         but is pushed as a role_update (websockets ROLE_UPDATE parity): the
-        gamepad slot mapping lives client-side and would silently desync."""
+        gamepad slot mapping lives client-side and would silently desync. The
+        slots it lost are released here, since the gate refuses the page's own
+        release of a slot no longer its."""
         if self.rtc_app is None:
             return
         tokens, mk = current_session_tokens()
@@ -1713,7 +1992,14 @@ class WebRTCService(BaseStreamingService):
             self.rtc_app._send_collab_state(peer.get("data_channel"), ctype, token)
             new_slot = new_perms.get("slot")
             if new_slot != peer.get("client_slot"):
+                lost = [s for s in sessions.token_slots(peer.get("client_slot"))
+                        if s not in sessions.token_slots(new_slot)]
                 peer["client_slot"] = new_slot
+                if lost and self.input_handler is not None:
+                    try:
+                        await self.input_handler.release_gamepad_slots_for_conn(peer_id, lost)
+                    except Exception:
+                        logger.warning(f"Releasing slots {lost} of {peer_id} failed", exc_info=True)
                 channel = peer.get("data_channel")
                 if channel is not None and channel.readyState == "open":
                     try:
@@ -1911,7 +2197,7 @@ class WebRTCService(BaseStreamingService):
                         return
                     # Before the shrink, so no monitor lingers outside the framebuffer.
                     await retire_displays()
-                    realized = await resize_display(f"{p_w}x{p_h}")
+                    realized = await resize_display(f"{p_w}x{p_h}", self.media_pipeline.framerate)
                     if realized:
                         p_w, p_h = realized
                     self.media_pipeline.capture_region = None
@@ -1956,16 +2242,16 @@ class WebRTCService(BaseStreamingService):
             )
             layouts[did] = layouts.pop("secondary")
             if IS_WAYLAND:
-                if not await self._apply_wayland_extension(did, layouts):
-                    await self._drop_wayland_secondary(
-                        did, "The compositor cannot create an output for this display."
-                    )
+                refusal = await self._apply_wayland_extension(did, layouts)
+                if refusal:
+                    await self._drop_wayland_secondary(did, refusal)
                     return
             else:
                 # apply_extended_layout fits `layouts` to the root really produced:
                 # kept displays may shrink and an unplaceable one disappears from it.
                 requested = {d: (r["w"], r["h"]) for d, r in layouts.items()}
-                if (not await apply_extended_layout(layouts, total_w, total_h)
+                if (not await apply_extended_layout(
+                        layouts, total_w, total_h, self.media_pipeline.framerate)
                         or did not in layouts):
                     await self._drop_x11_secondary(
                         did, "The X server cannot extend the desktop to fit this display."
@@ -1998,13 +2284,14 @@ class WebRTCService(BaseStreamingService):
                 pipeline = MediaPipelinePixel(
                     async_event_loop=asyncio.get_running_loop(),
                     encoder=str(setting("encoder")),
-                    framerate=int(setting("framerate")),
+                    framerate=setting("framerate"),
                     video_bitrate=int(setting("video_bitrate")),
                     audio_enabled=False,
                     width=s["w"],
                     height=s["h"],
                     crf=int(setting("video_crf")),
                     video_fullcolor=bool(setting("video_fullcolor")),
+                    video_10bit=bool(setting("video_10bit")),
                     use_cpu=bool(setting("use_cpu")),
                     video_streaming_mode=bool(setting("video_streaming_mode")),
                     use_paint_over_quality=bool(setting("use_paint_over_quality")),
@@ -2027,8 +2314,9 @@ class WebRTCService(BaseStreamingService):
                 # The native-cursor toggle is global across displays.
                 pipeline.capture_cursor = self.media_pipeline.capture_cursor
                 pipeline.produce_data = (
-                    lambda buf, pts, kind, keyframe=True, timing=None, dependency=None, _did=did:
-                        self.rtc_app.consume_data(buf, pts, kind, keyframe, _did, timing, dependency)
+                    lambda buf, pts, kind, keyframe=True, timing=None, dependency=None, codec=None, anchor=False,
+                    _did=did: self.rtc_app.consume_data(buf, pts, kind, keyframe, _did, timing, dependency, codec,
+                                                         anchor)
                 )
                 # pixelflux's cursor-callback slot is process-global (last registration
                 # wins), so every display must route cursors into the same sink.
@@ -2104,7 +2392,7 @@ class WebRTCService(BaseStreamingService):
         Rebroadcast with the layout, since a page maps a drag that crossed onto
         a neighbor through the neighbor's box rather than off its own edge.
         Only the browser knows those origins, and they are the only thing
-        relating two viewports whose monitors, window chrome and device pixel
+        relating two viewports whose monitors, window chrome, and device pixel
         ratios all differ. Ignored for an unknown display or an impossible box.
         """
         if display_id not in self.display_layouts:
@@ -2129,13 +2417,17 @@ class WebRTCService(BaseStreamingService):
         self._broadcast_display_config()
 
     def _display_config_payload(self) -> Dict[str, Any]:
-        """display_config_update body: the display roster, the backend, plus
-        each laid-out display's rectangle, its client's reported CSS-to-remote
-        scale and the desktop box that client draws it in, so a page can map a
-        cross-display drag into its neighbor's region and, on X11, a secondary
-        can follow the primary's density."""
+        """display_config_update body: the display roster, the backend and whether
+        it takes a touchpad's scroll as a finger's, plus each laid-out display's
+        rectangle, its client's reported CSS-to-remote scale, and the desktop box
+        that client draws it in, so a page can map a cross-display drag into its
+        neighbor's region and, on X11, a secondary can follow the primary's
+        density."""
         displays = ["primary"] + [d for d in self.display_clients.keys() if d != "primary"]
-        payload: Dict[str, Any] = {"displays": displays, "wayland": IS_WAYLAND}
+        payload: Dict[str, Any] = {
+            "displays": displays, "wayland": IS_WAYLAND,
+            "finger_scroll": bool(self.input_handler and self.input_handler.finger_scroll_available()),
+        }
         layouts = {}
         for did, rect in (self.display_layouts or {}).items():
             entry: Dict[str, Any] = dict(rect)
@@ -2198,7 +2490,7 @@ class WebRTCService(BaseStreamingService):
         An operator-set DPI (CLI/env) governs the desktop and is never
         clobbered by a client sync. Idempotent: the dashboard and the core
         each re-assert their DPI on settings broadcasts, and every apply churns
-        xrdb, xsettingsd SIGHUP and cursor themes. On Wayland the DPI runs the
+        xrdb, xsettingsd SIGHUP, and cursor themes. On Wayland the DPI runs the
         scale ladder per display: the session compositor scales the screen
         backing it, and only what it leaves becomes that display's capture
         scale, whose change restarts the capture (the WS path threads the same
@@ -2301,6 +2593,14 @@ class WebRTCService(BaseStreamingService):
                 await pipeline.restart_screen_capture()
                 await self._push_wayland_realized_geometry(did, pipeline)
 
+    async def _republish_second_screen(self) -> None:
+        """Re-read what backs a second display and re-announce the server
+        settings, so every page shows the second-display offer the session
+        allows now rather than the one it allowed when the page connected."""
+        await self._refresh_second_screen_capacity()
+        if self.rtc_app:
+            self.rtc_app.send_media_data_over_channel("server_settings", self._server_settings_payload())
+
     async def _resync_wayland_session_scale(self, dpi: Any) -> None:
         """A session compositor was adopted after captures started: run the
         scale ladder again for every display, so the session takes the desktop
@@ -2333,9 +2633,25 @@ class WebRTCService(BaseStreamingService):
         if self.rtc_app:
             self.rtc_app.send_stream_info(display_id, info)
 
+    def _rush_stream_stats(self, display_id: str) -> None:
+        """A controller just opened its stats: its display's encode is differenced
+        from now, and its first figures follow soon (`ResourceMonitor.rush`)."""
+        watch = getattr(self.display_pipelines.get(display_id), "stream_watch", None)
+        if watch is not None:
+            watch.rates()
+        if self.resource_monitor is not None:
+            asyncio.ensure_future(self.resource_monitor.rush())
+
+    def _note_frame_sent(self, display_id: str, capture_ns: int, size: int) -> None:
+        """A display's frame is on the wire to its controller (`RTCApp.on_frame_sent`)."""
+        watch = getattr(self.display_pipelines.get(display_id), "stream_watch", None)
+        if watch is not None:
+            watch.note_send(capture_ns, size)
+
     def _send_stream_stats(self) -> None:
         """One `stream_stats` to the controllers with their stats open: the host's
-        figures and their display's encode. The link is the page's own to measure."""
+        figures, their display's encode and delivery, and its CBR target. The link
+        is the page's own to measure."""
         host = stream_stats.host_stats(self.resource_monitor)
         for did in self.rtc_app.stats_displays():
             stats = dict(host)
@@ -2343,6 +2659,8 @@ class WebRTCService(BaseStreamingService):
             watch = getattr(pipeline, "stream_watch", None)
             if watch is not None:
                 stats.update(watch.rates())
+            if getattr(pipeline, "rc_mode", None) == RateControlMode.CBR and pipeline.video_bitrate:
+                stats["target_mbps"] = round(pipeline.video_bitrate / 1000, 2)
             self.rtc_app.send_stream_stats(did, stats)
 
     async def handle_resource_tick(self, t: float) -> None:
@@ -2373,6 +2691,7 @@ class WebRTCService(BaseStreamingService):
         "use_cpu": lambda p, v: p.set_use_cpu(bool(v)),
         "encoder": lambda p, v: p.set_encoder(str(v)),
         "video_fullcolor": lambda p, v: p.set_video_fullcolor(bool(v)),
+        "video_10bit": lambda p, v: p.set_video_10bit(bool(v)),
         "video_streaming_mode": lambda p, v: p.set_video_streaming_mode(bool(v)),
         "use_paint_over_quality": lambda p, v: p.set_use_paint_over_quality(bool(v)),
         "video_paintover_crf": lambda p, v: p.set_video_paintover_crf(int(v)),
@@ -2439,6 +2758,9 @@ class WebRTCService(BaseStreamingService):
         pipeline = self.display_pipelines.get(display_id)
         if pipeline is not None:
             await applier(pipeline, value)
+        if key == "framerate" and display_id == "primary" and self.media_pipeline and not IS_WAYLAND:
+            # The display's modes follow the primary's rate (`resize_display`).
+            await refresh_output_mode(self.media_pipeline.framerate)
         if key == "encoder" and display_id == "primary":
             self.settings.encoder = str(value)
             self.settings._encoder_client_set = True
@@ -2483,21 +2805,42 @@ class WebRTCService(BaseStreamingService):
     async def _fullcolor_declined(self, display_id: str) -> bool:
         """A joining WebRTC peer decodes none of the 4:4:4 the display's codec
         carries: full color goes off for the display, so the offer describes
-        4:2:0 from its first frame, and every client hears of it; a full color
-        the operator holds stays, which leaves that peer without a picture."""
-        if not self._fullcolor_for_display(display_id):
+        4:2:0 from its first frame (`_format_declined`)."""
+        return await self._format_declined(display_id, "video_fullcolor", "4:4:4", "full color")
+
+    async def _ten_bit_declined(self, display_id: str) -> bool:
+        """A joining WebRTC peer decodes no 10 bits of the display's codec: 10-bit
+        goes off for the display, so the offer describes 8 bits from its first
+        frame (`_format_declined`)."""
+        return await self._format_declined(display_id, "video_10bit", "10-bit", "10-bit")
+
+    async def _format_declined(self, display_id: str, setting: str, fmt: str, label: str) -> bool:
+        """Turn a format setting off for a display whose joining peer cannot decode it,
+        and tell every client; a setting the operator holds stays, which leaves that
+        peer without a picture.
+
+        Args:
+            display_id: The display the peer joins.
+            setting: The bool setting that asks for the format.
+            fmt: The format, as the log names it.
+            label: The setting, as the log names it.
+
+        Returns:
+            Whether the display no longer emits the format.
+        """
+        if not bool(self._display_setting(display_id, setting)):
             return True
-        limit = getattr(self.settings, "video_fullcolor", None)
+        limit = getattr(self.settings, setting, None)
         if isinstance(limit, (tuple, list)) and len(limit) > 1 and limit[1]:
             return False
-        logger.warning("A WebRTC peer of display %r decodes no 4:4:4 of its codec; full color is off.",
-                       display_id)
-        await self._apply_display_setting(display_id, "video_fullcolor", False)
+        logger.warning("A WebRTC peer of display %r decodes no %s of its codec; %s is off.",
+                       display_id, fmt, label)
+        await self._apply_display_setting(display_id, setting, False)
         if display_id == "primary":
             # The settings payload advertises the primary's value: an operator override
-            # left in it would come back from the client and flip the stream to 4:4:4.
-            self.settings.video_fullcolor = (False, False)
-            self.settings._overridden["video_fullcolor"] = False
+            # left in it would come back from the client and turn the format on again.
+            setattr(self.settings, setting, (False, False))
+            self.settings._overridden[setting] = False
         if self.rtc_app:
             self.rtc_app.send_media_data_over_channel(
                 "server_settings", self._server_settings_payload())
@@ -2505,6 +2848,9 @@ class WebRTCService(BaseStreamingService):
 
     def _fullcolor_for_display(self, display_id: str) -> bool:
         return bool(self._display_setting(display_id, "video_fullcolor"))
+
+    def _ten_bit_for_display(self, display_id: str) -> bool:
+        return bool(self._display_setting(display_id, "video_10bit"))
 
     def _use_cpu_for_display(self, display_id: str) -> bool:
         return bool(self._display_setting(display_id, "use_cpu"))
@@ -2541,6 +2887,7 @@ class WebRTCService(BaseStreamingService):
             "force_aligned_resolution",
             "encoder",
             "video_fullcolor",
+            "video_10bit",
             "video_streaming_mode",
             "use_paint_over_quality",
             "video_paintover_crf",
@@ -2630,6 +2977,8 @@ class WebRTCService(BaseStreamingService):
             logger.debug(
                 f"Updated setting '{key}' for display '{display_id}' from {current_value} to {sanitized_value}"
             )
+        if display_id == "primary":
+            self._primary_sized.set()
 
     def mon_rtc_config(
         self, stun_servers: List[str], turn_servers: List[str], rtc_config: Any
@@ -2643,18 +2992,28 @@ class WebRTCService(BaseStreamingService):
             logger.debug("updating STUN/TURN servers in RTC app")
             self.rtc_app.update_rtc_config(stun_servers, turn_servers)
 
-    def _ensure_pacer(self, pc: Any, peer: Dict[str, Any], display_id: str) -> Optional[Any]:
+    def _ensure_pacer(self, pc: Any, peer: Dict[str, Any], display_id: str,
+                      peer_id: Optional[str] = None) -> Optional[Any]:
         """Ensure the per-transport packet pacer is enabled/configured (called
         from the congestion loop; idempotent and cheap).
 
-        Encoder ceiling: the display's configured video bitrate, CBR or not.
+        Encoder rate: the display's configured video bitrate, CBR or not,
+        also while congestion control steers the encoder under it. Pacing at
+        the steered target, as libwebrtc paces at its estimate, shrinks the
+        queue budget (CAP_MIN_MS of the pace) into the pacer's purging regime:
+        on a constrained link it cut a fifth to a third of the frames delivered
+        and doubled the swing of the received rate for its lower delay. The
+        pacer's own brake follows the wire instead.
         The shared DTLS transport is reachable via `pc.sctp` only once the
         data-channel m-line is negotiated, while media (and TWCC estimates)
         can flow before that, so any transceiver's sender transport — the same
         shared RTCDtlsTransport — serves as the fallback. The IDR floor is
         bootstrapped from the session-start keyframe: on a late attach, waiting
         for the next natural IDR would start it at 0 and reset on the first
-        real burst.
+        real burst. The keyframe a GOP reset asks for, where the video sender
+        cannot resync its peer itself, is limited for `peer_id` as the peer's
+        own requests are (`RTCApp.peer_recovery_taken`): a page that does not
+        own its display gets the shared encoder's at most once a second.
 
         Returns:
             The DTLS transport (so callers can snapshot its pacer), or None
@@ -2677,13 +3036,15 @@ class WebRTCService(BaseStreamingService):
                 if getattr(tr, "kind", None) == "video":
                     vsender = tr.sender
                     break
-            transport.enable_pacer(
-                encoder_bps=enc_bps,
+            def pacer_keyframe(did_: str = display_id, pid_: Optional[str] = peer_id) -> None:
                 # Must hit the encoder pipeline: video rides the pre-encoded pack()
                 # path, where the sender's __force_keyframe flag is silently ignored.
-                request_keyframe=lambda did_=display_id: asyncio.ensure_future(
-                    self.request_idr_for_display(did_, unless_pending=True)),
-            )
+                rtc_app = self.rtc_app
+                if pid_ is not None and rtc_app is not None and not rtc_app.peer_recovery_taken(pid_, "keyframe"):
+                    return
+                asyncio.ensure_future(self.request_idr_for_display(did_, unless_pending=True))
+
+            transport.enable_pacer(encoder_bps=enc_bps, request_keyframe=pacer_keyframe)
             kf_bytes = getattr(vsender, "_keyframe_bytes", None)
             if kf_bytes:
                 transport.note_video_keyframe(
@@ -2699,18 +3060,29 @@ class WebRTCService(BaseStreamingService):
     async def _congestion_control_loop(self) -> None:
         """GCC-style bitrate adaptation from transport-wide-cc receiver feedback:
         per display, follow the slowest of ITS peers' goodput estimates with
-        headroom, back off multiplicatively on two ticks of loss in a row and
-        hold there before recovering (`CongestionSteer`), and retarget that
-        display's encoder within the allowed video_bitrate range — one display's
-        congested link never steers another's stream. Only CBR mode has a target
-        to steer. Each peer's own loss also sets how many FlexFEC repair packets
+        headroom, back off on the first tick whose one-way delay shows a queue
+        standing, or still building, `TWCC_QUEUE_MS` past the path's own
+        (`take_twcc_window`), to what the path delivered meanwhile unless the
+        display sent too little for that to measure the path, or
+        multiplicatively on two ticks of loss in a
+        row, and hold there before recovering (`CongestionSteer`), and retarget
+        that display's encoder within the allowed video_bitrate range — one
+        display's congested link never steers another's stream. The queue is
+        the deepest any of its peers shows, so a deep buffer is found before it
+        overflows into loss. The peers are the display's owner when it sent
+        feedback, as over WebSockets the owner's acks steer: a viewer's or a
+        controller's beside the owner on a slower link do not pull the owner's
+        stream down; all of them otherwise. Only CBR mode has a target to steer.
+        Each peer's own loss and queue also set how many FlexFEC repair packets
         its sender adds per group (`RTCRtpSender.steer_fec`).
 
         Each peer's feedback is drained per tick, so a decision is taken over a
         tick's worth of it rather than whichever window landed last: a single
         window is a few tens of packets, too few for its loss fraction to mean
         anything, and a display that sends little (a still second screen) is
-        made of such windows. A tick that drains nothing steers nothing.
+        made of such windows. A tick that drains nothing steers nothing. The
+        target is also the display's video budget (`PipelineBridge.set_budget`),
+        which drops the frames an encoder overshoots it by.
 
         The user-selected bitrate is the ceiling: control only backs off below
         it and recovers up to it. Clamping to the allowed range instead let a
@@ -2738,12 +3110,13 @@ class WebRTCService(BaseStreamingService):
             if not rtc_app:
                 continue
             per_display: Dict[str, Dict[str, Any]] = {}
-            for peer in rtc_app.peer_connections.values():
+            by_owner: Dict[str, Dict[str, Any]] = {}
+            for peer_id, peer in rtc_app.peer_connections.items():
                 pc = peer.get("peer_conn")
                 did = peer.get("display_id", "primary") or "primary"
                 if pacer_on:
                     try:
-                        dtls = self._ensure_pacer(pc, peer, did)
+                        dtls = self._ensure_pacer(pc, peer, did, peer_id)
                         if self.metrics is not None and dtls is not None:
                             self.metrics.set_pacer_snapshot(did, dtls.pacer_snapshot())
                     except Exception:
@@ -2752,14 +3125,22 @@ class WebRTCService(BaseStreamingService):
                 window = transport.take_twcc_window() if transport is not None else None
                 if window is None:
                     continue
+                standing = None if window["queue_ms"] is None else max(
+                    window["queue_ms"], window["queue_rising_ms"] or 0.0)
                 sender = peer.get("video_sender")
                 if sender is not None:
-                    sender.steer_fec(window["loss_fraction"])
-                bucket = per_display.setdefault(
-                    did, {"goodputs": [], "worst_loss": 0.0})
-                if window["goodput_bps"]:
-                    bucket["goodputs"].append(window["goodput_bps"])
-                bucket["worst_loss"] = max(bucket["worst_loss"], window["loss_fraction"])
+                    sender.steer_fec(window["loss_fraction"], standing is not None and standing > TWCC_QUEUE_MS)
+                for buckets in ((per_display, by_owner) if self._peer_owns_display(peer_id) else (per_display,)):
+                    bucket = buckets.setdefault(
+                        did, {"goodputs": [], "worst_loss": 0.0, "queue_ms": None, "depth_ms": 0.0, "sent_bps": 0})
+                    if window["goodput_bps"]:
+                        bucket["goodputs"].append(window["goodput_bps"])
+                    bucket["sent_bps"] = max(bucket["sent_bps"], window["sent_bps"])
+                    bucket["worst_loss"] = max(bucket["worst_loss"], window["loss_fraction"])
+                    if standing is not None:
+                        bucket["queue_ms"] = max(bucket["queue_ms"] or 0.0, standing)
+                        bucket["depth_ms"] = max(bucket["depth_ms"], window["queue_depth_ms"])
+            per_display.update(by_owner)
             if self.metrics is not None:
                 self.metrics.set_bridge_drops(rtc_app.bridge_drops())
             for did, bucket in per_display.items():
@@ -2770,6 +3151,7 @@ class WebRTCService(BaseStreamingService):
                     pipeline is None
                     or getattr(pipeline, "rc_mode", None) != RateControlMode.CBR
                 ):
+                    rtc_app.set_video_budget(did, None)
                     continue
                 goodputs, worst_loss = bucket["goodputs"], bucket["worst_loss"]
                 if not goodputs:
@@ -2777,14 +3159,24 @@ class WebRTCService(BaseStreamingService):
                 current = float(pipeline.video_bitrate)
                 ceiling = float(self._display_setting(did, "video_bitrate") or hi_kbps)
                 ceiling = max(lo_kbps, min(hi_kbps, ceiling))
+                queue_ms = bucket["queue_ms"]
+                queue_s = None if queue_ms is None else (
+                    max(queue_ms, bucket["depth_ms"]) / 1000.0 if queue_ms > TWCC_QUEUE_MS else 0.0)
                 # Goodput may lift the target, never drag it down (see docstring).
                 steer = self._congestion_steer.setdefault(did, CongestionSteer())
+                now = time.monotonic()
                 target = round(steer.target(
-                    current, ceiling, lo_kbps, min(goodputs), worst_loss, time.monotonic()))
+                    current, ceiling, lo_kbps, min(goodputs), worst_loss, now, queue_s,
+                    bucket["sent_bps"]))
+                rtc_app.set_video_budget(did, target * 1000)
+                held_kbps = self._rate_holds.setdefault(did, RateHold()).note(target, now)
+                if held_kbps is not None:
+                    rtc_app.send_cc_rate(did, held_kbps)
                 if target != round(current):
-                    logger.info(
+                    (logger.info if target < current else logger.debug)(
                         f"Congestion control[{did}]: video bitrate {current:.0f} -> {target:.0f} kbps "
-                        f"(goodput {min(goodputs) / 1e3:.1f} kbps, loss {worst_loss:.1%})"
+                        f"(goodput {min(goodputs) / 1e3:.1f} kbps, loss {worst_loss:.1%}, "
+                        f"queue {queue_ms or 0.0:.0f} ms)"
                     )
                     await pipeline.set_video_bitrate(target)
 
@@ -3023,6 +3415,12 @@ class WebRTCService(BaseStreamingService):
                 logger.exception(
                     "Unexpected error during concurrent component shutdown"
                 )
+        if self.peer_manager is not None:
+            # A page that registered before the stop's refusal took effect would
+            # hold the listener's shutdown open on its socket until a kill.
+            await _await_with_timeout(
+                self.peer_manager.close_clients(), "signaling clients", 3.0
+            )
         if self.metrics:
             try:
                 # unregister() drains the CSV executor with shutdown(wait=True).
@@ -3095,13 +3493,19 @@ class WebRTCService(BaseStreamingService):
     async def rtc_ws_handler(
         self, request: web.Request
     ) -> Union[web.Response, web.WebSocketResponse]:
-        """Accept a signaling WebSocket, refusing with 409/503 while the WebRTC
-        mode is inactive or still starting."""
+        """Accept a signaling WebSocket, refusing with 409 while the WebRTC mode
+        is inactive and 503 while it is starting or going away: a page its
+        stopping server closed reconnects at once, and a session registered
+        then would find no server peer and keep the shutdown waiting on it. A
+        plain GET is the page's probe before it reloads: answered 204, that the
+        transport is up, rather than with an error status the browser logs."""
         if self.supervisor.current_mode != self.mode:
             return web.Response(status=409, text="WebRTC mode is inactive")
-        if self.peer_manager is None:
+        if self.peer_manager is None or self._shutdown_called or self.shutdown_event.is_set():
             return web.Response(status=503, headers={"Retry-After": "1"},
-                                text="WebRTC service is still starting")
+                                text="WebRTC service is starting or stopping")
+        if request.headers.get("Upgrade", "").lower() != "websocket":
+            return web.Response(status=204)
         # autoping=False so the signaling loop sees PONG frames and can feed
         # the upload uplink gauge's clock; the loop answers PING itself.
         ws = web.WebSocketResponse(autoping=False)

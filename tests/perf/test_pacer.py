@@ -19,6 +19,7 @@ import logging
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -239,7 +240,8 @@ async def rewrite_candidates(sdp_text: str, up: Shaper, down: Shaper, tag: str) 
     return "\r\n".join(out_lines)
 
 async def run_client(ws_url: str, measure_s: float, warmup_s: float,
-                     client_type: str = "controller", client_slot: int = -1) -> dict:
+                     client_type: str = "controller", client_slot: int = -1,
+                     on_message=None) -> dict:
     """Run one headless WebRTC client session and measure a settled window.
 
     Args:
@@ -248,6 +250,7 @@ async def run_client(ws_url: str, measure_s: float, warmup_s: float,
         warmup_s: Maximum time to wait for media before measuring.
         client_type: Role announced in the HELLO message.
         client_slot: Slot announced in the HELLO message.
+        on_message: Called with every data channel message.
 
     Returns:
         The measure_window() summary for the measurement window.
@@ -267,6 +270,8 @@ async def run_client(ws_url: str, measure_s: float, warmup_s: float,
         LOG.info("datachannel: %s", channel.label)
         @channel.on("message")
         def on_msg(msg):
+            if on_message is not None:
+                on_message(msg)
             if isinstance(msg, str) and '"ping"' in msg:
                 try:
                     data = json.loads(msg)
@@ -291,6 +296,11 @@ async def run_client(ws_url: str, measure_s: float, warmup_s: float,
                 await ws.send_str("SESSION server")
             elif data.startswith(("SESSION_OK", "SESSION_END", "ERROR")):
                 LOG.info("signaling: %s", data)
+                # The server's own peer can register after the rig's HELLO; the
+                # page asks again a second later, and so does the rig.
+                if data == "ERROR peer server not found":
+                    await asyncio.sleep(1.0)
+                    await ws.send_str("SESSION server")
             elif data.startswith("SESSION"):
                 pass
             else:
@@ -476,6 +486,7 @@ async def run_cell(pacer_on: bool, regime: str) -> dict:
         "SELKIES_TURN_REST_URI": "",
         "SELKIES_STUN_HOST": "",
         "SELKIES_VIDEO_BITRATE": "8000",
+        "SELKIES_CONGESTION_CONTROL": "false",
         "SELKIES_DEBUG": "true",
     }
     for k in os.environ:
@@ -489,11 +500,14 @@ async def run_cell(pacer_on: bool, regime: str) -> dict:
     pr.cpu_percent()
     window = {}
     load_proc = None
+    # The capture sends nothing from a silent desktop, and audio behind video
+    # bursts is what the cells measure.
+    tone = H.pulse_sine()
     try:
         if LOAD_GEN:
             load_proc = H.spawn(
                 [os.path.join(H.TOOLS, "pacer_load_gen.sh")],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         # The listener answers before the service has registered its signaling
         # peer; a session asked for in between is refused.
         deadline = time.monotonic() + 30
@@ -512,8 +526,14 @@ async def run_cell(pacer_on: bool, regime: str) -> dict:
         if osc_task is not None:
             osc_task.cancel()
         if load_proc is not None:
-            load_proc.terminate()
-            subprocess.run(["pkill", "-9", "-f", "pacer-load"], capture_output=True)
+            # The generator's terminal shares its process group; anything else
+            # on the host matching its name is not this cell's to end.
+            try:
+                os.killpg(load_proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            load_proc.wait()
+        H.pulse_unload(tone)
         cell_log = server_log_delta(log, log_before)
         cpu = pr.cpu_percent()
         H.server_stop()

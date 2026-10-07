@@ -20,18 +20,15 @@
  *   limitations under the License.
  */
 
-/*global GamepadManager, Input*/
-
-/*eslint no-unused-vars: ["error", { "vars": "local" }]*/
-
 /**
  * Peer-connection side of the WebRTC transport.
  *
  * The server offers and the client answers. The offer arrives through
  * lib/signaling.js; the answer is munged before it becomes the local
- * description (`sps-pps-idr-in-keyframe=1` on the H.264 line, and on the
+ * description (`sps-pps-idr-in-keyframe=1` on the H.264 line, on the
  * Opus line `stereo=1` plus a `minptime` matching the server's `a=ptime`,
- * which is how audio frames shorter than 10 ms get through) and ICE
+ * which is how audio frames shorter than 10 ms get through, and the
+ * surround `multiopus` taken where it is offered, `takeMultiopus`) and ICE
  * candidates are exchanged the same way, non-relay ones dropped when
  * `forceTurn` is set. The server's video and audio arrive as media tracks
  * on the given element; the audio and video m-lines it offers recvonly are
@@ -44,27 +41,66 @@
  * unordered `pointer` channel, JSON messages downstream, routed by `type` to
  * the `on*` callbacks (`pipeline`,
  * `stream_info`, `stream_stats`, `cursor`, `system`, `ping`,
- * `latency_measurement`, `server_settings`, `display_config_update` and
- * `clipboard-msg*`). Either side may gzip a message once the `_gz,1`
- * handshake has been exchanged; the multipart clipboard and
- * `server_settings` kinds keep their arrival order across asynchronous
- * inflation, the rest route as soon as they are readable.
+ * `latency_measurement`, `server_settings`, `display_settings`,
+ * `display_config_update`, `cc_rate`, and `clipboard-msg*`). Either side may
+ * gzip a message once the `_gz,1` handshake has been exchanged; the multipart
+ * clipboard, `server_settings` and `display_settings` kinds keep their arrival
+ * order across asynchronous inflation, the rest route as soon as they are
+ * readable.
  * @module
  */
 
-import { Input } from "./input";
+
+/**
+ * Answers the server's surround stream with the codec it is offered as.
+ *
+ * With more than two audio channels the server offers Chromium's `multiopus`
+ * ahead of stereo RED and Opus. No engine lists it in an answer of its own,
+ * so its payload type is put first on each audio line the server sends on,
+ * with the offer's `rtpmap`, `fmtp`, and `rtcp-fb` for it. An engine that
+ * decodes it lists it on its receivers and gets the surround stream; for one
+ * that does not, `_onSDP` sends the answer the engine created itself, and
+ * the server streams that page stereo.
+ * @param {string} offer The server's offer SDP.
+ * @param {string} answer The answer SDP the engine created.
+ * @returns {string} The answer, taking multiopus wherever the offer carries it.
+ */
+export function takeMultiopus(offer, answer) {
+	const split = (sdp) => sdp.split(/(?=^m=)/m);
+	const offered = split(offer);
+	const answered = split(answer);
+	if (offered.length !== answered.length) return answer;
+	for (let i = 1; i < offered.length; i++) {
+		const section = offered[i];
+		if (!section.startsWith('m=audio') || /^a=recvonly/m.test(section)) continue;
+		const rtpmap = section.match(/^a=rtpmap:(\d+) multiopus\//m);
+		if (!rtpmap) continue;
+		const pt = rtpmap[1];
+		const own = new RegExp(`^a=(rtpmap|fmtp|rtcp-fb):${pt} `);
+		const attrs = section.split(/\r?\n/).filter((l) => own.test(l));
+		const lines = answered[i].split('\r\n');
+		const mline = lines[0].split(' ');
+		if (mline[1] === '0' || mline.slice(3).includes(pt)) continue;
+		lines[0] = [...mline.slice(0, 3), pt, ...mline.slice(3)].join(' ');
+		const at = lines.findIndex((l) => l.startsWith('a=rtpmap:'));
+		lines.splice(at < 0 ? lines.length - 1 : at, 0, ...attrs);
+		answered[i] = lines.join('\r\n');
+	}
+	return answered.join('');
+}
 
 /**
  * WebRTC client: one peer connection plus its data channel.
  *
- * Callbacks are assigned as properties: `onstatus`, `ondebug` and `onerror`
+ * Callbacks are assigned as properties: `onstatus`, `ondebug`, and `onerror`
  * receive messages, `onconnectionstatechange` the peer connection state,
  * `ondatachannelopen` and `ondatachannelclose` nothing, `onplaystreamrequired`
  * fires when autoplay was refused and a user gesture is needed, and
  * `onclipboardcontent`, `oncursorchange`, `onsystemaction`, `onstreaminfo`,
- * `onstreamstats`, `onlatencymeasurement`, `onserversettings` and
- * `ondisplayconfig` receive the payload of the data channel message of the
- * same kind.
+ * `onstreamstats`, `onlatencymeasurement`, `onserversettings`,
+ * `ondisplaysettings`, `ondisplayconfig`, and `onccrate` receive the payload of the data channel
+ * message of the same kind, and `onconnection` the server's verdict on this
+ * page's connection, true while it is poor.
  */
 export class WebRTCClient {
 	/**
@@ -105,10 +141,14 @@ export class WebRTCClient {
 		this._micTransceiver = null;
 		/** Active microphone capture, null until the user enables it. @type {?MediaStream} */
 		this._micStream = null;
+		/** The enable waiting on its permission prompt, which a disable meanwhile withdraws. @type {?{withdrawn: boolean}} */
+		this._micPending = null;
 		/** Sendonly transceiver the server reserved for the webcam, or null. @type {?RTCRtpTransceiver} */
 		this._webcamTransceiver = null;
 		/** Active camera capture, null until the user enables it. @type {?MediaStream} */
 		this._webcamStream = null;
+		/** The enable waiting on its permission prompt, which a disable meanwhile withdraws. @type {?{withdrawn: boolean}} */
+		this._webcamPending = null;
 
 		/** @type {?function(string): void} */
 		this.onstatus = null;
@@ -152,6 +192,9 @@ export class WebRTCClient {
 		/** @type {?function(Object): void} */
 		this.onstreamstats = null;
 
+		/** @type {?function(boolean): void} */
+		this.onconnection = null;
+
 		this.signaling.onsdp = this._onSDP.bind(this);
 		this.signaling.onice = this._onSignalingICE.bind(this);
 
@@ -168,7 +211,7 @@ export class WebRTCClient {
 		/** Order-preserving chain of pending order-sensitive receives. @type {Promise<void>} */
 		this._recvQueue = Promise.resolve();
 
-		/** @type {Input} */
+		/** @type {import('./input.js').Input} */
 		this.input = null;
 
 		/** @type {Array} */
@@ -178,10 +221,16 @@ export class WebRTCClient {
 		this.onserversettings = null;
 
 		/** @type {?function(Object): void} */
+		this.ondisplaysettings = null;
+
+		/** @type {?function(Object): void} */
 		this.ondisplayconfig = null;
 
 		/** @type {?function(Object): void} */
 		this.onprintdocument = null;
+
+		/** @type {?function(number): void} */
+		this.onccrate = null;
 	}
 
 	/** Forwards a status message to `onstatus`. */
@@ -243,7 +292,7 @@ export class WebRTCClient {
 	 * Answers the server's offer: sets the remote description, reserves the
 	 * uplink transceivers, creates the answer, munges it as described in the
 	 * module docblock (the munging has to happen before it becomes the local
-	 * description) and sends it. A rejected `setLocalDescription` is surfaced
+	 * description), and sends it. A rejected `setLocalDescription` is surfaced
 	 * as an error, since swallowing it would stall the session with no answer
 	 * ever sent.
 	 * @param {RTCSessionDescription} sdp
@@ -288,9 +337,19 @@ export class WebRTCClient {
 					}
 				}
 				console.log("Created local SDP", local_sdp);
-				this.peerConnection.setLocalDescription(local_sdp).then(() => {
+				const plain = local_sdp.sdp;
+				const surround = takeMultiopus(sdp.sdp, plain);
+				const apply = (text) => this.peerConnection.setLocalDescription({ type: 'answer', sdp: text });
+				// Gecko sets a surround answer and keeps multiopus in its local
+				// description but not in its receivers: the server is told the
+				// answer the engine would have sent, and streams it stereo.
+				const decodesSurround = () => this.peerConnection.getReceivers().some((r) => r.track && r.track.kind === 'audio'
+					&& r.getParameters().codecs.some((c) => /multiopus/i.test(c.mimeType)));
+				(surround === plain ? apply(plain) : apply(surround).catch(() => apply(plain))).then(() => {
 					this._setDebug("Sending SDP answer");
-					this.signaling.sendSDP(this.peerConnection.localDescription);
+					const local = this.peerConnection.localDescription;
+					const surroundTaken = local.sdp !== plain && local.sdp.indexOf('multiopus') !== -1;
+					this.signaling.sendSDP(surroundTaken && !decodesSurround() ? { type: 'answer', sdp: plain } : local);
 				}).catch((e) => {
 					this._setError("Error setting local description: " + e);
 				});
@@ -353,7 +412,9 @@ export class WebRTCClient {
 	 * detaches and stops it.
 	 * @param {boolean} enabled
 	 * @param {?string} deviceId Capture device, the default one when null.
-	 * @returns {Promise<boolean>} False when getUserMedia is unavailable.
+	 * @returns {Promise<?boolean>} False when getUserMedia is unavailable;
+	 *     null when a disable withdrew the enable while its permission request
+	 *     was pending, the stream it got released at once.
 	 * @throws {Error} When the server withheld the microphone m-line (the
 	 *     microphone is disabled server-side); raised before prompting for
 	 *     permission so the UI never claims an active mic that streams nothing.
@@ -363,20 +424,29 @@ export class WebRTCClient {
 			if (!this._micTransceiver) {
 				throw new Error('Microphone is disabled on this server.');
 			}
-			if (this._micStream) return true;
+			if (this._micStream || this._micPending) return true;
 			if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
 			const audio = { channelCount: 1, sampleRate: 24000, echoCancellation: true, noiseSuppression: true, autoGainControl: true };
 			if (deviceId) audio.deviceId = { exact: deviceId };
-			this._micStream = await navigator.mediaDevices.getUserMedia({
-				audio,
-				video: false
-			});
+			const pending = this._micPending = { withdrawn: false };
+			let stream;
+			try {
+				stream = await navigator.mediaDevices.getUserMedia({ audio, video: false });
+			} finally {
+				this._micPending = null;
+			}
+			if (pending.withdrawn) {
+				stream.getTracks().forEach((t) => t.stop());
+				return null;
+			}
+			this._micStream = stream;
 			const track = this._micStream.getAudioTracks()[0];
 			if (this._micTransceiver && this._micTransceiver.sender && track) {
 				await this._micTransceiver.sender.replaceTrack(track);
 			}
 			return true;
 		}
+		if (this._micPending) this._micPending.withdrawn = true;
 		if (this._micTransceiver && this._micTransceiver.sender) {
 			try { await this._micTransceiver.sender.replaceTrack(null); } catch (e) {}
 		}
@@ -389,7 +459,7 @@ export class WebRTCClient {
 
 	/**
 	 * Enables or disables the webcam: attaches a getUserMedia video track to
-	 * the reserved sendonly transceiver (the browser encodes H.264, VP8, VP9, H.265 or AV1 over
+	 * the reserved sendonly transceiver (the browser encodes H.264, VP8, VP9, H.265, or AV1 over
 	 * RTP and the server's virtual camera decodes it), or detaches and stops
 	 * it. Disabling also deactivates the sender's encodings, because a null or
 	 * ended track alone does not silence every engine (Firefox keeps the
@@ -398,7 +468,9 @@ export class WebRTCClient {
 	 * @param {boolean} enabled
 	 * @param {?string} deviceId Camera, the default one when null.
 	 * @param {{width?: number, height?: number, fps?: number}} hints Capture hints.
-	 * @returns {Promise<boolean>} False when getUserMedia is unavailable.
+	 * @returns {Promise<?boolean>} False when getUserMedia is unavailable;
+	 *     null when a disable withdrew the enable while its permission request
+	 *     was pending, the camera it got released at once.
 	 * @throws {Error} When the server withheld the webcam m-line (the webcam
 	 *     is locked off), raised before prompting for permission; or when the
 	 *     sender refuses the track (its transceiver stopped), the camera
@@ -409,11 +481,21 @@ export class WebRTCClient {
 			if (!this._webcamTransceiver) {
 				throw new Error('Webcam is disabled on this server.');
 			}
-			if (this._webcamStream) return true;
+			if (this._webcamStream || this._webcamPending) return true;
 			if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return false;
 			const video = { width: { ideal: width }, height: { ideal: height }, frameRate: { ideal: fps } };
 			if (deviceId) video.deviceId = { exact: deviceId };
-			const stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+			const pending = this._webcamPending = { withdrawn: false };
+			let stream;
+			try {
+				stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+			} finally {
+				this._webcamPending = null;
+			}
+			if (pending.withdrawn) {
+				stream.getTracks().forEach((t) => t.stop());
+				return null;
+			}
 			const track = stream.getVideoTracks()[0];
 			try {
 				if (track) {
@@ -430,6 +512,7 @@ export class WebRTCClient {
 			await this.setWebcamCodec(codec);
 			return true;
 		}
+		if (this._webcamPending) this._webcamPending.withdrawn = true;
 		if (this._webcamTransceiver && this._webcamTransceiver.sender) {
 			await this._setSenderActive(this._webcamTransceiver.sender, false);
 			try { await this._webcamTransceiver.sender.replaceTrack(null); } catch (e) {}
@@ -445,7 +528,7 @@ export class WebRTCClient {
 	 * Sends the camera as one codec: the `webcam_encoder` name (`h264`, `h265`,
 	 * `vp8`, `vp9`, `av1`) is set on the sender's encoding from the codecs the
 	 * answer negotiated, so the browser leaves the negotiated order for it;
-	 * `auto`, `mjpeg` or a codec the answer lacks returns to that order. The
+	 * `auto`, `mjpeg`, or a codec the answer lacks returns to that order. The
 	 * codec of an encoding is what the engine offers for this, and an engine
 	 * without it keeps the negotiated order, logged once.
 	 * @param {string} codec
@@ -609,16 +692,16 @@ export class WebRTCClient {
 
 	/**
 	 * Whether a message rides the ordered queue: multipart clipboard sequences
-	 * must reassemble in sequence, and `server_settings` snapshots are
-	 * last-wins, so a slow-inflating one must not be overtaken by a newer
-	 * plain one. Everything else (cursor, ping, stats, system actions) routes
+	 * must reassemble in sequence, and `server_settings` and
+	 * `display_settings` snapshots are last-wins, so a slow-inflating one must
+	 * not be overtaken by a newer plain one. Everything else (cursor, ping, stats, system actions) routes
 	 * on arrival so a long clipboard decode cannot delay it.
 	 * @param {Object} msg
 	 * @returns {boolean}
 	 */
 	_requiresOrderedDelivery(msg) {
 		return typeof msg.type === 'string' &&
-			(msg.type.startsWith('clipboard-msg') || msg.type === 'server_settings');
+			(msg.type.startsWith('clipboard-msg') || msg.type === 'server_settings' || msg.type === 'display_settings');
 	}
 
 	/**
@@ -660,6 +743,10 @@ export class WebRTCClient {
 			if (this.onstreamstats !== null) {
 				this.onstreamstats(msg.data);
 			}
+		} else if (msg.type === 'connection') {
+			if (this.onconnection !== null) {
+				this.onconnection(!!(msg.data && msg.data.poor));
+			}
 		} else if (typeof msg.type === 'string' && msg.type.startsWith('clipboard-msg')) {
 			if (typeof this.onclipboardcontent === 'function') {
 				return this.onclipboardcontent(msg);
@@ -696,6 +783,10 @@ export class WebRTCClient {
 			if (this.onserversettings !== null) {
 				this.onserversettings(msg.data);
 			}
+		} else if (msg.type === 'display_settings') {
+			if (this.ondisplaysettings !== null) {
+				this.ondisplaysettings(msg.data);
+			}
 		} else if (msg.type === 'display_config_update') {
 			if (this.ondisplayconfig !== null) {
 				this.ondisplayconfig(msg.data);
@@ -703,6 +794,10 @@ export class WebRTCClient {
 		} else if (msg.type === 'print_document') {
 			if (this.onprintdocument !== null) {
 				this.onprintdocument(msg.data);
+			}
+		} else if (msg.type === 'cc_rate') {
+			if (this.onccrate !== null && msg.data) {
+				this.onccrate(msg.data.kbps);
 			}
 		} else {
 			this._setError("Unhandled message received: " + msg.type);
@@ -782,6 +877,17 @@ export class WebRTCClient {
 			ch.addEventListener('bufferedamountlow', done);
 			if (ch.readyState !== 'open' || ch.bufferedAmount <= threshold) done();
 		});
+	}
+
+	/**
+	 * Outbound queue depth of the channel pointer motion goes out on
+	 * (`sendMotionMessage`), which the motion sender slows down on.
+	 * @returns {number}
+	 */
+	motionBufferedAmount() {
+		const channel = this._motion_channel;
+		if (channel !== null && channel.readyState === 'open') return channel.bufferedAmount;
+		return this.dataChannelBufferedAmount();
 	}
 
 	/**
@@ -967,7 +1073,7 @@ export class WebRTCClient {
 					connectionDetails.video.packetsReceived = videoRTP.packetsReceived;
 					connectionDetails.video.packetsLost = videoRTP.packetsLost;
 
-					var codec = reports.codecs[videoRTP.codecId];
+					const codec = reports.codecs[videoRTP.codecId];
 					if (codec !== undefined) {
 						connectionDetails.video.codecName = codec.mimeType.split("/")[1].toUpperCase();
 					}
@@ -983,7 +1089,7 @@ export class WebRTCClient {
 					if (audioRTP.totalSamplesReceived !== undefined) connectionDetails.audio.totalSamplesReceived = audioRTP.totalSamplesReceived;
 					if (audioRTP.packetsDiscarded !== undefined) connectionDetails.audio.packetsDiscarded = audioRTP.packetsDiscarded;
 
-					var codec = reports.codecs[audioRTP.codecId];
+					const codec = reports.codecs[audioRTP.codecId];
 					if (codec !== undefined) {
 						connectionDetails.audio.codecName = codec.mimeType.split("/")[1].toUpperCase();
 					}

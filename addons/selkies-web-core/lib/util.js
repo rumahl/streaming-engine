@@ -7,8 +7,9 @@
 /**
  * Helpers shared by the streaming cores and both dashboards: a small FIFO
  * queue, the human-readable labels for wire values, the decodability checks
- * that keep a client from asking for a stream it cannot play, and the route
- * prefix and localStorage namespace every caller derives the same way.
+ * that keep a client from asking for a stream it cannot play, the route
+ * prefix and localStorage namespace every caller derives the same way, and
+ * whether the server answers at all before a page reloads into it.
  * @module
  */
 
@@ -68,8 +69,8 @@ export class Queue {
     }
 }
 
-import { H264_ANNEXB_SAMPLE, PROBE_CODEC_STRINGS, PROBE_FULLCOLOR_STRINGS, codecOfEncoder, codecCarriesFullColor } from "./wire-codecs.js";
-export { codecOfEncoder, codecCarriesFullColor };
+import { H264_ANNEXB_SAMPLE, PROBE_CODEC_STRINGS, PROBE_FULLCOLOR_STRINGS, TEN_BIT_SAMPLES, codecOfEncoder, codecCarriesFullColor, codecCarriesTenBit, codecStringFor } from "./wire-codecs.js";
+export { codecOfEncoder, codecCarriesFullColor, codecCarriesTenBit };
 
 /**
  * Human-readable names for the wire values surfaced in UIs (transport modes,
@@ -106,28 +107,30 @@ export const DISPLAY_LABELS = {
 export const displayLabel = (value) => DISPLAY_LABELS[value] ?? value;
 
 /**
- * How long an engine is given to answer a decoder probe. A decoder that stalls
- * instead of answering must not hold the session up: the answer settles one
- * setting, while a session waits on it to start. Measured answers are
- * immediate, the first in a page costing a media stack its warm-up.
+ * How long an engine is given to answer a decoder probe, and a page's first
+ * stream decoder configuration before the core's no-output watchdog counts
+ * the wait. A decoder that stalls instead of answering must not hold
+ * the session up: the answer settles one setting, while a session waits on it
+ * to start. Measured answers are immediate, the first in a page costing a
+ * media stack its warm-up.
  */
-const DECODER_PROBE_TIMEOUT_MS = 10000;
+export const DECODER_PROBE_TIMEOUT_MS = 10000;
 
 /**
  * Whether a `VideoDecoder` here accepts `codec` at `width` x `height`. False
- * without WebCodecs, and when the engine throws on the question.
+ * without WebCodecs, and when the engine throws on the question; null when it
+ * gives no answer within `DECODER_PROBE_TIMEOUT_MS`, which is not a refusal.
  * @param {string} codec A WebCodecs codec string.
  * @param {number} width
  * @param {number} height
- * @returns {Promise<boolean>}
+ * @returns {Promise<?boolean>}
  */
 async function decoderAccepts(codec, width, height) {
     if (typeof VideoDecoder === "undefined") return false;
     // The runtime falls back to a software decoder where the hardware one refuses, so an
     // encoder software can play is still offered: a refused default probe is retried on
-    // software before it counts as unsupported. The timer stands in for the refusal a decoder
-    // without the profile gives, and an engine that never answers is not asked twice: the
-    // session waits on this, and the second question would only double the wait.
+    // software before it counts as unsupported. An engine that never answers is not asked
+    // twice: the session waits on this, and the second question would only double the wait.
     for (const accel of [undefined, "prefer-software"]) {
         try {
             const config = { codec, codedWidth: width, codedHeight: height };
@@ -137,7 +140,7 @@ async function decoderAccepts(codec, width, height) {
                 new Promise((resolve) => setTimeout(resolve, DECODER_PROBE_TIMEOUT_MS)),
             ]);
             if (support && support.supported) return true;
-            if (support === undefined) return false;
+            if (support === undefined) return null;
         } catch (err) {
             // Fall through to the next acceleration preference.
         }
@@ -150,8 +153,9 @@ async function decoderAccepts(codec, width, height) {
  * configuration, once the probe has run; `null` until then. A decoder can
  * accept a configuration and still fail at `decode()`, which the core's
  * fallback ladder answers; this only keeps the settings from offering what the
- * engine refuses outright.
- * @type {Object<string, boolean>|null}
+ * engine refuses outright, so a codec it gave no answer on (`null`) stays
+ * offered, as every codec is before the probe has run.
+ * @type {Object<string, ?boolean>|null}
  */
 let decoderSupport = null;
 
@@ -159,7 +163,7 @@ let decoderSupport = null;
  * Resolves once every codec has been asked of the decoder. Menus built before
  * it resolves offer every codec an engine with WebCodecs might play, and are
  * rebuilt from the answer.
- * @type {Promise<Object<string, boolean>>}
+ * @type {Promise<Object<string, ?boolean>>}
  */
 export const decoderSupportReady = (async () => {
     const answers = {};
@@ -288,7 +292,9 @@ export function canDecodeFullColor(codec = "h264") {
     const string = PROBE_FULLCOLOR_STRINGS[codec];
     if (!string) return Promise.resolve(false);
     if (!fullColorProbes[codec]) {
-        fullColorProbes[codec] = decoderAccepts(string, 320, 240).then((ok) => {
+        // An engine that gives no answer is shown no stream only its 4:4:4 profile decodes.
+        fullColorProbes[codec] = decoderAccepts(string, 320, 240).then((answer) => {
+            const ok = answer === true;
             fullColorAnswers[codec] = ok;
             return ok;
         });
@@ -307,6 +313,75 @@ const fullColorAnswers = {};
  */
 export const fullColorDecoded = (codec) => fullColorAnswers[codec];
 
+/** The decodes `canDecodeTenBit` has asked for, by format. */
+const tenBitProbes = {};
+/** The answers `canDecodeTenBit` has settled, by format. */
+const tenBitAnswers = {};
+
+/**
+ * The name a 10-bit format goes by in `TEN_BIT_SAMPLES`, in `tenBitDecoded`, and
+ * in a WebRTC hello: the codec name for 4:2:0, with `444` after it for 4:4:4.
+ * @param {string} codec The codec name.
+ * @param {boolean} [fullcolor] Whether the format is 4:4:4.
+ * @returns {string}
+ */
+export const tenBitFormat = (codec, fullcolor = false) => `${codec}${fullcolor ? "444" : ""}`;
+
+/**
+ * Whether this engine's `VideoDecoder` shows a picture of `codec` at 10 bits.
+ *
+ * The decoder is handed a real 10-bit key frame (`TEN_BIT_SAMPLES`) and has to
+ * give a frame back, configured as a stream's decoder is, from the key frame's
+ * own codec string: engines accept 10-bit configurations they then fail to
+ * decode (Firefox and VP9 profile 2), and whether a profile decodes turns on
+ * the client's hardware where the engine has no software decoder for the codec
+ * (H.265 everywhere), so nothing short of a decode answers it.
+ * @param {string} codec The codec name.
+ * @param {boolean} [fullcolor] Whether to ask for the codec's 4:4:4 at 10 bits.
+ * @returns {Promise<boolean>} False for a format without a sample, where there
+ *     is no `VideoDecoder`, and where no frame comes back within
+ *     `DECODER_PROBE_TIMEOUT_MS`.
+ */
+export function canDecodeTenBit(codec, fullcolor = false) {
+    const format = tenBitFormat(codec, fullcolor);
+    const sample = TEN_BIT_SAMPLES[format];
+    if (!sample || typeof VideoDecoder === "undefined") return Promise.resolve(false);
+    if (!tenBitProbes[format]) {
+        tenBitProbes[format] = (async () => {
+            const data = Uint8Array.from(atob(sample), (c) => c.charCodeAt(0));
+            let outputs = 0;
+            let decoder = null;
+            try {
+                decoder = new VideoDecoder({ output: (frame) => { outputs++; frame.close(); }, error: () => {} });
+                decoder.configure({
+                    codec: codecStringFor(codec, data, 320, 240, 30, fullcolor, true),
+                    codedWidth: 320, codedHeight: 240, optimizeForLatency: true,
+                });
+                decoder.decode(new EncodedVideoChunk({ type: "key", timestamp: 0, data }));
+                await Promise.race([
+                    decoder.flush(),
+                    new Promise((resolve) => setTimeout(resolve, DECODER_PROBE_TIMEOUT_MS)),
+                ]);
+            } catch (err) {
+                // Refused: the count says so.
+            }
+            try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (err) { /* closed by its error */ }
+            tenBitAnswers[format] = outputs > 0;
+            return outputs > 0;
+        })();
+    }
+    return tenBitProbes[format];
+}
+
+/**
+ * What `canDecodeTenBit` answered, for a decision that cannot wait on the
+ * decode: `undefined` while it is still out or was never asked.
+ * @param {string} codec The codec name.
+ * @param {boolean} [fullcolor] Whether the format is 4:4:4.
+ * @returns {boolean|undefined}
+ */
+export const tenBitDecoded = (codec, fullcolor = false) => tenBitAnswers[tenBitFormat(codec, fullcolor)];
+
 /**
  * Directory this document is served from, without a trailing slash (`''` at
  * the server root). Every request the client builds hangs off it, so a
@@ -318,6 +393,48 @@ export function getRoutePrefix() {
     const pathname = window.location.pathname;
     const dirPath = pathname.substring(0, pathname.lastIndexOf('/') + 1);
     return dirPath.replace(/\/$/, '');
+}
+
+/** How long `serverAnswers` and `entryPageTag` wait for an answer. */
+const SERVER_ANSWER_MS = 5000;
+
+/**
+ * The server's answer to a plain GET on one of its endpoints, or null where it
+ * gave none: nothing answered within SERVER_ANSWER_MS (a path that swallows
+ * packets holds a fetch open for minutes), or the answer says it is not up
+ * (502, 503, 504: a gateway in front of a stopped server, or the server itself
+ * still starting). A page reloaded into a server stopping or starting lands on
+ * an error page with nothing left to retry, so a core reloads only once this
+ * returns an answer.
+ * @param {string} url
+ * @param {Object<string, string>=} headers
+ * @returns {Promise<?Response>}
+ */
+export async function serverAnswers(url, headers) {
+    try {
+        const signal = typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(SERVER_ANSWER_MS) : undefined;
+        const res = await fetch(url, { cache: 'no-store', headers, signal });
+        return [502, 503, 504].includes(res.status) ? null : res;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * The validators (`ETag`, `Last-Modified`) the server answers for the page's
+ * own entry document now: two answers differ when a new build is served.
+ * @param {Object<string, string>} [headers] Credentials the page's API calls carry.
+ * @returns {Promise<?string>} Null when the server does not answer.
+ */
+export async function entryPageTag(headers) {
+    try {
+        const signal = typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(SERVER_ANSWER_MS) : undefined;
+        const res = await fetch(window.location.href, { method: 'HEAD', cache: 'no-store', headers, signal });
+        if (!res.ok) return null;
+        return `${res.headers.get('etag') || ''}|${res.headers.get('last-modified') || ''}`;
+    } catch (e) {
+        return null;
+    }
 }
 
 /**
@@ -348,6 +465,88 @@ export function isMacDesktop() {
     const platform = navigator.platform
         || (navigator.userAgentData && navigator.userAgentData.platform) || '';
     return /^mac/i.test(platform) && (navigator.maxTouchPoints || 0) <= 1;
+}
+
+/**
+ * This browser tab's id, kept in its sessionStorage: a reload of the page keeps
+ * it and another tab has its own, which is how the server tells a page taking
+ * its own display back from another page joining it.
+ * @returns {string|null} Null where the tab has no storage.
+ */
+export function pageTabId() {
+  const key = 'selkies_tab_id';
+  try {
+    let id = window.sessionStorage.getItem(key);
+    if (!id) {
+      id = (window.crypto && window.crypto.randomUUID) ? window.crypto.randomUUID()
+        : `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+      window.sessionStorage.setItem(key, id);
+    }
+    return id;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** How long a remembered start rate stands: a path's capacity a day later is anyone's guess. */
+const CC_START_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** The localStorage key of a display's remembered start rate, per origin as every key is. */
+function ccStartKey(displayId) {
+  return `${getStorageAppName()}_cc_start${displayId && displayId !== 'primary' ? `_${displayId}` : ''}`;
+}
+
+/**
+ * Keep the rate congestion control held a display at, as its server reports it, so a
+ * restarted server starts the page's next stream there rather than at the configured rate.
+ * @param {string} displayId
+ * @param {number} kbps
+ */
+export function rememberCcStart(displayId, kbps) {
+  if (!Number.isFinite(kbps) || kbps <= 0) return;
+  try {
+    window.localStorage.setItem(ccStartKey(displayId), JSON.stringify({ kbps: Math.round(kbps), at: Date.now() }));
+  } catch (e) { /* no storage: every start is the configured rate */ }
+}
+
+/**
+ * The display's remembered start rate, or null: none kept, a day old, or unreadable.
+ * @param {string} displayId
+ * @returns {number|null}
+ */
+export function recalledCcStart(displayId) {
+  try {
+    const kept = JSON.parse(window.localStorage.getItem(ccStartKey(displayId)) || 'null');
+    if (kept && Number.isFinite(kept.kbps) && kept.kbps > 0 && Date.now() - kept.at < CC_START_TTL_MS) {
+      return kept.kbps;
+    }
+  } catch (e) { /* unreadable reads as none */ }
+  return null;
+}
+
+/**
+ * Drop the display's remembered start rate, once the user sets a bitrate of their own.
+ * @param {string} displayId
+ */
+export function forgetCcStart(displayId) {
+  try {
+    window.localStorage.removeItem(ccStartKey(displayId));
+  } catch (e) { /* nothing kept */ }
+}
+
+/**
+ * WebKit's Linux ports (WPE, WebKitGTK), which draw a canvas through Skia's GPU
+ * context, as against Safari, which draws through CoreGraphics. No capability
+ * tells the two apart and WebKit on Linux can carry Safari's macOS user agent,
+ * so the engine is read from the user agent and the OS from the platform, both
+ * of which a worker has too.
+ * @param {string} userAgent `navigator.userAgent`.
+ * @param {string} platform `navigator.platform`.
+ * @returns {boolean}
+ */
+export function isSkiaWebKit(userAgent, platform) {
+    return /AppleWebKit\//.test(userAgent || '') && !/Chrom(e|ium)\/|Edg\/|OPR\//.test(userAgent || '')
+        && /^Linux/.test(platform || '');
 }
 
 /**

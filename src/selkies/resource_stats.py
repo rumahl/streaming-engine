@@ -12,8 +12,15 @@ behind nvitop/nvtop; exact PCI identity, no subprocess per poll) with an
 its load through devfreq. Every other card is read through DRM: amdgpu counts
 utilization and VRAM device-wide in sysfs, and the rest have the engine times in
 their clients' fdinfo summed, the kernel's vendor-neutral interface that i915,
-xe, Mali, Adreno and VideoCore all write. A card whose driver writes neither --
+xe, Mali, Adreno, and VideoCore all write. A card whose driver writes neither --
 Apple's, on Asahi -- is listed with no utilization rather than a zero.
+
+A card's utilization is its busiest engine's, the video encoder and decoder
+included, on every vendor: an encoder-bound session is a GPU-bound one, and the
+figure is the one an operator reads to find the bottleneck. fdinfo already
+reports every engine; NVML and nvidia-smi give NVENC and NVDEC apart from the
+graphics engine, and amdgpu's `gpu_busy_percent` counts graphics alone, so their
+codec engines are folded in.
 
 ``get_gpus(dri_node=...)`` keys the readings to the render node the pipeline
 captures/encodes on (PCI match when the source knows its address, else a
@@ -30,7 +37,7 @@ import os
 import shutil
 import subprocess
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 import psutil
 
@@ -45,9 +52,11 @@ logger = logging.getLogger("stats")
 # appear after startup, so a failure is never retried or re-logged.
 _nvml_ready: Optional[bool] = None
 
-# utilization.gpu is a percentage; memory.* are MiB (nounits strips the suffix);
-# pci.bus_id keys the stats to the render node the pipeline encodes on.
-_NVIDIA_SMI_QUERY: str = "utilization.gpu,memory.total,memory.used,pci.bus_id"
+# utilization.* are percentages; memory.* are MiB (nounits strips the suffix);
+# pci.bus_id keys the stats to the render node the pipeline encodes on. The codec
+# engines come last, and a driver that refuses them is asked again without.
+_NVIDIA_SMI_BASE_QUERY: str = "utilization.gpu,memory.total,memory.used,pci.bus_id"
+_NVIDIA_SMI_QUERY: str = _NVIDIA_SMI_BASE_QUERY + ",utilization.encoder,utilization.decoder"
 
 # Overridable so tests can point at fabricated trees.
 _SYSFS_DRM_ROOT: str = "/sys/class/drm"
@@ -140,6 +149,14 @@ def _vendor_of_node(dri_node: Optional[str], root: Optional[str] = None) -> Opti
     return _DRIVER_VENDORS.get(driver)
 
 
+def _nvml_codec_load(query: Callable[[Any], Any], handle: Any) -> float:
+    """An NVML codec engine's utilization in percent, 0 where the device has none."""
+    try:
+        return float(query(handle)[0])
+    except Exception:
+        return 0.0
+
+
 def _nvml_gpus() -> List[GPUStat]:
     """NVIDIA via NVML: no subprocess, exact per-device PCI identity."""
     global _nvml_ready
@@ -157,7 +174,9 @@ def _nvml_gpus() -> List[GPUStat]:
     try:
         for idx in range(pynvml.nvmlDeviceGetCount()):
             handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+            util = max(pynvml.nvmlDeviceGetUtilizationRates(handle).gpu,
+                       _nvml_codec_load(pynvml.nvmlDeviceGetEncoderUtilization, handle),
+                       _nvml_codec_load(pynvml.nvmlDeviceGetDecoderUtilization, handle))
             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
             bus_id = pynvml.nvmlDeviceGetPciInfo(handle).busId
             if isinstance(bus_id, bytes):
@@ -183,22 +202,25 @@ def _nvidia_gpus() -> List[GPUStat]:
     smi = shutil.which("nvidia-smi")
     if not smi:
         return []
-    try:
-        result = subprocess.run(
-            [
-                smi,
-                f"--query-gpu={_NVIDIA_SMI_QUERY}",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.debug("nvidia-smi query failed: %s", exc)
-        return []
-    if result.returncode != 0:
+    for query in (_NVIDIA_SMI_QUERY, _NVIDIA_SMI_BASE_QUERY):
+        try:
+            result = subprocess.run(
+                [
+                    smi,
+                    f"--query-gpu={query}",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("nvidia-smi query failed: %s", exc)
+            return []
+        if result.returncode == 0:
+            break
+    else:
         return []
 
     gpus = []
@@ -212,6 +234,11 @@ def _nvidia_gpus() -> List[GPUStat]:
             mem_used = float(parts[2])
         except ValueError:
             continue
+        for codec in parts[4:6]:
+            try:
+                util = max(util, float(codec))
+            except ValueError:
+                pass
         pci = _normalize_pci(parts[3]) if len(parts) > 3 else None
         gpus.append(GPUStat(idx, util / 100.0, mem_total, mem_used, pci, "nvidia"))
     return gpus
@@ -270,10 +297,16 @@ def _drm_client_paths(root: Optional[str] = None) -> Dict[str, str]:
 def _drm_engine_busy(clients: Dict[str, str]) -> Dict[Tuple[str, str], float]:
     """Nanoseconds each device's engines have run, summed over its clients.
 
+    A client is a `drm-client-id` on a device, not a descriptor: every
+    duplicate of a descriptor, in the same process or one it was passed to,
+    reports the same client's totals, so each id is counted once. A descriptor
+    whose driver writes no id is a client of its own.
+
     Clients that have exited are dropped from `clients` as they are found, so
     the list never outgrows what is open.
     """
     busy: Dict[Tuple[str, str], float] = {}
+    counted: Set[Tuple[str, str]] = set()
     for path, device in list(clients.items()):
         try:
             with open(path, "r") as f:
@@ -283,8 +316,12 @@ def _drm_engine_busy(clients: Dict[str, str]) -> Dict[Tuple[str, str], float]:
             continue
         engines: Dict[str, float] = {}
         capacity: Dict[str, float] = {}
+        client = path
         for line in lines:
             key, _, value = line.partition(":")
+            if key == "drm-client-id":
+                client = value.strip()
+                continue
             if key.startswith("drm-engine-capacity-"):
                 name, into = key.removeprefix("drm-engine-capacity-"), capacity
             elif key.startswith("drm-engine-"):
@@ -295,6 +332,9 @@ def _drm_engine_busy(clients: Dict[str, str]) -> Dict[Tuple[str, str], float]:
                 into[name] = float(value.split()[0])
             except (IndexError, ValueError):
                 continue
+        if (device, client) in counted:
+            continue
+        counted.add((device, client))
         for engine, ns in engines.items():
             slot = (device, engine)
             busy[slot] = busy.get(slot, 0.0) + ns / max(1.0, capacity.get(engine, 1.0))
@@ -328,8 +368,9 @@ def _drm_client_load(root: Optional[str] = None) -> Dict[str, float]:
 def _drm_gpus(root: Optional[str] = None) -> List[GPUStat]:
     """Every DRM card, read the best way its driver allows.
 
-    amdgpu counts utilization and VRAM device-wide in sysfs; the rest are read
-    from their clients' fdinfo, which is only looked for once a card is found
+    amdgpu counts utilization and VRAM device-wide in sysfs, graphics only, so its
+    clients' fdinfo is folded in for the codec engines; the rest are read from
+    their clients' fdinfo alone, which is only looked for once a card is found
     that needs it. Mali writes its engine times only while profiling is on, so
     a card left at the driver's default reads as one nothing counts. Memory is reported only where the card has its own and the
     driver counts it, so one drawing on system memory is listed without rather
@@ -352,9 +393,10 @@ def _drm_gpus(root: Optional[str] = None) -> List[GPUStat]:
         device = os.path.realpath(node)
         vendor = _DRIVER_VENDORS.get(driver)
         busy = _read_sysfs_number(os.path.join(node, "gpu_busy_percent"))
-        if busy is None and load is None and driver not in _DRM_UNCOUNTED:
+        if load is None and driver not in _DRM_UNCOUNTED and (busy is None or vendor == "amd"):
             load = _drm_client_load(root)
-        util = busy / 100.0 if busy is not None else (load or {}).get(device)
+        counted = (load or {}).get(device)
+        util = max(busy / 100.0, counted or 0.0) if busy is not None else counted
         if vendor is None and util is None:
             continue
         total = _read_sysfs_number(os.path.join(node, "mem_info_vram_total")) or 0.0
@@ -386,6 +428,21 @@ def _tegra_gpus(globs: Optional[Tuple[str, ...]] = None) -> List[GPUStat]:
             return [GPUStat(idx, min(1.0, load / 1000.0), 0.0, 0.0, None, "nvidia")
                     for idx, load in enumerate(loads)]
     return []
+
+
+def gpu_node(gpu_id: Optional[int], encode_dri: str = "") -> str:
+    """The render node the gauge reads: `--encode-dri`'s where it names one, else the
+    one `gpu_id` points the encoder at, `renderD{128 + n}`, where it exists. Empty
+    otherwise, which leaves the gauge to `gpu_id` as a position among the GPUs found:
+    a host given one card of several is handed its node under the card's own number,
+    which no list of one reaches as a position."""
+    if encode_dri:
+        return encode_dri
+    if gpu_id is not None and gpu_id >= 0:
+        node = f"/dev/dri/renderD{128 + gpu_id}"
+        if os.path.exists(node):
+            return node
+    return ""
 
 
 def get_gpus(dri_node: Optional[str] = None) -> List[GPUStat]:
@@ -565,6 +622,11 @@ class SystemUsage:
         return round(percent, 1), mem[0], mem[1]
 
 
+#: How soon after a page opens its stats its first figures follow, in seconds:
+#: long enough for the CPU and the encode to be differenced over something.
+RUSH_S = 0.5
+
+
 class ResourceMonitor:
     """Samples the session's CPU and memory, and the GPU its pipeline encodes
     on, once a period off the event loop, and keeps the latest sample in the
@@ -578,8 +640,9 @@ class ResourceMonitor:
     period is sampled only for someone: `watched`, when set, says whether a
     page has its stats open, and without one and without `metrics` the period
     passes unsampled and `system` and `gpu` read None rather than go stale.
-    The GPU is `dri_node`'s card when that narrows the list to one, else the
-    `gpu_id`th of the unfiltered list.
+    A page that opens its stats is not kept waiting for the period to come
+    round (`rush`). The GPU is `dri_node`'s card when that narrows the list to
+    one, else the `gpu_id`th of the unfiltered list.
     """
 
     def __init__(self, period: float = 1.0, gpu_id: int = 0, dri_node: str = "",
@@ -596,6 +659,9 @@ class ResourceMonitor:
         self._probe_gpu = True
         self._gpu_seen = False
         self._stop: Optional[asyncio.Event] = None
+        self._wake: Optional[asyncio.Event] = None
+        self._rushed: Optional[asyncio.TimerHandle] = None
+        self._sampling: Optional[asyncio.Lock] = None
         self._task: Optional[asyncio.Task] = None
 
     def _gpu_sample(self) -> Optional[Dict[str, Any]]:
@@ -644,8 +710,12 @@ class ResourceMonitor:
     async def _loop(self) -> None:
         try:
             while self._stop is not None and not self._stop.is_set():
+                if self._rushed is not None:
+                    self._rushed.cancel()
+                    self._rushed = None
                 if self.metrics is not None or self.watched is None or self.watched():
-                    self.system, self.gpu = await asyncio.to_thread(self._sample)
+                    async with self._sampling:
+                        self.system, self.gpu = await asyncio.to_thread(self._sample)
                 else:
                     self.system = self.gpu = None
                 if self.metrics is not None and self.gpu is not None:
@@ -653,9 +723,11 @@ class ResourceMonitor:
                 if self.on_tick is not None:
                     await self.on_tick(time.time())
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=self.period)
+                    await asyncio.wait_for(self._wake.wait(), timeout=self.period)
                 except asyncio.TimeoutError:
-                    pass
+                    if self._rushed is not None:
+                        await self._wake.wait()
+                self._wake.clear()
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -666,12 +738,34 @@ class ResourceMonitor:
         if self._task is not None and not self._task.done():
             return
         self._stop = asyncio.Event()
+        self._wake = asyncio.Event()
+        self._sampling = asyncio.Lock()
         self._task = asyncio.create_task(self._loop())
+
+    async def rush(self) -> None:
+        """Brings the next period forward for a page that just opened its stats.
+
+        The CPU is differenced from now, so the first figures describe the
+        moment rather than the spell nobody watched, and they follow `RUSH_S`
+        later instead of up to a period. A period that would end sooner waits
+        for them, since a sample right behind the baseline is differenced over
+        next to nothing; a sample already under way is the baseline itself, and
+        a later rush restarts the wait.
+        """
+        if self._task is None or self._task.done() or self._wake is None:
+            return
+        if self._rushed is not None:
+            self._rushed.cancel()
+        self._rushed = asyncio.get_running_loop().call_later(RUSH_S, self._wake.set)
+        if not self._sampling.locked():
+            async with self._sampling:
+                await asyncio.to_thread(self._usage.sample)
 
     async def stop(self) -> None:
         """Ends the loop at once and waits for it."""
         if self._stop is not None:
             self._stop.set()
+            self._wake.set()
         if self._task is not None:
             await self._task
             self._task = None

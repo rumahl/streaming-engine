@@ -13,7 +13,18 @@ climbed back.
 
 A control interval's worth of feedback is the measurement, and an interval
 that carried none steers nothing. A link that really is losing packets must
-still be backed off exactly as before.
+still be backed off exactly as before. And all of it is read: libwebrtc pads
+a feedback that does not end on a 32-bit boundary with the RTCP padding bit,
+three in four of them, and such a feedback, with the compound packet around
+it, parses whole.
+
+The same interval measures the queue standing on the path from one-way delay:
+the feedback's reference time puts every arrival on the receiver's one clock,
+so a queue that grows a little with every frame, with nothing lost, reads as a
+queue, and so does one standing through feedback that comes only four times a
+second, while delay that only jitters, even as widely as a Wi-Fi hop spreads it
+and over a still screen's trickle, or one key frame's burst, does not, and the
+24-bit reference time wrapping changes nothing.
 """
 import os
 import struct
@@ -21,6 +32,7 @@ from types import SimpleNamespace
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"))
+from selkies.webrtc import rtp  # noqa: E402
 from selkies.webrtc.rtcdtlstransport import RTCDtlsTransport  # noqa: E402
 from selkies.webrtc.rtp import pack_twcc_fci  # noqa: E402
 
@@ -41,16 +53,17 @@ def feedback(base_seq: int, received: int, lost: int, delta_us: int = 1000) -> b
     return fci + bytes([delta_us // 250]) * received
 
 
+def _refused(rtp_mod, data: bytes) -> bool:
+    try:
+        rtp_mod.RtcpPacket.parse(data)
+    except ValueError:
+        return True
+    return False
+
+
 def transport() -> RTCDtlsTransport:
     """A transport with only the send-side congestion state a feedback needs."""
-    tr = object.__new__(RTCDtlsTransport)
-    tr._twcc_seq = 0
-    tr._twcc_history = {}
-    tr._twcc_pruned_at = 0.0
-    tr.twcc_estimate = None
-    tr._pacer = None
-    tr._twcc_window = RTCDtlsTransport._twcc_window_zero()
-    return tr
+    return RTCDtlsTransport(SimpleNamespace(), [SimpleNamespace()])
 
 
 def deliver(tr: RTCDtlsTransport, base_seq: int, received: int, lost: int) -> None:
@@ -60,8 +73,31 @@ def deliver(tr: RTCDtlsTransport, base_seq: int, received: int, lost: int) -> No
     tr._twcc_process_feedback(feedback(base_seq, received, lost))
 
 
+def padded_feedback(fci: bytes) -> bytes:
+    """A transport-cc feedback as libwebrtc sends it: the FCI as long as it
+    runs, padded to 32 bits with the RTCP padding bit and a count byte."""
+    body = struct.pack("!LL", 1, 0) + fci
+    pad = -len(body) % 4
+    body += bytes(pad - 1) + bytes([pad]) if pad else b""
+    return struct.pack("!BBH", (2 << 6) | (1 << 5 if pad else 0) | rtp.RTCP_RTPFB_TWCC, rtp.RTCP_RTPFB,
+                       len(body) // 4) + body
+
+
 def main() -> int:
     res = H.Results("twcc-window")
+
+    fci = struct.pack("!HHL", 100, 3, 0) + struct.pack("!H", (1 << 13) | 3) + bytes([4, 4, 4])
+    try:
+        packets = rtp.RtcpPacket.parse(bytes(rtp.RtcpRrPacket(ssrc=1)) + padded_feedback(fci))
+    except ValueError as exc:
+        packets = str(exc)
+    res.check("a feedback padded with the RTCP padding bit parses, and so does its compound",
+              not isinstance(packets, str)
+              and [type(p).__name__ for p in packets] == ["RtcpRrPacket", "RtcpRtpfbPacket"]
+              and packets[1].fmt == rtp.RTCP_RTPFB_TWCC and packets[1].fci == fci, packets)
+    res.check("while a NACK whose entries stop short of a whole word is still refused",
+              _refused(rtp, struct.pack("!BBH", (2 << 6) | (1 << 5) | rtp.RTCP_RTPFB_NACK, rtp.RTCP_RTPFB, 3)
+                       + bytes(10) + bytes([0, 2])), "")
 
     tr = transport()
     deliver(tr, 100, 17, 5)
@@ -112,7 +148,8 @@ def main() -> int:
     def arrivals(tr: RTCDtlsTransport, times: list, fed: list) -> dict:
         for i in range(len(times)):
             tr._twcc_history[i] = (PACKET_BYTES, 0.0)
-        tr._pacer = SimpleNamespace(set_goodput_bps=fed.append)
+        tr._pacer = SimpleNamespace(set_goodput_bps=fed.append, set_link_bps=lambda bps: None,
+                                    burst_probe_bytes=12_500)
         tr._twcc_process_feedback(pack_twcc_fci(0, times, 0))
         return tr.twcc_estimate
 
@@ -142,6 +179,13 @@ def main() -> int:
     tr._twcc_pruned_at = 0.0
     tr._twcc_next(PACKET_BYTES)
     res.check("and is let go once older than the feedback could be", len(tr._twcc_history) == 1, len(tr._twcc_history))
+    tr = transport()
+    for _ in range(20):
+        tr._twcc_next(PACKET_BYTES)
+    tr._twcc_window["opened"] -= 0.5
+    tr._twcc_process_feedback(feedback(0, 20, 0))
+    sent = tr.take_twcc_window()["sent_bps"]
+    res.check("a window reports the rate sent over it", 0.95 * 384_000 <= sent <= 384_000, sent)
     estimate = arrivals(transport(), [100.0 + i for i in range(10)] + [900.0 + i for i in range(10)], [])
     res.check("an outage inside a window is silence, not a rate: the stretches on either side measure",
               round(estimate["recv_span_s"], 6) == 0.018 and estimate["goodput_bps"] == 9_600_000, estimate)
@@ -199,9 +243,96 @@ def main() -> int:
     tr._twcc_process_feedback(pack_twcc_fci(0, [100.0 + i if i != 15 else None for i in range(20)], 0))
     tr._twcc_process_feedback(pack_twcc_fci(15, [121.0] + [116.0 + i for i in range(14)], 1))
     res.check("a window moved back over a late packet measures only the packets reported for the first time",
-              round(tr.twcc_estimate["recv_span_s"], 6) == 0.009 and tr.twcc_estimate["goodput_bps"] == 9_600_000
-              and tr.twcc_estimate["bytes_acked"] == 10 * PACKET_BYTES and tr.twcc_estimate["lost"] == 0
+              round(tr.twcc_estimate["recv_span_s"], 6) == 0.009 and tr.twcc_estimate["goodput_bps"] == 10_666_666
+              and tr.twcc_estimate["bytes_acked"] == 11 * PACKET_BYTES and tr.twcc_estimate["lost"] == 0
               and len(tr._twcc_history) == 0, tr.twcc_estimate)
+
+    # One-way delay: a frame of 10 packets every 16.7 ms, sent at `t`, arriving
+    # `delay(t)` later on a receiver clock 5000 s ahead of the sender's, fed back
+    # every 50 ms and drained every second.
+    def run_delay(delay, seconds: float, tr=None, start: float = 0.0, offset_ms: float = 5_000_000.0) -> list:
+        tr = tr or transport()
+        seq, queues, fb, t = 0, [], [], start
+        depths.clear()
+        rising.clear()
+        while t < start + seconds - 1e-9:
+            for i in range(10):
+                tr._twcc_history[seq & 0xFFFF] = (PACKET_BYTES, t + i * 0.0005)
+                fb.append((seq, offset_ms + (t + i * 0.0005 + delay(t)) * 1000.0))
+                seq += 1
+            t = round(t + 1 / 60, 6)
+            if len(fb) >= 30:
+                tr._twcc_process_feedback(pack_twcc_fci(fb[0][0] & 0xFFFF, [a for _, a in fb], 0))
+                fb = []
+            if int(t * 60) % 60 == 0:
+                window = tr.take_twcc_window()
+                if window is not None:
+                    queues.append(window["queue_ms"])
+                    depths.append(window["queue_depth_ms"])
+                    rising.append(window["queue_rising_ms"])
+        return queues
+
+    depths: list = []
+    rising: list = []
+
+    queues = run_delay(lambda t: 0.020 + 0.002 * (t - 3.0) * 60 if t > 3 else 0.020, 6.0)
+    res.check("a queue growing 2 ms a frame with nothing lost reads as one once it stood a whole interval",
+              queues[2] < 25 and queues[4] > 100, [round(q or 0, 1) for q in queues])
+    res.check("and its depth is the newest arrival's, which the growing queue has grown into",
+              round(depths[4]) > round(queues[4]) + 100, [round(d or 0, 1) for d in depths])
+    res.check("while it builds, before it stands a whole interval, it reads as rising",
+              rising[2] is None and rising[3] is not None and rising[3] > 25, [r and round(r, 1) for r in rising])
+    import random
+    rng = random.Random(7)
+    queues = run_delay(lambda t: 0.020 + rng.uniform(0.0, 0.015), 10.0)
+    res.check("delay that only jitters never reads as a standing queue, or a rising one",
+              max(queues) < 25 and max((r or 0.0) for r in rising) < 25, ([round(q, 1) for q in queues], rising))
+    epoch = {"until": -1.0, "extra": 0.0}
+
+    def wifi(t: float) -> float:
+        """20 ms, plus up to 40 ms redrawn at exponential epochs of 20 ms on average."""
+        if t >= epoch["until"]:
+            epoch["extra"] = rng.uniform(0.0, 0.040)
+            epoch["until"] = t + rng.expovariate(1 / 0.020)
+        return 0.020 + epoch["extra"]
+
+    queues = run_delay(wifi, 300.0)
+    res.check("delay a Wi-Fi hop spreads over 40 ms never reads as a standing queue, or a rising one",
+              max(queues) < 25 and max((r or 0.0) for r in rising) < 25,
+              ([round(q, 1) for q in queues if q >= 25], [round(r, 1) for r in rising if r]))
+    queues = run_delay(lambda t: 0.020 + (0.120 if 4.0 <= t < 4.05 else 0.0), 8.0)
+    res.check("one key frame's burst does not either", max(queues) < 25 and not any(rising),
+              ([round(q, 1) for q in queues], rising))
+
+    def trickle(tr, start: float, seconds: float, per_second: int, delay) -> list:
+        """`per_second` lone packets a second, each fed back on its own, drained every second."""
+        seq, windows = 20000, []
+        for second in range(int(start), int(start + seconds)):
+            for i in range(per_second):
+                t = second + i / per_second
+                tr._twcc_history[seq] = (PACKET_BYTES, t)
+                tr._twcc_process_feedback(pack_twcc_fci(seq, [5_000_000.0 + (t + delay(t)) * 1000.0], 0))
+                seq = (seq + 1) & 0xFFFF
+            windows.append(tr.take_twcc_window())
+        return windows
+
+    tr = transport()
+    run_delay(lambda t: 0.020, 3.0, tr=tr)
+    epoch["until"] = -1.0
+    thin = trickle(tr, 3.0, 600.0, 2, wifi)
+    res.check("nor does a still screen's trickle over it, two lone packets a second, which reads no queue",
+              all(w["queue_ms"] is None and w["queue_rising_ms"] is None for w in thin),
+              [w["queue_ms"] for w in thin if w["queue_ms"] is not None][:10])
+    tr = transport()
+    run_delay(lambda t: 0.020, 3.0, tr=tr)
+    queues = [w["queue_ms"] for w in trickle(tr, 3.0, 4.0, 4, lambda t: 0.020 if t < 4.0 else 0.080)]
+    res.check("while a queue standing through four feedback packets a second reads as one",
+              queues[0] < 25 and queues[2] > 50, [round(q, 1) for q in queues])
+    tr = transport()
+    run_delay(lambda t: 0.020, 3.0, tr=tr, offset_ms=(0xFFFFFF - 20) * 64.0)
+    queues = run_delay(lambda t: 0.020, 3.0, tr=tr, start=3.0, offset_ms=(0xFFFFFF - 20) * 64.0)
+    res.check("the reference time wrapping at 24 bits moves nothing",
+              tr._twcc_reference > 0xFFFFFF and max(abs(q) for q in queues) < 1, (tr._twcc_reference, queues))
 
     return 0 if res.summary() else 1
 

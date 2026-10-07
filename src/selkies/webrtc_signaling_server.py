@@ -16,10 +16,13 @@ Wire protocol (text frames, space-separated): a peer opens with
 `HELLO <server|client> [<json-metadata>]` (`client_type`, `client_slot`,
 `client_strict_viewer`, `client_token`, `server_token`, `display_id`,
 `display_position`, `fullcolor_codecs`: the codec names the client decodes at
-4:4:4) and is answered `HELLO`. `SESSION <peer-id|server>` pairs
+4:4:4, `tenbit_codecs`: the formats it decodes at 10 bits, a codec name for 4:2:0
+and the name with `444` after it for 4:4:4, `client_tab_id`, `cc_start_kbps`: the rate congestion control last held
+the page's display at, `page_size`: the `[width, height]` its first resize will ask for) and is answered `HELLO`.
+A server that does not know a key ignores it. `SESSION <peer-id|server>` pairs
 the caller with the callee: the caller gets `SESSION_OK <callee-id>`, the callee
 `SESSION_START <caller-id> <client_type> <display_id> <display_position>
-[<client_token>] [fullcolor=<codec,...>]`, and a disconnect sends the partner `SESSION_END <peer-id>
+[<client_token>] [fullcolor=<codec,...>] [tenbit=<format,...>]`, and a disconnect sends the partner `SESSION_END <peer-id>
 <client_type>`. In a session every message is addressed `<peer-id> <message>`
 and relayed as `<sender-id> <message>`, only between session partners. `ROOM
 <room-id>` joins or creates a room (`ROOM_OK <member-ids>`, members get
@@ -57,6 +60,18 @@ from .stream_server import note_pong
 
 logger = logging.getLogger("signaling")
 
+# The largest side a hello's `page_size` may name; the page caps its requests at 4080.
+MAX_PAGE_SIZE = 8192
+
+
+def hello_page_size(value: Any) -> Optional[Tuple[int, int]]:
+    """A hello's `page_size` as (width, height), or None for anything but two
+    whole numbers from 1 to `MAX_PAGE_SIZE`."""
+    if (isinstance(value, list) and len(value) == 2
+            and all(type(v) is int and 0 < v <= MAX_PAGE_SIZE for v in value)):
+        return value[0], value[1]
+    return None
+
 
 @dataclass
 class Peer:
@@ -80,6 +95,14 @@ class Peer:
         display_position: Where a secondary display sits relative to the
             primary ("right"/"left"/"up"/"down"), carried to the server side
             so it lays the framebuffer out like websockets mode.
+        tab_id: The browser tab the page runs in, which tells a page taking
+            its own controller back from another page's controller joining
+            beside it; None for a page that names none.
+        cc_start_kbps: The rate congestion control last held this page's
+            display at, as the page kept it (`RateHold`); None for none.
+        page_size: The width and height the page's first resize will ask
+            for, which a primary's capture can start at; None for a page that
+            names none, as one before it did not.
     """
 
     uid: str
@@ -94,6 +117,10 @@ class Peer:
     display_id: str = "primary"
     display_position: str = "right"
     fullcolor_codecs: Optional[List[str]] = None
+    tenbit_codecs: Optional[List[str]] = None
+    tab_id: Optional[str] = None
+    cc_start_kbps: Any = None
+    page_size: Optional[Tuple[int, int]] = None
 
 
 class WebRTCPeerManagement:
@@ -108,7 +135,7 @@ class WebRTCPeerManagement:
             peers come and go; the server's own signaling peer does not count.
         rtc_config: Config served from `/api/turn`. Primarily the config the
             server itself resolved via `get_rtc_configuration()` (REST,
-            Cloudflare, JSON file, legacy, HMAC or built-in default), passed
+            Cloudflare, JSON file, legacy, HMAC, or built-in default), passed
             as `options.rtc_config` and kept fresh by the RTC monitors through
             `set_rtc_config`, so the client negotiates with the same ICE
             servers as the server; the local `rtc_config_file` is read only
@@ -330,8 +357,12 @@ class WebRTCPeerManagement:
 
         A server peer leaving closes every client connection, since the server
         owns the media graph they all stream from; a client peer leaving
-        closes only its own socket. Closes are collected under the lock and
-        awaited after it, bounded per socket and best-effort.
+        closes only its own socket. The server peer leaves when the process
+        stops or restarts or the transport switches, none of them a verdict on
+        the client, so its clients are closed as going away (1001), which
+        they reconnect from, and never with the fatal 4000 the handshake's
+        refusals carry. Closes are collected under the lock and awaited after
+        it, bounded per socket and best-effort.
 
         Args:
             uid: Peer ID to remove.
@@ -355,8 +386,8 @@ class WebRTCPeerManagement:
                         if p.peer_type == "client":
                             deferred_closes.append(
                                 lambda cws=p.ws: cws.close(
-                                    code=4000,
-                                    message=b"Server disconnected, closing connection.",
+                                    code=1001,
+                                    message=b"Server going away.",
                                 )
                             )
                 else:
@@ -376,6 +407,18 @@ class WebRTCPeerManagement:
                 await asyncio.wait_for(make_coro(), timeout=5)
             except Exception as exc:
                 logger.debug("Deferred peer close failed/timed out: {}".format(exc))
+
+    async def close_clients(self) -> None:
+        """Close every client socket still registered, as going away (1001),
+        for a service that is shutting down: its server peer may already be
+        gone, and an open socket keeps the listener's shutdown waiting on it."""
+        async with self.lock:
+            sockets = [p.ws for p in self.peers.values()
+                       if p.peer_type == "client" and not p.ws.closed]
+        await asyncio.gather(
+            *(asyncio.wait_for(ws.close(code=1001, message=b"Server going away."), timeout=2)
+              for ws in sockets),
+            return_exceptions=True)
 
     async def peer_connection_handler(
         self,
@@ -543,6 +586,8 @@ class WebRTCPeerManagement:
                         session_start += " " + peer.client_token
                     if peer.fullcolor_codecs is not None:
                         session_start += " fullcolor=" + ",".join(peer.fullcolor_codecs)
+                    if peer.tenbit_codecs is not None:
+                        session_start += " tenbit=" + ",".join(peer.tenbit_codecs)
                     await wsc.send_str(session_start)
                     peer.peer_status = peer_status = "session"
                     callee_peer.peer_status = "session"
@@ -593,6 +638,15 @@ class WebRTCPeerManagement:
 
     _EVICTION_STORM_WINDOW_S: float = 5.0
     _EVICTION_STORM_LIMIT: int = 3
+
+    def _beside(self, peer: Any, client_type: Optional[str], tab_id: Optional[str]) -> bool:
+        """Whether a controller joining with `tab_id` stays beside `peer`, a
+        controller of the same display, rather than superseding it: with
+        sharing on, a page of another tab. A page that names no tab, or the
+        peer's own tab reconnecting, supersedes it as before."""
+        return (self.enable_sharing and client_type == "controller"
+                and getattr(peer, "client_type", None) == "controller"
+                and bool(tab_id) and bool(getattr(peer, "tab_id", None)) and peer.tab_id != tab_id)
 
     def _eviction_storm(self, key: Any) -> bool:
         """Return True when the identity ``key`` (slot/controller) has been
@@ -667,9 +721,10 @@ class WebRTCPeerManagement:
         itself, so dead holders are reaped and a live one is closed. The
         identities are the display's sole client in non-sharing mode, a
         player slot in sharing mode (`-1` is the unassigned sentinel, exempt
-        from uniqueness), and a display's controller — each scoped per
-        display so display2 never supersedes the primary — unless the
-        takeover-storm breaker (`_eviction_storm`) rejects the claimant. A
+        from uniqueness) or, in secure mode, the page's token, since its slot
+        claim there is only its URL's, and a display's controller — each
+        scoped per display so display2 never supersedes the primary — unless
+        the takeover-storm breaker (`_eviction_storm`) rejects the claimant. A
         viewer first reaps a dead, unreaped controller and treats it as
         absent rather than pairing with a stale peer; a viewer of the primary
         display needs no controller, since the desktop exists regardless and
@@ -710,11 +765,15 @@ class WebRTCPeerManagement:
         client_type = None
         client_slot = None
         client_strict_viewer = None
+        client_tab_id = None
+        cc_start_kbps = None
         client_token = None
         server_token = None
         display_id = "primary"
         display_position = "right"
         fullcolor_codecs = None
+        tenbit_codecs = None
+        page_size = None
         dead_peer_notifications: List[Callable[[], Awaitable[Any]]] = []
 
         def evict_peer_locked(
@@ -749,9 +808,17 @@ class WebRTCPeerManagement:
                         display_id = json_metadata.get("display_id") or "primary"
                         pos = json_metadata.get("display_position")
                         display_position = pos if pos in ("right", "left", "up", "down") else "right"
+                        tab = json_metadata.get("client_tab_id")
+                        if isinstance(tab, str) and tab:
+                            client_tab_id = tab[:64]
+                        cc_start_kbps = json_metadata.get("cc_start_kbps")
                         codecs = json_metadata.get("fullcolor_codecs")
                         if isinstance(codecs, list):
                             fullcolor_codecs = [str(c) for c in codecs if isinstance(c, str) and c.isalnum()]
+                        codecs = json_metadata.get("tenbit_codecs")
+                        if isinstance(codecs, list):
+                            tenbit_codecs = [str(c) for c in codecs if isinstance(c, str) and c.isalnum()]
+                        page_size = hello_page_size(json_metadata.get("page_size"))
                     except json.JSONDecodeError as e:
                         await ws.close(code=1002, message=b"invalid protocol")
                         raise Exception("Invalid JSON metadata from {!r}".format(raddr)) from e
@@ -836,29 +903,47 @@ class WebRTCPeerManagement:
                                 "Invalid client slot provided {!r}".format(client_slot)
                             )
                         if client_slot != -1:
+                            # A page is the only one of its slot, as its hello names it. In
+                            # secure mode the token table says who a page is and which slots
+                            # it drives, while every page opened without `#playerN` names
+                            # slot 1, so a page is the only one of its token instead: the
+                            # pages of a collaboration room, each with its own, all stay.
+                            by_token = bool(app_settings.master_token)
+                            if by_token:
+                                key = ("token", display_id, client_token)
+                            else:
+                                key = ("slot", display_id, client_slot)
                             colliding = [
                                 (pid, peer)
                                 for pid, peer in self.peers.items()
-                                if getattr(peer, "client_slot", None) == client_slot
+                                if (getattr(peer, "client_token", None) == client_token if by_token
+                                    else getattr(peer, "client_slot", None) == client_slot)
                                 and getattr(peer, "display_id", "primary") == display_id
+                                and not self._beside(peer, client_type, client_tab_id)
                             ]
-                            if colliding and self._eviction_storm(("slot", display_id, client_slot)):
+                            if colliding and self._eviction_storm(key):
                                 await ws.close(
                                     code=4000,
-                                    message=b"Player slot takeover loop detected; another page holds this slot.",
+                                    message=(b"Session takeover loop detected; another page holds this session."
+                                             if by_token else
+                                             b"Player slot takeover loop detected; another page holds this slot."),
                                 )
+                                # The token is a credential: logs name the page by its address alone.
                                 raise Exception(
-                                    "Rejecting slot {!r} claim from {!r}: takeover storm".format(
-                                        client_slot, raddr
-                                    )
+                                    "Rejecting a page of the same token from {!r}: takeover storm".format(raddr)
+                                    if by_token else
+                                    "Rejecting slot {!r} claim from {!r}: takeover storm".format(client_slot, raddr)
                                 )
                             for pid, peer in colliding:
                                 evict_peer_locked(
                                     pid, peer,
-                                    b"Superseded by a new connection for this player slot.",
-                                    storm_key=("slot", display_id, client_slot),
+                                    b"Superseded by a new connection." if by_token
+                                    else b"Superseded by a new connection for this player slot.",
+                                    storm_key=key,
                                 )
                                 logger.info(
+                                    "Evicting peer {!r} of the same token for reconnect from {!r}".format(pid, raddr)
+                                    if by_token else
                                     "Evicting peer {!r} holding slot {!r} for reconnect from {!r}".format(
                                         pid, client_slot, raddr
                                     )
@@ -886,6 +971,26 @@ class WebRTCPeerManagement:
                     )
                     peer_controller = controller_entry[1] if controller_entry else None
                     if client_type == "controller":
+                        # A controller of another tab stays beside the newcomer; the
+                        # one it supersedes is its own page's, or any where either
+                        # names no tab.
+                        rival_entry = next(
+                            (
+                                (pid, peer)
+                                for pid, peer in self.peers.items()
+                                if getattr(peer, "client_type", None) == "controller"
+                                and getattr(peer, "display_id", "primary") == display_id
+                                and not self._beside(peer, client_type, client_tab_id)
+                            ),
+                            None,
+                        )
+                        if rival_entry is not None:
+                            controller_entry = rival_entry
+                            peer_controller = rival_entry[1]
+                        elif peer_controller is not None:
+                            logger.info("Controller from {!r} joins display {!r} beside {!r}".format(
+                                raddr, display_id, controller_entry[0]))
+                            peer_controller = None
                         if peer_controller is not None:
                             if self._eviction_storm(("controller", display_id)):
                                 await ws.close(
@@ -948,6 +1053,10 @@ class WebRTCPeerManagement:
                     display_id=display_id,
                     display_position=display_position,
                     fullcolor_codecs=fullcolor_codecs,
+                    tenbit_codecs=tenbit_codecs,
+                    tab_id=client_tab_id,
+                    cc_start_kbps=cc_start_kbps,
+                    page_size=page_size,
                 )
                 result = (puid, peer_type, client_type, client_slot, client_strict_viewer)
         finally:

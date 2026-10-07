@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A GOP the pacer abandons is gone from the queue, the wire and the repairs.
+"""A GOP the pacer abandons is gone from the queue, the wire, and the repairs.
 
 A video packet the queue budget cannot hold abandons its GOP: every queued
 packet of it is purged rather than trimmed to fit, since nothing behind the
@@ -8,7 +8,8 @@ the packet itself is refused. The stale deadline and a failed send abandon
 the same way. The sender learns of an abandonment from the refusal and stops
 repairing what it sent up to then: a NACK batch ends at the reset, and a late
 NACK for an abandoned packet is ignored rather than putting it back on the
-wire behind the keyframe. Driven with stand-ins; no peer."""
+wire behind the keyframe, while what it sends after is repaired however far its
+numbering runs. Driven with stand-ins; no peer."""
 import asyncio
 import os
 import sys
@@ -117,24 +118,25 @@ async def sender_repairs() -> None:
 
     events: list = []
     sender = SimpleNamespace(
-        _RTCRtpSender__rtp_history=history, _RTCRtpSender__abandoned=None, _RTCRtpSender__last_sequence=5,
+        _RTCRtpSender__rtp_history=history, _RTCRtpSender__rtt=None, _RTCRtpSender__unheld=(),
         _RTCRtpSender__kind="video", _RTCRtpSender__rtx_payload_type=None,
         _RTCRtpSender__rtp_header_extensions_map=HeaderExtensionsMap(),
         _RTCRtpSender__log_debug=lambda *a: None,
-        transport=SimpleNamespace(_send_rtp=send_rtp, _twcc_next=lambda n: 7),
-        _emit_pli_event=lambda: events.append("pli"), emit=lambda name, *args: events.append((name,) + args))
+        transport=SimpleNamespace(_send_rtp=send_rtp, _twcc_next=lambda n: 7, _send_delay=lambda: 0.0),
+        _emit_pli_event=lambda: events.append("pli"), emit=lambda name, *args: events.append((name,) + args),
+        _resync_held=lambda: False)
     sender._retransmit = lambda packet: RTCRtpSender._retransmit(sender, packet)
     sender._send = lambda data, twcc_seq=None: RTCRtpSender._send(sender, data, twcc_seq)
     nack = lambda *lost: RtcpRtpfbPacket(fmt=RTCP_RTPFB_NACK, ssrc=1, media_ssrc=2, lost=list(lost))
 
     await RTCRtpSender._handle_rtcp_packet(sender, nack(1, 2))
-    res.check("repairs the pacer takes leave nothing abandoned",
-              len(wire) == 2 and sender._RTCRtpSender__abandoned is None, (len(wire), sender._RTCRtpSender__abandoned))
+    res.check("repairs the pacer takes leave nothing abandoned, a first NACK's each sent twice",
+              len(wire) == 4 and not any(history.abandoned(s) for s in range(1, 6)), len(wire))
     refusals[:] = [False, True, False]
     wire.clear()
     await RTCRtpSender._handle_rtcp_packet(sender, nack(1, 2, 3, 4, 5))
     res.check("a batch stops at the repair the pacer refused, and everything sent so far is abandoned",
-              len(wire) == 2 and sender._RTCRtpSender__abandoned == 5 and events == [("lost_frame", 1)],
+              len(wire) == 2 and all(history.abandoned(s) for s in range(1, 6)) and events == [("lost_frame", 1)],
               (len(wire), events))
     res.check("a repair goes out under its own transport sequence", wire == [7, 7], wire)
     wire.clear()
@@ -144,14 +146,16 @@ async def sender_repairs() -> None:
               wire == [] and events == [], (wire, events))
     for seq in (6, 7):
         history.add(RtpPacket(payload_type=96, sequence_number=seq, payload=b"x"), 0.0, seq)
-    sender._RTCRtpSender__last_sequence = 7
     await RTCRtpSender._handle_rtcp_packet(sender, nack(5, 7))
     res.check("a packet sent after the abandonment is repaired as before",
-              len(wire) == 1 and events == [], (len(wire), events))
-    sender._RTCRtpSender__abandoned = 65535
+              len(wire) == 2 and events == [], (len(wire), events))
+    # Past half the numbering, a sequence number compared with the abandonment's would read
+    # as before it: every NACK went unanswered for the next 32768 packets.
+    for seq in (40000, 40001):
+        history.add(RtpPacket(payload_type=96, sequence_number=seq, payload=b"x"), 0.0, seq)
     wire.clear()
-    await RTCRtpSender._handle_rtcp_packet(sender, nack(7))
-    res.check("the boundary compares across the sequence wrap", len(wire) == 1, len(wire))
+    await RTCRtpSender._handle_rtcp_packet(sender, nack(40001))
+    res.check("a packet sent half the numbering after an abandonment is repaired", len(wire) == 2, len(wire))
     events.clear()
     await RTCRtpSender._handle_rtcp_packet(sender, nack(99))
     res.check("a NACK past the history still asks for a keyframe", events == ["pli"], events)

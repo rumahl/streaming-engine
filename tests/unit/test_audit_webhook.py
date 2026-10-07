@@ -4,7 +4,7 @@
 Each clipboard payload the server sends or takes, each upload that lands or
 fails, and each download served becomes one JSON POST to the operator's URL,
 carrying metadata only. Events queue in emit order and one sender delivers
-them over one keep-alive connection; a collector that rejects, stalls or is
+them over one keep-alive connection; a collector that rejects, stalls, or is
 down costs a session an enqueue and nothing more, is logged once per outage,
 and loses only what overflows the queue. Without a URL nothing is created.
 """
@@ -29,7 +29,7 @@ from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
 from selkies import audit  # noqa: E402
 from selkies.input_handler import WebRTCInput  # noqa: E402
-from selkies.webrtc_engine import RTCApp  # noqa: E402
+from selkies.webrtc_engine import ClientType, RTCApp  # noqa: E402
 from selkies.websockets_mode import SelkiesStreamingApp  # noqa: E402
 from selkies.settings import SENSITIVE_SETTING_NAMES, build_client_settings_payload, settings  # noqa: E402
 from selkies.stream_server import CentralizedStreamServer, TransferPacer  # noqa: E402
@@ -70,7 +70,7 @@ class Channel:
 
 
 class Collector:
-    """An audit collector that answers, rejects or stalls on command."""
+    """An audit collector that answers, rejects, or stalls on command."""
 
     def __init__(self) -> None:
         self.mode = "ok"
@@ -307,7 +307,7 @@ async def hook_cases() -> None:
           await handler._dispatch_message("cw," + b64("blocked".encode()))
           await delivered()
           got = [(e["event"], e["mime_type"], e["size_bytes"], e["multipart"]) for e in collector.events]
-          check("clipboard.receive: text, binary and multipart once the clipboard took them; a refused or "
+          check("clipboard.receive: text, binary, and multipart once the clipboard took them; a refused or "
                 "disabled write records nothing",
                 got == [("clipboard.receive", "text/plain", 5, False),
                         ("clipboard.receive", "image/png", 9, False),
@@ -326,7 +326,8 @@ async def hook_cases() -> None:
           await rtc_app.send_clipboard_data(b"\x89PNG..", "image/png")
           channel = Channel()
           rtc_app.peer_connections = {"peer": {"peer_conn": SimpleNamespace(connectionState="connected"),
-                                               "data_channel": channel}}
+                                               "data_channel": channel,
+                                               "client_type": ClientType.CONTROLLER}}
           await rtc_app.send_clipboard_data(b"\x89PNG..", "image/png")
           await rtc_app.send_clipboard_data("", "text/plain", reply_to="cr")
           await delivered()

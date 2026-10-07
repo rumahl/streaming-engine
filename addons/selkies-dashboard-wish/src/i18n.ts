@@ -7,16 +7,15 @@
  * from its addon, like the touch-gamepad import in main.jsx) overlaid with the
  * wish-only strings in translations-extra.ts. Extras are consulted first, then
  * the classic translator with its built-in English fallback. Language follows
- * `navigator.language`, resolved once at module load, the same policy as
- * classic.
+ * `navigator.language`, resolved once at module load to the dictionary key
+ * the classic translator reads for it (`resolveLocale`, which picks the
+ * written form of Chinese by region and script), the same policy as classic.
  * @module
  */
-import { getTranslator } from "../../selkies-dashboard/src/translations.js";
+import { getTranslator, resolveLocale } from "../../selkies-dashboard/src/translations.js";
 import { extras } from "./translations-extra";
 
-const lang = ((typeof navigator !== "undefined" && navigator.language) || "en")
-    .split("-")[0]
-    .toLowerCase();
+const lang = resolveLocale((typeof navigator !== "undefined" && navigator.language) || "en");
 const base = getTranslator(lang);
 const extra = extras[lang] || extras.en;
 
@@ -31,11 +30,13 @@ const interpolate = (text: string, vars?: Record<string, unknown>): string =>
 /**
  * Translates a dotted key, wish extras first, then the classic dictionary.
  * @param key Dotted lookup key.
- * @param vars Values for `{name}` placeholders in the string.
+ * @param vars Values for `{name}` placeholders in the string, or, as the
+ *     classic translator takes it, a literal to show where no dictionary has
+ *     the key.
  */
-export const t = (key: string, vars?: Record<string, unknown>): string => {
+export const t = (key: string, vars?: Record<string, unknown> | string): string => {
     const hit = lookup(extra, key) ?? lookup(extras.en, key);
-    if (typeof hit === "string") return interpolate(hit, vars);
+    if (typeof hit === "string") return interpolate(hit, typeof vars === "string" ? undefined : vars);
     return base.t(key, vars);
 };
 

@@ -2,14 +2,15 @@
 """Printed documents reach the browser through the spool.
 
 A document that lands whole in the print spool is announced once, whatever
-way it landed; `/api/print/<name>` serves it, records it for the audit and
-takes it out of the spool, refusing a viewer, a disabled policy and any name
+way it landed; `/api/print/<name>` serves it, records it for the audit, and
+takes it out of the spool, refusing a viewer, a disabled policy, and any name
 that is not a document in the spool; and each transport announces to the
 primary controller pages alone.
 """
 import asyncio
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -23,7 +24,7 @@ sys.argv = ["selkies"]
 
 from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
-from selkies import audit, printing  # noqa: E402
+from selkies import audit, printing, settings  # noqa: E402
 from selkies.webrtc_engine import ClientType, RTCApp  # noqa: E402
 from selkies.websockets_mode import DataStreamingServer, client_permissions  # noqa: E402
 from selkies.stream_server import CentralizedStreamServer  # noqa: E402
@@ -45,6 +46,39 @@ def name_cases() -> None:
     check("case of the suffix does not matter", printing.document_name("scan.PDF") == "scan.PDF")
     for bad in ("../x.pdf", "sub/x.pdf", ".hidden.pdf", ".3.part", "notes.txt", "x\x00.pdf", ""):
         check(f"{bad!r} is not a document", printing.document_name(bad) is None)
+
+
+def spool_path_cases(root: str) -> None:
+    default = next(d["default"] for d in settings.SETTING_DEFINITIONS if d["name"] == "print_spool_path")
+    saved = os.environ.get("XDG_STATE_HOME")
+    try:
+        os.environ["XDG_STATE_HOME"] = root
+        check("the default spool is under XDG_STATE_HOME",
+              printing.spool_path(default) == os.path.join(root, "selkies", "print"), printing.spool_path(default))
+        del os.environ["XDG_STATE_HOME"]
+        check("and under ~/.local/state without it",
+              printing.spool_path(default) == os.path.expanduser("~/.local/state/selkies/print"),
+              printing.spool_path(default))
+        check("a configured spool is taken as given, ~ expanded",
+              printing.spool_path("~/prints") == os.path.expanduser("~/prints"))
+    finally:
+        if saved is not None:
+            os.environ["XDG_STATE_HOME"] = saved
+
+
+def paper_cases() -> None:
+    ppd = (printing.files("selkies") / "cups" / "selkies.ppd").read_text("latin-1")
+
+    def defaults(text: str) -> list:
+        return re.findall(r"^\*Default(?:PageSize|PageRegion|ImageableArea|PaperDimension): (\S+)", text, re.M)
+
+    check("the shipped queue defaults to A4", defaults(ppd) == ["A4"] * 4, defaults(ppd))
+    for requested in ("b5", "letterish"):
+        check(f"PAPERSIZE={requested!r} leaves the PPD as shipped",
+              printing.default_paper(ppd, requested) == (ppd, None))
+    text, size = printing.default_paper(ppd, "LETTER")
+    check("a size the queue offers, named in any case, becomes every default",
+          size == "Letter" and defaults(text) == ["Letter"] * 4, defaults(text))
 
 
 def pending_cases(spool: str) -> None:
@@ -250,6 +284,34 @@ async def transport_cases() -> None:
           one.sent == [{"type": "print_document", "data": {"name": "Late.pdf", "size_bytes": 3}}], one.sent)
 
 
+def scheduler_cases(root: str) -> None:
+    """A scheduler installed for root alone is named with its mode rather than reported absent."""
+    prefix = os.path.join(root, "usr")
+    cupsd = os.path.join(prefix, "sbin", "cupsd")
+    os.makedirs(os.path.dirname(cupsd))
+    open(cupsd, "w").close()
+    os.chmod(cupsd, 0)
+    saved, search = os.environ.get("PATH", ""), printing.PrintQueue.SEARCH_PATH
+    os.environ["PATH"] = os.path.dirname(cupsd)
+    printing.PrintQueue.SEARCH_PATH = ""
+    try:
+        check("a scheduler this user cannot read serves no queue", printing.PrintQueue.programs() is None)
+        check("and is named with its mode", printing.PrintQueue.locked_scheduler() == (cupsd, 0),
+              printing.PrintQueue.locked_scheduler())
+        os.chmod(cupsd, 0o755)
+        os.makedirs(os.path.join(prefix, "lib", "cups", "daemon"))
+        os.makedirs(os.path.join(prefix, "lib", "cups", "filter"))
+        open(os.path.join(prefix, "lib", "cups", "daemon", "cups-exec"), "w").close()
+        check("a readable one is found with its program and data directories",
+              printing.PrintQueue.programs() == (cupsd, os.path.join(prefix, "lib", "cups"),
+                                                 os.path.join(prefix, "share", "cups")),
+              printing.PrintQueue.programs())
+        check("and nothing stands in its way", printing.PrintQueue.locked_scheduler() is None)
+    finally:
+        os.environ["PATH"] = saved
+        printing.PrintQueue.SEARCH_PATH = search
+
+
 async def main() -> None:
     root = tempfile.mkdtemp(prefix="selkies-printing-")
     spool, elsewhere = os.path.join(root, "spool"), os.path.join(root, "elsewhere")
@@ -257,6 +319,9 @@ async def main() -> None:
     os.makedirs(elsewhere)
     try:
         name_cases()
+        paper_cases()
+        spool_path_cases(os.path.join(root, "state"))
+        scheduler_cases(os.path.join(root, "arch"))
         pending_cases(spool)
         await watcher_cases(spool, elsewhere)
         await route_cases(spool)

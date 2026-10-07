@@ -5,11 +5,7 @@ description: Open-Source Low-Latency Accelerated Linux WebSocket and WebRTC HTML
 
 ![Selkies](assets/logo/horizontal.svg)
 
-[![Build](https://github.com/selkies-project/selkies/actions/workflows/ci.yaml/badge.svg)](https://github.com/selkies-project/selkies/actions/workflows/ci.yaml)
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
-[![Docs](https://img.shields.io/badge/docs-docs.selkies.io-blue)](https://docs.selkies.io/)
-[![Discord](https://img.shields.io/badge/dynamic/json?logo=discord&label=Discord%20Members&query=approximate_member_count&url=https%3A%2F%2Fdiscordapp.com%2Fapi%2Finvites%2FwDNGDeSW5F%3Fwith_counts%3Dtrue)](https://discord.gg/wDNGDeSW5F)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/selkies-project/selkies)
+[![Build](https://github.com/selkies-project/selkies/actions/workflows/ci.yaml/badge.svg)](https://github.com/selkies-project/selkies/actions/workflows/ci.yaml) [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-docs.selkies.io-blue)](https://docs.selkies.io/) [![Discord](https://img.shields.io/badge/dynamic/json?logo=discord&label=Discord%20Members&query=approximate_member_count&url=https%3A%2F%2Fdiscordapp.com%2Fapi%2Finvites%2FwDNGDeSW5F%3Fwith_counts%3Dtrue)](https://discord.gg/wDNGDeSW5F) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/selkies-project/selkies)
 
 **Moonlight, Google Stadia, or GeForce NOW in noVNC form factor for Linux X11 and Wayland, in any HTML5 web interface you wish to embed inside, with at least 60 frames per second on Full HD resolution.**
 
@@ -23,7 +19,7 @@ While designed for clustered or unprivileged containerized environments, Selkies
 
 The HTML5 client runs on Chromium, Firefox, and Safari, with two-way clipboard (text and images), low-latency zero-copy video rendering, automatic GPU selection, resilient keyboard, mouse, and gamepad input, and microphone and webcam forwarding into the session.
 
-Video is H.264, H.265, VP8, VP9 or AV1, chosen from the dashboard, encoded on the GPU wherever it carries the codec (NVENC, VA-API, the Jetson and V4L2 engines) and in software where it does not, with 4:4:4 chroma where both ends carry it, and striped H.264 and Motion JPEG as the paths that play everywhere; the same menu drives both transports, and a codec a browser cannot play is stepped past rather than shown as a black screen. Screen capture and encoding are the work of [pixelflux](components/pixelflux.md) and audio of [pcmflux](components/pcmflux.md), two Rust extensions of the same project with references at <https://pixelflux.selkies.io> and <https://pcmflux.selkies.io>. [Sealskin](https://github.com/selkies-project/sealskin) orchestrates the desktop containers one per user on a single server, an example of building a service on them.
+Video is H.264, H.265, VP8, VP9, or AV1, chosen from the dashboard, encoded on the GPU wherever it carries the codec (NVENC, VA-API, the Jetson and V4L2 engines) and in software where it does not, with 4:4:4 chroma where both ends carry it, and striped H.264 and Motion JPEG as the paths that play everywhere; the same menu drives both transports, and a codec a browser cannot play is stepped past rather than shown as a black screen. Screen capture and encoding are the work of [pixelflux](components/pixelflux.md) and audio of [pcmflux](components/pcmflux.md), two Rust extensions of the same project with references at <https://pixelflux.selkies.io> and <https://pcmflux.selkies.io>. [Sealskin](https://github.com/selkies-project/sealskin) orchestrates the desktop containers one per user on a single server, an example of building a service on them.
 
 **Please read [Troubleshooting and FAQs](faq.md) first, then use [Discord](https://discord.gg/wDNGDeSW5F) or [GitHub Discussions](https://github.com/selkies-project/selkies/discussions) for support questions. Please only use [Issues](https://github.com/selkies-project/selkies/issues) for technical inquiries or bug reports.**
 
@@ -44,6 +40,8 @@ Video is H.264, H.265, VP8, VP9 or AV1, chosen from the dashboard, encoded on th
 [**WebRTC and Firewall Issues (cannot connect)**](firewall.md)
 
 [**Secure Mode (token authentication)**](secure-mode.md)
+
+[**Jupyter, Coder, and Open OnDemand**](platforms.md)
 
 [**Components including Encoders and Interfaces**](components/index.md): [pixelflux](components/pixelflux.md), [pcmflux](components/pcmflux.md), the [web client and dashboards](components/web-client.md), the [Base Container](components/base-image.md), the [Desktop Container](components/desktop-image.md), the [KDE Plasma desktops](components/kde-images.md), [gamepads](components/input-interposer.md), the [webcam](components/v4l2-interposer.md), and [TURN](components/turn.md)
 

@@ -240,10 +240,10 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
     const input = makeInput({ dpr: 2 });
     input._mouseButtonMovement({ type: 'mousemove', target: input.element,
                                  clientX: 100.3, clientY: 0 });
-    const queued = input._pendingMove;
+    input._flushCoalescedMouseMove();
+    const last = input.sent[input.sent.length - 1];
     check('absolute motion reaches every server pixel at dpr 2',
-          queued !== null && queued.mtype === 'm' && queued.x === 201,
-          `${queued && `${queued.mtype},${queued.x}`}`);
+          typeof last === 'string' && last.startsWith('m,201,'), `${last}`);
 }
 
 // --- a button event maps its own position ---------------------------------
@@ -263,6 +263,30 @@ for (const dpr of [1, 1.25, 1.5, 2]) {
           `${input.sent[input.sent.length - 1]}`);
     check('the locked motion before it went out as a delta',
           input.sent.includes('m2,37,-21,0,0,1'), `${input.sent}`);
+}
+
+// --- a Control-click is the primary button on every engine ----------------
+{
+    // Gecko on macOS reports a Control-click as the secondary button while
+    // `buttons` holds the primary alone, after a move stating that primary.
+    const input = makeInput({ dpr: 1 });
+    const at = { target: input.element, clientX: 10, clientY: 10, ctrlKey: true };
+    input._mouseButtonMovement({ type: 'mousemove', buttons: 1, ...at });
+    input._mouseButtonMovement({ type: 'mousedown', button: 2, buttons: 1, ...at });
+    input._mouseButtonMovement({ type: 'mouseup', button: 2, buttons: 0, ...at });
+    const masks = input.sent.filter((m) => m.startsWith('m,')).map((m) => Number(m.split(',')[3]));
+    check('a Control-click reported as the secondary button presses the primary alone',
+          masks.every((m) => (m & ~1) === 0) && masks.includes(1), `${input.sent}`);
+    check('and its release leaves no button held', input.buttonMask === 0, `${input.buttonMask}`);
+}
+{
+    const input = makeInput({ dpr: 1 });
+    const at = { target: input.element, clientX: 10, clientY: 10, ctrlKey: true };
+    input._mouseButtonMovement({ type: 'mousedown', button: 2, buttons: 2, ...at });
+    const held = input.buttonMask;
+    input._mouseButtonMovement({ type: 'mouseup', button: 2, buttons: 0, ...at });
+    check('a secondary button pressed under Control stays the secondary',
+          held === 4 && input.buttonMask === 0, `${held} ${input.buttonMask}`);
 }
 
 // --- a non-finite delta cannot latch the accumulator ----------------------

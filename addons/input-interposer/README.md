@@ -36,7 +36,7 @@ export LD_PRELOAD="${SELKIES_INTERPOSER}${LD_PRELOAD:+:${LD_PRELOAD}}"
 ```
 
 Do **not** preload this into the Selkies backend process itself. It hooks
-`read`, `close`, `ioctl` and `epoll_ctl` for every file descriptor in the
+`read`, `close`, `ioctl`, and `epoll_ctl` for every file descriptor in the
 process, and its blocking device reads are exactly what an asyncio event loop
 must never do: a hook that blocks there stops the server answering anything.
 The backend is the other end of these sockets and needs no preload;
@@ -50,7 +50,7 @@ export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/selkies_input_interposer.so${LD_PRE
 
 You can replace `/usr/$LIB/selkies_input_interposer.so` with any non-root path of your choice if using the `.tar.gz` tarball. Make sure the correct `selkies_input_interposer.so` is installed in that path.
 
-Chromium, Electron and other binaries built with `_FORTIFY_SOURCE` open devices through glibc's checked entry points (`__open64_2`, `__openat64_2`, `__read_chk`) rather than `open()`; the interposer hooks those too, so a browser's Gamepad API sees the pads with nothing further to set.
+Chromium, Electron, and other binaries built with `_FORTIFY_SOURCE` open devices through glibc's checked entry points (`__open64_2`, `__openat64_2`, `__read_chk`) rather than `open()`; the interposer hooks those too, so a browser's Gamepad API sees the pads with nothing further to set.
 
 SDL2 applications find the four pads through [fake-udev](https://github.com/selkies-project/selkies/tree/main/addons/fake-udev/README.md), which is preloaded alongside the interposer in the container images. Where device discovery through `libudev` is unavailable — `SDL_JOYSTICK_DISABLE_UDEV=1`, an SDL sandbox build, or an SDL built without udev — SDL scans `/dev/input`, and the interposer's evdev nodes appear in that scan, so the pads are found with nothing further to set.
 
@@ -86,15 +86,15 @@ export SDL_JOYSTICK_DEVICE=/dev/input/event1000
 LD_PRELOAD='/usr/$LIB/selkies_input_interposer.so' timeout 10 tests/tools/gamepad/sdlread
 ```
 
-`sdlread` prints the name, GUID, vendor/product and axis/button/hat counts SDL read out of the interposer, then one line per event. `tests/tools/gamepad/sdlenum` lists what SDL enumerates without opening anything.
+`sdlread` prints the name, GUID, vendor/product, and axis/button/hat counts SDL read out of the interposer, then one line per event. `tests/tools/gamepad/sdlenum` lists what SDL enumerates without opening anything.
 
 ## Application-created devices
 
-Where `/dev/uinput` is not writable — the usual case in an unprivileged container — an application preloaded with the interposer that opens it to create a device is served in userspace instead of failing. The `UI_SET_*BIT`, `UI_ABS_SETUP` and `UI_DEV_SETUP` setup ioctls are accumulated, `UI_DEV_CREATE` binds a socket for the new device under `SELKIES_JS_SOCKET_PATH` and writes a descriptor beside it (`selkies_event<N>.sock`/`.desc`, with `N` at or above 3000, clear of the four gamepad slots), and the `input_event` records the application writes fan out to every sibling process that opens the resulting `/dev/input/event<N>`. Those siblings read it as an ordinary evdev device: its `EVIOCG*` identity and capabilities come from the descriptor, and [fake-udev](https://github.com/selkies-project/selkies/tree/main/addons/fake-udev/README.md) enumerates it (as a joystick, mouse or keyboard per its capability bits) so `libudev` consumers such as SDL2 discover it. Where `/dev/uinput` **is** writable, the open is not interposed and the kernel creates a real device, so a bare-metal host is unaffected. This needs no configuration; it is the same preload the gamepad sockets use.
+Where `/dev/uinput` is not writable — the usual case in an unprivileged container — an application preloaded with the interposer that opens it to create a device is served in userspace instead of failing. The `UI_SET_*BIT`, `UI_ABS_SETUP`, and `UI_DEV_SETUP` setup ioctls are accumulated, `UI_DEV_CREATE` binds a socket for the new device under `SELKIES_JS_SOCKET_PATH` and writes a descriptor beside it (`selkies_event<N>.sock`/`.desc`, with `N` at or above 3000, clear of the four gamepad slots), and the `input_event` records the application writes fan out to every sibling process that opens the resulting `/dev/input/event<N>`. Those siblings read it as an ordinary evdev device: its `EVIOCG*` identity and capabilities come from the descriptor, and [fake-udev](https://github.com/selkies-project/selkies/tree/main/addons/fake-udev/README.md) enumerates it (as a joystick, mouse, or keyboard per its capability bits) so `libudev` consumers such as SDL2 discover it. Where `/dev/uinput` **is** writable, the open is not interposed and the kernel creates a real device, so a bare-metal host is unaffected. This needs no configuration; it is the same preload the gamepad sockets use.
 
 ## Unix domain socket protocol
 
-Selkies is the server (`SelkiesGamepad` in `selkies.input_handler`) and this library is the client. The sockets are `AF_UNIX`/`SOCK_STREAM` and live in `$SELKIES_JS_SOCKET_PATH` (default `/tmp`, set from `--js_socket_path`): `selkies_js<0-3>.sock` backs `/dev/input/js<0-3>` and `selkies_event100<0-3>.sock` backs `/dev/input/event100<0-3>`.
+Selkies is the server (`SelkiesGamepad` in `selkies.input_handler`) and this library is the client. The sockets are `AF_UNIX`/`SOCK_STREAM` and live in `$SELKIES_JS_SOCKET_PATH` (set from `--js_socket_path`; unset, `$XDG_RUNTIME_DIR`, the session's private directory, and `/tmp` where that is unset too): `selkies_js<0-3>.sock` backs `/dev/input/js<0-3>` and `selkies_event100<0-3>.sock` backs `/dev/input/event100<0-3>`.
 
 Every `open()` of an interposed device makes its own connection (up to 16 per device), so each handle gets the full event stream. A connect is retried for 250 ms; if nothing is listening, `open()` fails with `EIO`.
 
@@ -141,6 +141,24 @@ struct input_event { struct timeval time; __u16 type; __u16 code; __s32 value; }
 
 Each event is written together with a `SYN_REPORT` (`type` `EV_SYN` = 0, `code` `SYN_REPORT` = 0, `value` 0) immediately after it, so one button press or axis motion is always two records.
 
+### Force feedback
+
+The evdev node answers as a memless Xbox pad does: `EVIOCGBIT(EV_FF)` reports `FF_RUMBLE`, `FF_PERIODIC` with `FF_SQUARE`, `FF_TRIANGLE`, and `FF_SINE`, and `FF_GAIN`; `EVIOCGEFFECTS` is 16. The effects an application uploads with `EVIOCSFF` are kept per handle, as the kernel keeps them per open file (a new one, id `-1`, takes the first free id; any other type, or an id the handle does not hold, is `EINVAL`; a seventeenth is `ENOSPC`), and `EVIOCRMFF` forgets one. The events an application `write()`s to the node are taken whole, as `evdev_write()` takes them (`EINVAL` under one event's size): each `EV_FF` play, stop, or gain goes to the server as one record on the handle's own socket, the direction the event stream leaves free, and every other event is accepted and dropped. The record is 16 bytes, packed `=BBhHHHHHH`:
+
+| offset | field | meaning |
+|---|---|---|
+| 0 | `kind` | `1` play, `2` stop, `3` gain |
+| 1 | reserved | 0 |
+| 2 | `id` | the effect |
+| 4 | `strong` | play: strong motor, 0-0xffff (a rumble effect's `strong_magnitude`; a periodic one's magnitude, doubled, on both motors) |
+| 6 | `weak` | play: weak motor, likewise |
+| 8 | `length_ms` | play: the effect's `replay.length`, 0 until stopped |
+| 10 | `delay_ms` | play: its `replay.delay` |
+| 12 | `count` | play: the repeat count; gain: the gain, 0-0xffff |
+| 14 | reserved | 0 |
+
+The server mixes every playing effect of a slot and relays the result to the client driving it. The joydev node has no force feedback, and what an application writes to it is read and dropped.
+
 ### Closing
 
-Closing a handle is per handle: the interposer retires the fd that was closed, leaves this device's other handles alone, and clears the cached `js_config_t` only when the last one goes. The server drops the writer from its fan-out list when the connection ends, and unlinks the socket files when the gamepad is shut down.
+Closing a handle is per handle: the interposer retires the fd that was closed, leaves this device's other handles alone, and clears the cached `js_config_t` only when the last one goes. The server drops the writer from its fan-out list when the connection ends, stops the effects that handle played, and unlinks the socket files when the gamepad is shut down.

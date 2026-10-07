@@ -5,12 +5,12 @@ A KDE session offers neither screencopy nor the virtual keyboard and pointer pro
 ordinary clients, so `SELKIES_WAYLAND_HOST_DISPLAY` aimed at its socket has pixelflux open a
 RemoteDesktop portal session instead: the monitor's PipeWire stream carries the frames and the
 seat's input goes through the portal by keysym and stream coordinates. This suite runs a real
-KDE stack on a private bus — `kwin_wayland --virtual`, PipeWire, xdg-desktop-portal and its KDE
+KDE stack on a private bus — `kwin_wayland --virtual`, PipeWire, xdg-desktop-portal, and its KDE
 backend — starts the server against it over either transport, and checks the rung was taken,
-the stream negotiated, and that a browser's pointer moves, clicks, scrolls and keys land on a
-client window inside KWin. KWin's virtual backend records no screencast frames (only its DRM
-and nested Wayland backends emit the output damage the stream is fed from), so the frame checks
-report skipped there and pass where a backend that does emit them is captured.
+the stream negotiated, and that a browser's pointer moves, clicks, scrolls, and keys land on a
+client window inside KWin. Plasma 6.6's virtual backend streams its frames as GPU dmabufs; a KWin
+whose virtual backend emits no output damage streams none, and the frame check reports skipped
+there.
 
 Usage: python3 tests/e2e/test_wayland_host_portal.py [websockets|webrtc]
 """
@@ -46,11 +46,19 @@ def service_exec(name: str) -> str:
 
 
 class KdeRig:
-    """kwin_wayland (virtual backend), PipeWire and the KDE portal on a private session bus and
-    runtime dir, the way a KDE session exposes them; `socket_path` is the compositor's socket."""
+    """kwin_wayland (virtual backend), PipeWire, and the KDE portal on a private session bus and
+    runtime dir, the way a KDE session exposes them; `socket_path` is the compositor's socket.
+
+    KWin runs with `KWIN_WAYLAND_NO_PERMISSION_CHECKS`, as the KDE image sets it: KWin 6 grants
+    its restricted globals, the screencast one among them, by the desktop file of the client's
+    executable, which it does not resolve in this bare session (it logs the backend as not
+    listing `zkde_screencast_unstable_v1`, which the backend's desktop file does), and the backend
+    then refuses every session request. KDE 6's backend also asks before a remote-desktop session
+    starts unless the permission store's `kde-authorized` table grants the app `remote-desktop`,
+    so the rig grants it to a host app, whose id is empty, as a deployment does ahead of time."""
 
     def __init__(self) -> None:
-        # A short path: the compositor's, PipeWire's and the bus's sockets all live under it.
+        # A short path: the compositor's, PipeWire's, and the bus's sockets all live under it.
         self.root = tempfile.mkdtemp(prefix="pf-portal-")
         self.runtime = os.path.join(self.root, "rt")
         os.makedirs(self.runtime, mode=0o700)
@@ -74,7 +82,7 @@ class KdeRig:
 
     def start(self) -> str:
         """Bring the stack up; returns why it could not, or an empty string."""
-        for binary in ("kwin_wayland", "dbus-daemon", "pipewire", "wireplumber"):
+        for binary in ("kwin_wayland", "dbus-daemon", "gdbus", "pipewire", "wireplumber"):
             if not shutil.which(binary):
                 return f"{binary} not installed"
         for name, path in (("xdg-desktop-portal", self.portal), ("xdg-desktop-portal-kde", self.portal_kde)):
@@ -92,7 +100,7 @@ class KdeRig:
         self._spawn(["wireplumber"], "wireplumber")
         self._spawn(["kwin_wayland", "--virtual", "--width", str(SIZE[0]), "--height", str(SIZE[1]),
                      "--no-lockscreen", "--no-global-shortcuts", "--no-kactivities",
-                     "--socket", self.socket_name], "kwin")
+                     "--socket", self.socket_name], "kwin", KWIN_WAYLAND_NO_PERMISSION_CHECKS="1")
         deadline = time.time() + 20
         while not os.path.exists(self.socket_path):
             if time.time() > deadline:
@@ -102,6 +110,14 @@ class KdeRig:
         self._spawn([self.portal_kde], "portal-kde", KDE_FULL_SESSION="true")
         self._spawn([self.portal, "-r"], "portal")
         time.sleep(2.0)
+        grant = subprocess.run(
+            ["gdbus", "call", "--session", "--dest", "org.freedesktop.impl.portal.PermissionStore",
+             "--object-path", "/org/freedesktop/impl/portal/PermissionStore",
+             "--method", "org.freedesktop.impl.portal.PermissionStore.SetPermission",
+             "kde-authorized", "true", "remote-desktop", "", "['yes']"],
+            env=self.env, capture_output=True, text=True, timeout=15)
+        if grant.returncode != 0:
+            return f"the permission store took no remote-desktop grant: {grant.stderr.strip()}"
         return ""
 
     def log(self, name: str) -> str:
@@ -168,9 +184,9 @@ def run(mode: str) -> "H.Results":
                 if C.wait_log("first portal frame", 8):
                     res.check("video reaches the browser", bool(wait_video(page, mode, 30)), "")
                 else:
-                    res.skip("video reaches the browser", "the compositor emitted no screencast frame (KWin's virtual backend never does)")
+                    res.skip("video reaches the browser", "the compositor emitted no screencast frame")
 
-                # Input from the browser: pointer motion, a click, a wheel notch and a key,
+                # Input from the browser: pointer motion, a click, a wheel notch, and a key,
                 # each of which the KDE client inside KWin must report.
                 page.mouse.move(640, 360)
                 page.mouse.click(640, 360)
@@ -193,6 +209,29 @@ def run(mode: str) -> "H.Results":
                           and obs.wait_for("kbd_key", timeout=8, key=48, state=1) is not None
                           and obs.wait_for("kbd_key", timeout=8, key=42, state=1) is not None,
                           keys)
+                # Past the page's one-second wheel reset, a stroke of small pixel deltas is a
+                # touchpad's, which goes to the portal as smooth scroll ending in a finish.
+                time.sleep(1.3)
+                mark = len(obs.lines)
+                stroke = [3.5, 6.25, 9.0, 4.75, 2.5]
+                for d in stroke:
+                    page.mouse.wheel(0, d)
+                    time.sleep(0.016)
+                time.sleep(1.0)
+                seen = [l for l in obs.lines[mark:]
+                        if l.get("kind") in ("ptr_axis", "ptr_axis_source", "ptr_axis_stop")]
+                values = [l["value"] for l in seen if l["kind"] == "ptr_axis" and l.get("axis") == 0]
+                last_axis = max((i for i, l in enumerate(seen) if l["kind"] == "ptr_axis"), default=-1)
+                res.check("a touchpad's stroke reaches the KDE client unstepped, as far as the page scrolled",
+                          any(v != int(v) for v in values) and abs(sum(values) - sum(stroke)) < 0.5,
+                          f"{values} against {sum(stroke)}")
+                if "portal offers no EIS socket" in H.server_log():
+                    # Without EIS the stroke goes through NotifyPointerAxis, whose finish KDE's
+                    # backend drops (5.27 through master): the client is never told it stopped.
+                    res.skip("and stops once the stroke pauses", "KDE's portal takes no finish without EIS")
+                else:
+                    res.check("and stops once the stroke pauses",
+                              any(l["kind"] == "ptr_axis_stop" for l in seen[last_axis + 1:]), seen[-3:])
                 res.check("the portal cursor sprite is delivered when the client draws the cursor",
                           C.wait_log("portal cursor sprites arrive", 10), H.server_log(tail=4))
                 real_errors, bad404 = C.benign_console(console_errors, not_found)

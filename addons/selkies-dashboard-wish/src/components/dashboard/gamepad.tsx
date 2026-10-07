@@ -9,7 +9,7 @@ import { GamepadVisualizer } from "@/components/dashboard/GamepadVisualizer";
 import { Button } from "@/components/ui/button";
 import { Keyboard } from "lucide-react";
 import { t } from "@/i18n";
-import { isMobileClient } from "@/utils";
+import { hardwareKeyboard } from "@/utils";
 
 /**
  * The gamepad preview of the top menu's gamepad dropdown, one visualizer per
@@ -27,7 +27,7 @@ import { isMobileClient } from "@/utils";
 
 interface GamepadProps {
     /**
-     * Owned by DashboardOverlay, one source for the menu entry, the hotkey
+     * Owned by DashboardOverlay, one source for the menu entry, the hotkey,
      * and this preview: while the touch overlay is up the physical visualizer
      * would only mirror it, so it is hidden.
      */
@@ -95,14 +95,36 @@ export function Gamepad({ isTouchGamepadActive }: GamepadProps) {
     );
 }
 
-/** The mobile button that asks the core to show the virtual keyboard; nothing elsewhere. */
+/** The page's attached-keyboard verdict, listening from load. */
+const keyboardWatch = hardwareKeyboard();
+
+/** The primary pointer, which a convertible turns coarse when its keyboard is detached. */
+const coarsePointer = typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia("(pointer: coarse)")
+    : null;
+const subscribeCoarsePointer = (onChange: () => void) => {
+    coarsePointer?.addEventListener("change", onChange);
+    return () => coarsePointer?.removeEventListener("change", onChange);
+};
+const isCoarsePointer = () => coarsePointer?.matches ?? false;
+
+/**
+ * The button that asks the core to show the virtual keyboard, while the primary pointer is
+ * coarse (a phone, a tablet, a convertible in its tablet posture) and no keyboard is
+ * attached, which keeps the system's on-screen one down.
+ */
 export function VirtualKeyboardButton() {
-    if (!isMobileClient) return null;
+    const keyboardAttached = React.useSyncExternalStore(keyboardWatch.subscribe, keyboardWatch.attached);
+    const coarse = React.useSyncExternalStore(subscribeCoarsePointer, isCoarsePointer);
+    if (!coarse || keyboardAttached) return null;
     return (
         <Button
             variant="default"
             size="icon"
             className="fixed bottom-4 right-4 z-50"
+            aria-label={t("topMenu.virtualKeyboard")}
+            title={t("topMenu.virtualKeyboard")}
+            data-virtual-keyboard-button=""
             onClick={() => window.postMessage({ type: 'showVirtualKeyboard' }, window.location.origin)}
         >
             <Keyboard className="h-4 w-4" />

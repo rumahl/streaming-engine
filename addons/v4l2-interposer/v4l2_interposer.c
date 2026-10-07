@@ -12,7 +12,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
     socket or from its PipeWire node (SELKIES_WEBCAM_SOURCE). It emulates the
     observable half of a fixed-function webcam — one pixel format (raw
     I420/NV12/YUYV, or MJPEG) at one size, as configured by the backend: the
-    VIDIOC_* ioctl surface, MMAP streaming buffers, read() I/O and poll
+    VIDIOC_* ioctl surface, MMAP streaming buffers, read() I/O, and poll
     readiness, so that unmodified consumers capture frames pushed from the
     browser without any kernel module or elevated privilege in the container.
 
@@ -106,7 +106,8 @@ typedef int ioctl_request_t;
 
 /* Default virtual device and its backing socket. The device index is
  * overridable with SELKIES_WEBCAM_DEVICE; the socket directory with
- * SELKIES_WEBCAM_SOCKET_PATH (basename kept), matching the backend. */
+ * SELKIES_WEBCAM_SOCKET_PATH (basename kept), else XDG_RUNTIME_DIR, else /tmp,
+ * matching the backend. */
 #define WC_DEFAULT_DEVICE_PATH "/dev/video0"
 #define WC_DEFAULT_SOCKET_PATH "/tmp/selkies_webcam0.sock"
 #define WC_VIDEO_MAJOR 81
@@ -237,7 +238,7 @@ typedef struct {
     uint32_t version;      /* WC_SHM_VERSION */
     uint32_t width;
     uint32_t height;
-    uint32_t fourcc;       /* V4L2 pixel format: YU12, NV12, YUYV or MJPG */
+    uint32_t fourcc;       /* V4L2 pixel format: YU12, NV12, YUYV, or MJPG */
     uint32_t fps_num;
     uint32_t fps_den;
     uint32_t n_slots;
@@ -285,7 +286,7 @@ typedef enum {
     WC_BUF_DONE = 2      /* filled, awaiting DQBUF (transient) */
 } wc_buf_state_t;
 
-/* One application open() handle: its own frame source, staging and buffers. The frame source is
+/* One application open() handle: its own frame source, staging, and buffers. The frame source is
  * either the backend's staging ring (fd = the connected control socket, staging_map set) or a
  * PipeWire stream (fd = our end of a doorbell socketpair, pw set); everything above the source
  * is shared. */
@@ -522,6 +523,8 @@ __attribute__((constructor)) static void swc_init_interposer(void) {
         }
     }
     const char *sock_dir = getenv("SELKIES_WEBCAM_SOCKET_PATH");
+    if (!sock_dir || !sock_dir[0])
+        sock_dir = getenv("XDG_RUNTIME_DIR");
     if (sock_dir && sock_dir[0]) {
         const char *slash = strrchr(g_socket_path, '/');
         const char *base = slash ? slash + 1 : g_socket_path;
@@ -1154,7 +1157,22 @@ static int connect_socket(wc_handle_t *out, int open_flags) {
         return -1;
     }
 
-    size_t staging_size = (size_t)cfg.data_offset + (size_t)cfg.n_slots * (size_t)cfg.slot_size;
+    /* The layout comes from the peer, so it is checked before the map: the slot records sit
+     * between the header and the frames, and the frames inside the memfd it sent, since a
+     * frame read past the memfd's end faults the application. */
+    uint64_t ctrl_end = (uint64_t)cfg.ctrl_offset + (uint64_t)cfg.n_slots * cfg.ctrl_stride;
+    uint64_t staging_end = (uint64_t)cfg.data_offset + (uint64_t)cfg.n_slots * cfg.slot_size;
+    struct stat st;
+    if (cfg.ctrl_offset < sizeof(wc_shm_header_t) || cfg.ctrl_stride < sizeof(wc_shm_ctrl_t) ||
+        ctrl_end > cfg.data_offset || staging_end > SIZE_MAX ||
+        real_fstat(staging_fd, &st) != 0 || (uint64_t)st.st_size < staging_end) {
+        swc_log_error("staging layout outside its memfd: slots %u x %u at %u, frames %u x %u at %u",
+                      cfg.n_slots, cfg.ctrl_stride, cfg.ctrl_offset, cfg.n_slots, cfg.slot_size, cfg.data_offset);
+        real_close(staging_fd);
+        real_close(sockfd);
+        return -1;
+    }
+    size_t staging_size = (size_t)staging_end;
     void *map = real_mmap(NULL, staging_size, PROT_READ, MAP_SHARED, staging_fd, 0);
     real_close(staging_fd);
     if (map == MAP_FAILED) {
@@ -1187,7 +1205,7 @@ static size_t round_up_page(size_t n);
  * publishes one; any other producer works too) can stand in for the backend's staging ring. The
  * application fd is our end of a socketpair: the PipeWire data thread copies each
  * frame into the handle's latest-frame buffer and writes one byte, so poll(),
- * DQBUF and read() behave exactly as with the ring. libpipewire is loaded at run
+ * DQBUF, and read() behave exactly as with the ring. libpipewire is loaded at run
  * time on the first device open, never at library load: this library is preloaded
  * into every process of an application, and initializing PipeWire during early
  * process startup is what hangs some of them. Built only when the PipeWire

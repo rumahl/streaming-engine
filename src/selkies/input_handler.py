@@ -28,7 +28,7 @@ rung rather than latching into a fallback:
 - Wayland keyboard: the compositor seat keymap (`_WaylandKeymapOwner`), then
   the in-process zwp_virtual_keyboard client, then a data-control clipboard
   paste. The Wayland path is subprocess-free by design; never reintroduce
-  wtype, wl-copy or similar forks where the in-process pixelflux harness
+  wtype, wl-copy, or similar forks where the in-process pixelflux harness
   exists.
 - X11 keyboard: in-process XTEST (`_XTestKeyboard`, with a dynamic
   spare-keycode overlay for unmapped keysyms and an XKB group lock for
@@ -50,10 +50,11 @@ client cannot inject input a controller did not grant: a read-only viewer
 peer (shared/#player co-op) may send only `VIEWER_ALLOWED_PREFIXES`; a viewer
 holding the active mk token while `enable_collab` is on (a read-write
 collaborator) may additionally send `VIEWER_COLLAB_EXTRA_PREFIXES` — the
-keyboard, mouse and clipboard set, including `co,` because IME commits and
+keyboard, mouse, and clipboard set, including `co,` because IME commits and
 atomic typing arrive that way. `cmd` and every settings-mutating message stay
-controller-only. Blur/visibility lifecycle noise (`VIEWER_SILENT_DROP_PREFIXES`)
-from a read-only viewer is normal operation and is dropped without a warning.
+controller-only. Blur/visibility lifecycle noise and a trackpad page's
+pointer echo request (`VIEWER_SILENT_DROP_PREFIXES`) from a read-only viewer
+are normal operation and are dropped without a warning.
 A `js,` message names its own gamepad index, so `gamepad_slot_denied` decides
 separately whether its sender holds that slot.
 
@@ -63,10 +64,12 @@ stalls behind a slow display server.
 """
 
 import ctypes
+import errno
 import fcntl
 from collections import deque
 import functools
 import logging
+import math
 import select
 import struct
 import threading
@@ -80,9 +83,10 @@ import base64
 import io
 import re
 import json
+from html.parser import HTMLParser
 import aiofiles
 import msgpack
-from PIL import Image
+from PIL import Image, ImageOps
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Container, Dict, Iterable, List, Optional, Tuple, Union
@@ -93,7 +97,8 @@ from .display_utils import (
     wayland_output_id,
 )
 from .settings import RateControlMode
-from .settings import settings
+from .settings import sanitize_client_setting, settings
+from .sessions import token_slots
 from . import audit
 try:
     from pixelflux import VirtualKeyboardUnavailable as PixelfluxVkUnavailable
@@ -168,24 +173,28 @@ VIEWER_COLLAB_EXTRA_PREFIXES = (
     "co,",
     "cws", "cbs", "cwd", "cbd", "cwe", "cbe", "cw", "cb", "cr",
     "REQUEST_CLIPBOARD",
+    "_pointer_echo,",
+    "sf",
 )
-VIEWER_SILENT_DROP_PREFIXES = ("kr", "cr")
+VIEWER_SILENT_DROP_PREFIXES = ("kr", "cr", "_pointer_echo")
 
 
-def gamepad_slot_denied(msg: str, role: Optional[str], slot: Optional[int],
+def gamepad_slot_denied(msg: str, role: Optional[str], slot: Union[int, List[int], None],
                         is_secure: bool) -> bool:
     """Whether a `js,` message drives a gamepad slot its sender does not hold.
 
     The index is a field of the client's own message, so the connection decides
-    which one it may name: a slot holder drives index `slot - 1` alone, and a
-    viewer without one drives none. A legacy controller is left unrestricted,
-    since it already holds keyboard and mouse: pinning it to index 0 would buy
-    no guarantee while breaking a client presenting several local pads.
+    which ones it may name: a slot holder drives the index of each slot it
+    holds (`slot - 1`), and a viewer without one drives none. A legacy
+    controller is left unrestricted, since it already holds keyboard and mouse:
+    pinning it to index 0 would buy no guarantee while breaking a client
+    presenting several local pads.
 
     Args:
         msg: Raw client message; anything but `js,` is not this gate's business.
         role: The connection's role, "controller" or "viewer".
-        slot: One-based player slot the connection holds, None when it holds none.
+        slot: One-based player slot the connection holds, or a list of them
+            (`sessions.token_slots`), None when it holds none.
         is_secure: Whether a master token is set.
 
     Returns:
@@ -199,7 +208,7 @@ def gamepad_slot_denied(msg: str, role: Optional[str], slot: Optional[int],
         index = int(msg.split(",", 3)[2])
     except (IndexError, ValueError):
         return True
-    return int(slot) - 1 != index
+    return index + 1 not in token_slots(slot)
 
 
 class _WaylandKeymapOwner:
@@ -215,18 +224,22 @@ class _WaylandKeymapOwner:
     Overlay keycodes are chosen from the live keymap (`_build_map`), not a
     fixed range: an X11 keycode is a byte, so a bind above 255 reaches Wayland
     apps only and XWayland clients never see it. The sub-256 range is nearly
-    full on a pc105 keymap, so unbound keycodes are taken first, then keycodes
-    carrying only XF86 vendor keysyms (media/browser keys a streamed session
-    does not need); everything else down there is load bearing (modifiers,
-    F-keys, punctuation, Print) and never touched. An overflow band past the
-    ceiling keeps a layout with no room working for Wayland clients instead
-    of failing outright.
+    full on a pc105 keymap, so only unbound keycodes and keycodes carrying
+    only XF86 vendor keysyms (media/browser keys a streamed session does not
+    need) are taken; everything else down there is load bearing (modifiers,
+    F-keys, punctuation, Print) and never touched. Of those, the text spares
+    (`_TEXT_SPARES`) come first and are recycled before any other is taken,
+    and `type_text` types a longer run in chunks that fit them. An overflow
+    band past the ceiling keeps a layout with no room working for Wayland
+    clients instead of failing outright.
 
     Attributes:
         _map: Keysym to (keycode, level) in the base keymap.
         _overlay: Keysym to overlay keycode.
         _overlay_order: Overlay keysyms in bind order, for round-robin recycling.
-        _overlay_codes: Overlay keycode pool in preference order.
+        _overlay_codes: Overlay keycode pool in preference order, the text
+            spares first.
+        _text_codes: How many of `_overlay_codes` are text spares.
         _pressed: Held keysym to (keycode, synthesized modifier keycodes).
         _mod_refs: Synthesized modifier keycode to holder count.
         _down: Every keycode currently injected down; the one live view that
@@ -237,6 +250,13 @@ class _WaylandKeymapOwner:
     _SUB256_CEILING = 256
     _OVERFLOW_BASE_KEYCODE = 257
     _OVERFLOW_SLOTS = 64
+    # Spare keycodes every client types a character on: F13 to F24, then the JIS
+    # IntlRo and IntlYen keys. A Wayland client may read a key's code as the
+    # physical key it names before the keysym the keymap gives, and Chromium
+    # drops a code naming no key it knows and runs its browser, media, and
+    # launcher keys as commands, so a character on another spare reaches every
+    # client but Chromium.
+    _TEXT_SPARES = (*range(191, 203), 97, 132)
 
     def __init__(self, wayland_input: Any, base_keymap_text: str) -> None:
         if libxkb is None:
@@ -293,7 +313,10 @@ class _WaylandKeymapOwner:
                             unbound.append(kc)
                         elif seen == spare:
                             shadowable.append(kc)
-                self._overlay_codes = unbound + shadowable + list(range(
+                spares = unbound + shadowable
+                text = [kc for kc in self._TEXT_SPARES if kc in spares]
+                self._text_codes = len(text)
+                self._overlay_codes = text + [kc for kc in spares if kc not in text] + list(range(
                     self._OVERFLOW_BASE_KEYCODE,
                     self._OVERFLOW_BASE_KEYCODE + self._OVERFLOW_SLOTS))
             finally:
@@ -394,32 +417,44 @@ class _WaylandKeymapOwner:
 
         A swap costs milliseconds on the compositor thread (which also drives
         input and rendering), so binding a burst one at a time would stall it
-        proportionally. A full pool recycles the oldest slot not held down:
-        rebinding a pressed keycode would make its release report a different
-        symbol than its press did. The swap rides the same command channel as
-        the key events and never awaits a reply, so it drains before the keys
-        that need it while this loop is never blocked on the compositor;
-        `set_keymap_overlay` hands over just the binds, the `set_keymap_string`
-        fallback re-sends the whole keymap text (a redundant compile far side).
+        proportionally. Once the text spares are bound, the oldest bind on one
+        not held down is recycled before any other keycode is taken, and a full
+        pool recycles the oldest slot not held down: rebinding a pressed keycode
+        would make its release report a different symbol than its press did.
+        The swap rides the same command channel as the key events and never
+        awaits a reply, so it drains before the keys that need it while this
+        loop is never blocked on the compositor; `set_keymap_overlay` hands
+        over just the binds, the `set_keymap_string` fallback re-sends the
+        whole keymap text (a redundant compile far side).
 
         Returns:
             `{keysym: keycode}` for every requested keysym; a keysym that could
             not be bound (every slot held down) maps to 0.
         """
+        keysyms = list(dict.fromkeys(keysyms))
+        # The batch's own binds are as untouchable as a held key: one swap binds
+        # them all, so a recycled one would type the other keysym.
         held = {kc for kc, _ in self._pressed.values()}
+        held.update(self._overlay[k] for k in keysyms if k in self._overlay)
         out = {}
         fresh = False
-        for keysym in dict.fromkeys(keysyms):
+        for keysym in keysyms:
             kc = self._overlay.get(keysym)
             if kc is None:
-                if len(self._overlay) >= len(self._overlay_codes):
-                    victim = next(
-                        (s for s in self._overlay_order if self._overlay[s] not in held),
-                        None,
-                    )
-                    if victim is None:
-                        out[keysym] = 0
-                        continue
+                victim = None
+                if len(self._overlay) >= self._text_codes:
+                    text = self._overlay_codes[:self._text_codes]
+                    victim = next((s for s in self._overlay_order
+                                   if self._overlay[s] in text and self._overlay[s] not in held), None)
+                    if victim is None and len(self._overlay) >= len(self._overlay_codes):
+                        victim = next(
+                            (s for s in self._overlay_order if self._overlay[s] not in held),
+                            None,
+                        )
+                        if victim is None:
+                            out[keysym] = 0
+                            continue
+                if victim is not None:
                     self._overlay_order.remove(victim)
                     kc = self._overlay.pop(victim)
                 else:
@@ -487,11 +522,14 @@ class _WaylandKeymapOwner:
             self._input.inject_key(kc, state)
 
     def type_text(self, text: str, neutralize: bool = False) -> bool:
-        """Type text as momentary taps with at most ONE keymap swap.
+        """Type text as momentary taps, with one keymap swap per run.
 
-        Every missing keysym resolves in a single swap (no per-char swap storm).
-        Each char prefers its canonical layout keysym (a ru layout types ф on
-        its own key) before falling to the overlay.
+        Every missing keysym of a run resolves in a single swap (no per-char
+        swap storm). A run holds as many missing keysyms as there are text
+        spares not held down, so a longer text goes out in runs that fit them,
+        each swap riding the channel behind the taps before it. Each char
+        prefers its canonical layout keysym (a ru layout types ф on its own
+        key) before falling to the overlay.
 
         Args:
             text: Characters to tap out in order.
@@ -499,8 +537,9 @@ class _WaylandKeymapOwner:
                 so the taps land on their resolved levels.
 
         Returns:
-            False, having typed nothing, when a char cannot be bound at all;
-            True once the full run is injected.
+            False, having typed nothing, when a char cannot be bound at all
+            (every overlay keycode is held down, which only the first run can
+            meet); True once the full text is injected.
         """
         keysyms = []
         for ch in text:
@@ -510,27 +549,43 @@ class _WaylandKeymapOwner:
                 if ks is None:
                     continue
             keysyms.append(ks)
-        missing = [ks for ks in dict.fromkeys(keysyms) if ks not in self._map]
-        overlay = self._overlay_bind_many(missing) if missing else {}
-        # Resolve everything before touching state: the False path must have
-        # typed nothing and charged no modifier refs.
-        resolved_keys = []
+        held = {kc for kc, _ in self._pressed.values()}
+        room = sum(kc not in held for kc in self._overlay_codes[:self._text_codes])
+        runs = [([], {})]
         for ks in keysyms:
-            resolved = self._map.get(ks)
-            if resolved is None and overlay.get(ks):
-                resolved = (overlay[ks], 0)
-            if resolved is None:
-                return False
-            resolved_keys.append(resolved)
-        # Lift conflicts before building the taps so _down reflects the lift and
-        # a shifted char inside the run synthesizes its Shift normally.
-        lifted = self._held_conflicts(()) if neutralize else []
-        for kc in lifted:
-            self._inject(kc, 0)
-        events = []
-        for kc, level in resolved_keys:
-            self._tap(kc, self._mods_for_level(level), into=events)
-        self._inject_run(events + [(kc, 1) for kc in reversed(lifted)])
+            run, missing = runs[-1]
+            if ks not in self._map and ks not in missing:
+                if room and len(missing) >= room:
+                    run, missing = [], {}
+                    runs.append((run, missing))
+                missing[ks] = None
+            run.append(ks)
+        lifted = []
+        for i, (run, missing) in enumerate(runs):
+            overlay = self._overlay_bind_many(missing) if missing else {}
+            # Resolve the run before touching state: the False path must have
+            # typed nothing and charged no modifier refs.
+            resolved_keys = []
+            for ks in run:
+                resolved = self._map.get(ks)
+                if resolved is None and overlay.get(ks):
+                    resolved = (overlay[ks], 0)
+                if resolved is None:
+                    return False
+                resolved_keys.append(resolved)
+            if not i and neutralize:
+                # Lift conflicts before building the taps so _down reflects the
+                # lift and a shifted char inside the run synthesizes its Shift
+                # normally.
+                lifted = self._held_conflicts(())
+                for kc in lifted:
+                    self._inject(kc, 0)
+            events = []
+            for kc, level in resolved_keys:
+                self._tap(kc, self._mods_for_level(level), into=events)
+            if i == len(runs) - 1:
+                events += [(kc, 1) for kc in reversed(lifted)]
+            self._inject_run(events)
         return True
 
     def press(self, keysym: int, neutralize: bool = False) -> None:
@@ -666,7 +721,9 @@ class _X11ClipboardMonitor:
     a text/uri-list of file:// URIs rather than image bytes and is resolved
     locally, as the xclip path resolves it. Content written from the browser
     is offered on PRIMARY as well as CLIPBOARD, mirroring the middle-click
-    paste the Wayland compositor provides natively.
+    paste the Wayland compositor provides natively. A copy whose owner offers a
+    password manager's hint reads as its text alone, marked `SecretText`, and
+    such text is offered with the hint again.
 
     The Display is opened with a bounded reply wait: the monitor is (re)built
     from the event loop, sometimes while the server is disrupted — exactly
@@ -772,6 +829,7 @@ class _X11ClipboardMonitor:
         self._text_targets = [(self._d.get_atom(t), t) for t in (
             'UTF8_STRING', 'text/plain;charset=utf-8', 'STRING')]
         self._uri_list_atom = self._d.get_atom('text/uri-list')
+        self._secret_hint_atoms = [self._d.get_atom(m) for m in CLIPBOARD_SECRET_HINTS]
         self._d.xfixes_select_selection_input(
             self._win, self._clipboard,
             xfixes.XFixesSetSelectionOwnerNotifyMask
@@ -957,7 +1015,7 @@ class _X11ClipboardMonitor:
 
         Under INCR each property delete requests the next chunk and a
         zero-length chunk ends the transfer. Only that ends it successfully: a
-        transfer cut short by the idle bound, the overall bound or the size cap
+        transfer cut short by the idle bound, the overall bound, or the size cap
         is discarded, since half an image handed on as content is worse than a
         read that failed. Events are awaited with the remaining deadline so a
         stalled owner cannot wedge the event thread inside a blocking
@@ -1080,14 +1138,16 @@ class _X11ClipboardMonitor:
 
     def read(self, use_binary: bool) -> tuple:
         """Blocking read (call via executor): (data, mime) like read_clipboard —
-        text as str with mime 'text/plain', markup with the text beneath it as
-        one envelope under CLIPBOARD_FLAVOURS_MIME, images as bytes with their
-        mime.
+        text as str with mime 'text/plain' (`SecretText` for a copy marked
+        secret), markup with the text beneath it as one envelope under
+        CLIPBOARD_FLAVOURS_MIME, images as bytes with their mime.
 
         Images come first where the caller takes them, since a copied picture
         offers markup of its own (an `img` tag pointing back at a page) that is
-        worth less than the picture; a text selection carries no image target,
-        so its markup wins over the plain text beneath it.
+        worth less than the picture, unless that markup carries text
+        (`clipboard_markup_has_text`): an office application's text selection
+        offers a picture of itself beside it. Markup wins over the plain text
+        beneath it.
         """
         reply = self._convert_and_wait(self._targets)
         if not reply or reply[1] != 32:
@@ -1098,7 +1158,17 @@ class _X11ClipboardMonitor:
             if not reply or reply[1] != 32:
                 return None, None
         offered = set(reply[0])
-        if use_binary:
+        hint = next((atom for atom in self._secret_hint_atoms if atom in offered), None)
+        if hint is not None:
+            got = self._convert_and_wait(hint)
+            if got is not None and got[1] == 8 and clipboard_secret_hint(got[0]):
+                return self._read_secret(offered)
+        html = None
+        if self._html_atom in offered:
+            got = self._convert_and_wait(self._html_atom)
+            if got is not None and got[0]:
+                html = bytes(got[0])
+        if use_binary and not (html and clipboard_markup_has_text(html)):
             for atom, mime in self._image_targets:
                 if atom in offered:
                     got = self._convert_and_wait(atom)
@@ -1110,25 +1180,33 @@ class _X11ClipboardMonitor:
                     resolved = self._resolve_uri_list_image(bytes(got[0]))
                     if resolved is not None:
                         return resolved
-        if self._html_atom in offered:
-            got = self._convert_and_wait(self._html_atom)
-            if got is not None and got[0]:
-                html = bytes(got[0])
-                plain = b''
-                for atom, _name in self._text_targets:
-                    if atom in offered:
-                        beside = self._convert_and_wait(atom)
-                        if beside is not None and beside[0]:
-                            plain = bytes(beside[0])
-                            break
-                entries = [("text/html", html)] + ([("text/plain", plain)] if plain else [])
-                return clipboard_envelope(entries), CLIPBOARD_FLAVOURS_MIME
+        if html:
+            plain = b''
+            for atom, _name in self._text_targets:
+                if atom in offered:
+                    beside = self._convert_and_wait(atom)
+                    if beside is not None and beside[0]:
+                        plain = bytes(beside[0])
+                        break
+            entries = [("text/html", html)] + ([("text/plain", plain)] if plain else [])
+            return clipboard_envelope(entries), CLIPBOARD_FLAVOURS_MIME
         for atom, _name in self._text_targets:
             if atom in offered:
                 got = self._convert_and_wait(atom)
                 if got is not None and got[0] is not None:
                     return bytes(got[0]).decode('utf-8', errors='replace'), 'text/plain'
         return None, None
+
+    def _read_secret(self, offered: set) -> tuple:
+        """The text of a copy its owner marked secret, as `SecretText`; empty
+        when it offers no text, and (None, None) when the text cannot be read."""
+        atom = next((a for a, _name in self._text_targets if a in offered), None)
+        if atom is None:
+            return SecretText(''), 'text/plain'
+        got = self._convert_and_wait(atom)
+        if got is None or got[0] is None:
+            return None, None
+        return SecretText(bytes(got[0]).decode('utf-8', errors='replace')), 'text/plain'
 
     def _resolve_uri_list_image(self, data_bytes: bytes) -> Optional[tuple]:
         """Resolve a text/uri-list (file-manager copy) to (image_bytes, mime): the
@@ -1170,6 +1248,7 @@ class _X11ClipboardMonitor:
         text. Returns True when ownership was acquired."""
         offerable = dict((m, a) for a, m in self._image_targets)
         offerable['text/html'] = self._html_atom
+        offerable.update(zip(CLIPBOARD_SECRET_HINTS, self._secret_hint_atoms))
         offers: list = []
         for mime_type, data in entries:
             if not data:
@@ -1291,6 +1370,15 @@ class _XTestKeyboard:
     # its previous symbol -- NoSymbol on a spare, which drops the key outright.
     # A Chrome whose main thread is starved of its core needs ~25 ms.
     _BIND_SETTLE_S = 0.025
+    # Spares taken first, as on Wayland. Chromium reads an X keycode as the evdev
+    # key it numbers, whatever key the server's own keycodes put there, and runs
+    # the arrows, Delete, Copy or Undo it names as commands. On evdev keycodes a
+    # spare is a key the layout leaves out, so the whole pool serves; on others
+    # (an Xorg on xfree86 keycodes leaves those numbers unbound) the text spares
+    # are recycled before any other is taken.
+    _TEXT_SPARES = _WaylandKeymapOwner._TEXT_SPARES
+    # XK_Left at evdev's keycode for it, which tells the server's keycodes apart.
+    _EVDEV_LEFT = (0xFF51, 113)
     # A group lock outlives the last key that needed it by this long: one switch
     # per run of keystrokes, and the desktop's layout indicator stays put.
     _GROUP_LINGER_S = 0.5
@@ -1308,6 +1396,7 @@ class _XTestKeyboard:
         self._synth_mods = {}
         self._spare_keycodes = None
         self._spare_set = frozenset()
+        self._text_codes = 0
         self._overlay = {}
         self._overlay_value_kc = {}
         self._settle_until = 0.0
@@ -1326,7 +1415,9 @@ class _XTestKeyboard:
         never spare: pressing one would toggle its modifier under the typed
         char. The full range is scanned (not a fixed cap): more slots make
         recycling — the only case where a slow app can mistranslate a rebound
-        keycode — rare.
+        keycode — rare. The text spares (`_TEXT_SPARES`) lead the pool, and on
+        keycodes other than evdev's they are all a bind recycles before it takes
+        another (`_text_codes`).
         """
         info = self._d.display.info
         lo, hi = info.min_keycode, info.max_keycode
@@ -1350,7 +1441,10 @@ class _XTestKeyboard:
                     # An overlay bind, this handler's or a previous one's.
                     spares.append(kc)
         self._spare_set = frozenset(spares)
-        return spares
+        text = [kc for kc in self._TEXT_SPARES if kc in self._spare_set]
+        keysym, evdev_kc = self._EVDEV_LEFT
+        self._text_codes = 0 if self._d.keysym_to_keycode(keysym) == evdev_kc else len(text)
+        return text + [kc for kc in spares if kc not in text]
 
     def _free_spares(self) -> list:
         """Spare keycodes not currently bound, in pool order."""
@@ -1396,29 +1490,51 @@ class _XTestKeyboard:
         except Exception:
             pass
 
-    def _recycle_index(self) -> int:
+    def _recycle_index(self, keep: Iterable[int] = ()) -> int:
         """Index into _overlay_order of the oldest binding whose keycode is
         not physically down: rebound while held, a keycode's eventual release
-        would be read under the new symbol and leave the old one stuck."""
+        would be read under the new symbol and leave the old one stuck. The
+        bindings of `keep`, keysyms about to be typed, are passed over too."""
         held = set(self._pressed_kc.values())
+        held.update(self._overlay[k] for k in keep if k in self._overlay)
         for i, ks in enumerate(self._overlay_order):
             if self._overlay[ks] not in held:
                 return i
         return 0
 
-    def _alloc_overlay_keycode(self, keysym: int) -> int:
+    def text_room(self) -> int:
+        """How many text spares are not physically down: how many keysyms a run
+        can bind on them at once; 0 where binds are not kept to them."""
+        if self._spare_keycodes is None:
+            self._spare_keycodes = self._find_spare_keycodes()
+        held = set(self._pressed_kc.values())
+        return sum(kc not in held for kc in self._spare_keycodes[:self._text_codes])
+
+    def _alloc_overlay_keycode(self, keysym: int, keep: Iterable[int] = ()) -> int:
         """Reserve a spare keycode for keysym and record the binding.
 
-        Recycles the oldest binding when the pool is full. The mapping request
-        itself is the caller's (single vs batched).
+        A free text spare comes first. Once every text spare is bound, the
+        oldest bind on one that is not down, nor one of `keep`, is recycled
+        before any other keycode is taken; then a free spare, then the oldest
+        binding anywhere. The mapping request itself is the caller's (single
+        vs batched).
         """
         free = self._free_spares()
-        if free:
+        text = self._spare_keycodes[:self._text_codes]
+        held = set(self._pressed_kc.values())
+        held.update(self._overlay[k] for k in keep if k in self._overlay)
+        victim = None
+        if not (free and (free[0] in text or not text)):
+            victim = next((ks for ks in self._overlay_order
+                           if self._overlay[ks] in text and self._overlay[ks] not in held), None)
+            if victim is None and not free:
+                victim = self._overlay_order[self._recycle_index(keep)]
+        if victim is None:
             kc = free[0]
         else:
-            oldest = self._overlay_order.pop(self._recycle_index())
-            kc = self._overlay.pop(oldest)
-            self._overlay_value_kc.pop(overlay_bind_keysym(oldest), None)
+            self._overlay_order.remove(victim)
+            kc = self._overlay.pop(victim)
+            self._overlay_value_kc.pop(overlay_bind_keysym(victim), None)
         self._overlay[keysym] = kc
         self._overlay_value_kc[overlay_bind_keysym(keysym)] = kc
         self._overlay_order.append(keysym)
@@ -1455,8 +1571,9 @@ class _XTestKeyboard:
 
         One ChangeKeyboardMapping per contiguous spare-keycode run, one sync —
         so a CJK composition commit broadcasts O(1) MappingNotify events
-        instead of one per new char; the longest free runs are taken first to
-        keep that count down.
+        instead of one per new char. The keycodes come as a single bind takes
+        them (`_alloc_overlay_keycode`), the text spares first, and never one a
+        keysym of the batch is bound to.
 
         Returns:
             False (nothing bound) when more new keysyms than slots exist, since
@@ -1465,42 +1582,15 @@ class _XTestKeyboard:
             typing. True otherwise.
         """
         d = self._d
-        missing = []
-        for ks in dict.fromkeys(keysyms):
-            if ks not in self._overlay and not self._layout_keycode(ks):
-                missing.append(ks)
+        batch = list(dict.fromkeys(keysyms))
+        missing = [ks for ks in batch if ks not in self._overlay and not self._layout_keycode(ks)]
         if not missing:
             return True
         if self._spare_keycodes is None:
             self._spare_keycodes = self._find_spare_keycodes()
         if len(missing) > len(self._spare_keycodes):
             return False
-        free = self._free_spares()
-        runs = []
-        i = 0
-        while i < len(free):
-            j = i
-            while j + 1 < len(free) and free[j + 1] == free[j] + 1:
-                j += 1
-            runs.append(free[i:j + 1])
-            i = j + 1
-        runs.sort(key=len, reverse=True)
-        picked = []
-        for run in runs:
-            if len(picked) >= len(missing):
-                break
-            picked.extend(run[:len(missing) - len(picked)])
-        while len(picked) < len(missing):
-            oldest = self._overlay_order.pop(self._recycle_index())
-            picked.append(self._overlay.pop(oldest))
-            self._overlay_value_kc.pop(overlay_bind_keysym(oldest), None)
-        assigns = []
-        for ks, kc in zip(missing, picked):
-            self._overlay[ks] = kc
-            self._overlay_value_kc[overlay_bind_keysym(ks)] = kc
-            self._overlay_order.append(ks)
-            assigns.append((kc, ks))
-        assigns.sort()
+        assigns = sorted((self._alloc_overlay_keycode(ks, keep=batch), ks) for ks in missing)
         i = 0
         while i < len(assigns):
             j = i
@@ -1560,7 +1650,7 @@ class _XTestKeyboard:
     def invalidate_mapping(self) -> None:
         """A foreign keymap change (setxkbmap, desktop layout switcher) wiped
         our overlay bindings and may have moved modifier keycodes: drop the
-        overlay bookkeeping, rediscover spares lazily and re-resolve the
+        overlay bookkeeping, rediscover spares lazily, and re-resolve the
         modifier keycodes. Held keys are kept: release replays the exact
         press-time keycode."""
         self._overlay.clear()
@@ -1865,6 +1955,92 @@ class _XTestKeyboard:
             logger_webrtc_input.debug(f"group lock restore failed: {e}")
 
 
+class _PointerEcho:
+    """One trackpad page's pointer echo. The page draws the pointer at the last
+    echo it was sent, moved on by each delta it sent past the message that echo
+    includes and held inside that display after each, as the pointer is, so an
+    echo that would leave it drawn where it is goes unsent: where the page draws
+    it, with the deltas the position includes, is followed here and compared with
+    the position. On Wayland a message counts once the compositor has applied the
+    move numbered when it was injected (`pointer_location`); X11 applies a move
+    before the next request it reads."""
+
+    def __init__(self, seq: int) -> None:
+        self.seq = seq
+        self._sent: Optional[Tuple[str, float, float, float]] = None
+        self._x = 0.0
+        self._y = 0.0
+        self._pending: deque = deque()
+
+    def applied(self, motion: Optional[int], seq: int, dx: float, dy: float) -> None:
+        """One of the page's pointer messages applied, with its delta (zero for an
+        absolute position, which the page does not draw ahead of the echo) and the
+        number of the move it ended at, None on X11."""
+        if motion is None:
+            self._include(seq, dx, dy)
+        else:
+            self._pending.append((motion, seq, dx, dy))
+
+    def _include(self, seq: int, dx: float, dy: float) -> None:
+        self.seq = max(self.seq, seq)
+        if self._sent is not None:
+            _, scale, w, h = self._sent
+            self._x = min(max(self._x + dx * scale, 0.0), max(0.0, w - 1))
+            self._y = min(max(self._y + dy * scale, 0.0), max(0.0, h - 1))
+
+    def through(self, motion: Optional[int]) -> int:
+        """The last message the position of move number `motion` includes."""
+        if motion is not None:
+            while self._pending and self._pending[0][0] <= motion:
+                self._include(*self._pending.popleft()[1:])
+        return self.seq
+
+    def drawn_at(self, did: str, x: float, y: float) -> bool:
+        """Whether the page already draws the pointer at (x, y) on `did`."""
+        return (self._sent is not None and self._sent[0] == did
+                and abs(self._x - x) < 0.5 and abs(self._y - y) < 0.5)
+
+    def echoed(self, did: str, x: float, y: float, scale: float, w: float, h: float) -> None:
+        self._sent = (did, scale, w, h)
+        self._x = x
+        self._y = y
+
+
+class _XPointerReader:
+    """The X server's pointer, asked on a connection of its own from a worker
+    thread, so a display server slow to answer holds that thread and never the
+    event loop. The connection opens on first use and again after a failure."""
+
+    def __init__(self) -> None:
+        self._d: Any = None
+        self._lock = threading.Lock()
+
+    def read(self) -> Optional[Tuple[int, int]]:
+        """Blocking. The root position, or None when the server cannot be asked."""
+        with self._lock:
+            try:
+                if self._d is None:
+                    self._d = display.Display(blocking_timeout=INPUT_X_REPLY_TIMEOUT_S)
+                p = self._d.screen().root.query_pointer()
+                return p.root_x, p.root_y
+            except Exception as e:
+                logger_webrtc_input.debug(f"pointer position read failed: {e}")
+                self._close()
+                return None
+
+    def close(self) -> None:
+        with self._lock:
+            self._close()
+
+    def _close(self) -> None:
+        d, self._d = self._d, None
+        if d is not None:
+            try:
+                d.close()
+            except Exception:
+                pass
+
+
 class _XTestMouse:
     """Mouse controller backed by the bundled python-xlib XTEST extension."""
 
@@ -1879,10 +2055,10 @@ class _XTestMouse:
 
     @position.setter
     def position(self, xy: tuple) -> None:
+        """Queues a warp to (x, y); `send_x11_mouse` flushes once per pointer message."""
         x, y = xy
         xtest.fake_input(self._d, Xlib.X.MotionNotify, detail=False,
                          root=Xlib.X.NONE, x=int(x), y=int(y))
-        self._d.flush()
 
     def scroll(self, dx: int, dy: int) -> None:
         d = self._d
@@ -1945,6 +2121,125 @@ def clipboard_flavours(payload: bytes) -> List[Tuple[str, bytes]]:
         raise ValueError(f"no usable clipboard flavour in {sorted(decoded)}")
     return entries
 
+
+class _MarkupText(HTMLParser):
+    """Whether markup carries text a reader would see; see `clipboard_markup_has_text`."""
+
+    # Elements whose content is never shown as text.
+    _UNSHOWN = frozenset(("head", "style", "script", "title", "noscript", "template"))
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.unshown = 0
+        self.found = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._UNSHOWN:
+            self.unshown += 1
+
+    def handle_endtag(self, tag):
+        if tag in self._UNSHOWN and self.unshown:
+            self.unshown -= 1
+
+    def handle_data(self, data):
+        if not self.unshown and data.strip():
+            self.found = True
+
+
+def clipboard_markup_has_text(html: bytes) -> bool:
+    """Whether a copy's markup carries text, which makes the copy text.
+
+    An office application copying formatted text offers a picture of the
+    selection beside its markup (Word's bitmap, LibreOffice's PNG and BMP),
+    so that a paint program can take it, while a copied picture offers markup
+    of its own that is only an `img` tag pointing back at its page. So the
+    markup decides which the copy is: one with text to show is text, and its
+    picture is left out; one with none is a picture.
+
+    Args:
+        html: The `text/html` flavour.
+
+    Returns:
+        True when any of it outside the document head, styles and scripts is
+        text other than whitespace.
+    """
+    parser = _MarkupText()
+    try:
+        parser.feed(bytes(html).decode("utf-8", errors="replace"))
+        parser.close()
+    except Exception:
+        return False
+    return parser.found
+
+
+# The target a password manager offers beside a secret it copies, valued
+# `secret` (KeePassXC, KDE), in KDE's spelling and the prefixed ones a toolkit
+# that validates mime types can see.
+CLIPBOARD_SECRET_HINTS = ("x-kde-passwordManagerHint", "text/x-kde-passwordManagerHint",
+                          "application/x-kde-passwordManagerHint")
+
+
+class SecretText(str):
+    """Session clipboard text its owner marked secret (`CLIPBOARD_SECRET_HINTS`).
+
+    The mark rides with the text to the clients, which keep it out of sight and
+    take it back off the local clipboard as far as the browser lets them
+    (lib/clipboard-sync.js), and back onto the session's clipboard when this
+    server writes the text there again. The text alone is carried: markup or a
+    picture beside it would leave the secret where the mark cannot follow. An
+    empty one tells the clients that the session's clipboard no longer holds
+    the secret sent before it. Its repr shows neither the text nor its length,
+    so a log line that prints one with `%r`, or a container holding one, keeps
+    it out of sight as well; str(), formatting, and comparison stay a str's,
+    since every transport sends the text itself.
+    """
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "SecretText(<hidden>)" if self else "SecretText('')"
+
+
+def clipboard_secret_hint(value: Optional[bytes]) -> bool:
+    """Whether a hint target's value marks its copy secret."""
+    return bool(value) and bytes(value).strip(b"\0 \t\r\n") == b"secret"
+
+
+def clipboard_png_beside(mime_type: str, data: bytes) -> Optional[bytes]:
+    """A PNG of an image a client sent in another format, to offer beside it.
+
+    Chromium pastes no image type but PNG from either selection, and neither do
+    most other applications, while a picture uploaded from disk arrives as the
+    JPEG or WebP it was saved as. The pixels are decoded as the browser that
+    sent them showed them, EXIF orientation included; a format Pillow cannot
+    decode is offered only as it came.
+
+    Args:
+        mime_type: The payload's type.
+        data: The payload.
+
+    Returns:
+        The PNG, or None for anything but a decodable non-PNG image.
+    """
+    if not mime_type.startswith("image/") or mime_type == "image/png":
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            frame = ImageOps.exif_transpose(im)
+            if frame.mode not in ("1", "L", "LA", "I", "P", "RGB", "RGBA"):
+                frame = frame.convert("RGBA" if "A" in frame.getbands() else "RGB")
+            out = io.BytesIO()
+            # The fastest deflate: a clipboard copy is read once, nearby.
+            frame.save(out, "PNG", compress_level=1)
+            return out.getvalue()
+    except Exception as e:
+        logger_webrtc_input.debug(f"clipboard {mime_type} offered without a PNG beside it: {e}")
+        return None
+
+
+# How long a client's clipboard write waits for the PNG of an image sent in
+# another format: the client's later messages, its input among them, wait too.
+CLIPBOARD_PNG_WAIT_S = 0.25
+
 # Re-reads the outbound monitor gives one selection-change edge whose read came
 # back empty, before treating the selection as genuinely empty.
 _CLIPBOARD_REREAD_ATTEMPTS = 2
@@ -1959,29 +2254,35 @@ INPUT_X_REPLY_TIMEOUT_S = 20.0
 # input connection, so cursor and keymap changes still land promptly.
 INPUT_X_EVENT_POLL_S = 0.02
 
+# The largest finger scroll one `sf` message moves, in pixels each way.
+FINGER_SCROLL_MAX_PX = 4096.0
 
-def _is_within_directory(directory: str, target: str) -> bool:
-    """Return True if `target` is `directory` itself or strictly inside it.
+# A trackpad page draws the pointer where the server echoes it (`_pointer_echo`),
+# moved on by its own deltas, so an echo goes out where the pointer is not where
+# the page draws it, at most once per POINTER_ECHO_MIN_S. A resting pointer is read
+# again every POINTER_ECHO_POLL_S, for a move no page sent (an application's warp).
+POINTER_ECHO_MIN_S = 0.008
+POINTER_ECHO_POLL_S = 0.025
 
-    Compares on path-segment boundaries via os.path.commonpath rather than a
-    bare string prefix (which would accept sibling dirs sharing a name prefix).
-    Both paths should already be absolute/realpath-resolved by the caller.
-    """
-    directory = os.path.abspath(directory)
-    target = os.path.abspath(target)
-    try:
-        return os.path.commonpath([directory, target]) == directory
-    except ValueError:
-        # Paths on different drives or a mix of absolute/relative.
-        return False
 
-# Event, button and axis codes from linux/input-event-codes.h.
+# Event, button, and axis codes from linux/input-event-codes.h.
 EV_SYN = 0x00
 EV_KEY = 0x01
 EV_REL = 0x02
 EV_ABS = 0x03
 EV_MSC = 0x04
+EV_FF = 0x15
 SYN_REPORT = 0
+# The force-feedback types and bits a memless pad (xpad) reports: rumble, the
+# periodic waveforms it plays as rumble, and gain.
+FF_RUMBLE = 0x50
+FF_PERIODIC = 0x51
+FF_SQUARE = 0x58
+FF_TRIANGLE = 0x59
+FF_SINE = 0x5a
+FF_GAIN = 0x60
+FF_MEMLESS_BITS = (FF_RUMBLE, FF_PERIODIC, FF_SQUARE, FF_TRIANGLE, FF_SINE, FF_GAIN)
+FF_EFFECTS_MAX = 16
 
 BTN_MOUSE = 0x110
 BTN_LEFT = 0x110
@@ -2149,7 +2450,7 @@ def character_to_layout_keysym(char: str) -> int:
 def is_function_keysym(keysym: int) -> bool:
     """Whether a keysym names a key rather than a glyph.
 
-    The X function block (0xFF00 to 0xFFFF: navigation, editing, F-keys
+    The X function block (0xFF00 to 0xFFFF: navigation, editing, F-keys,
     and the keypad) and the XF86 vendor block carry no shifted glyph for a
     held Shift or AltGr to move onto, so a level modifier the client holds
     with one of them is the chord the user meant (Shift+Home selects to the
@@ -2164,7 +2465,7 @@ def overlay_bind_keysym(keysym: int) -> int:
 
     An overlay bind is a key we invent, not one a layout author chose, and the
     receiving toolkits' tables for legacy national/publishing keysyms disagree
-    across versions (permille, signifblank and the angle brackets die or
+    across versions (permille, signifblank, and the angle brackets die or
     mistranslate on a legacy bind) — while Latin-1 and Unicode-plane keysyms
     translate algorithmically everywhere. So any keysym that spells one
     character is bound in that universal form; charless keysyms (XF86, F-keys)
@@ -2494,6 +2795,20 @@ UINPUT_SETUP_FMT = "=HHHH80sI"
 UINPUT_ABS_SETUP_FMT = "=H2x6i"
 UINPUT_SYSNAME_LEN = 64
 
+# struct ff_effect: type, id, direction, trigger {button, interval}, replay
+# {length, delay}, then the effect union, aligned to the pointer in
+# ff_periodic_effect: 32 bytes on a 64-bit ABI, 28 on a 32-bit one.
+FF_EFFECT_HEAD_FMT = "=HhHHHHH2x"
+FF_EFFECT_SIZE = 16 + (32 if struct.calcsize("P") == 8 else 28)
+# struct uinput_ff_upload { __u32 request_id; __s32 retval; struct ff_effect effect, old; }
+UINPUT_FF_UPLOAD_SIZE = 8 + 2 * FF_EFFECT_SIZE
+# struct uinput_ff_erase { __u32 request_id; __s32 retval; __u32 effect_id; }
+UINPUT_FF_ERASE_FMT = "=IiI"
+# The uinput device's own events: an application uploaded or erased an effect.
+EV_UINPUT = 0x0101
+UI_FF_UPLOAD = 1
+UI_FF_ERASE = 2
+
 UI_DEV_CREATE = _uinput_ioc(0, 1, 0)
 UI_DEV_DESTROY = _uinput_ioc(0, 2, 0)
 UI_DEV_SETUP = _uinput_ioc(_IOC_WRITE, 3, struct.calcsize(UINPUT_SETUP_FMT))
@@ -2501,7 +2816,15 @@ UI_ABS_SETUP = _uinput_ioc(_IOC_WRITE, 4, struct.calcsize(UINPUT_ABS_SETUP_FMT))
 UI_SET_EVBIT = _uinput_ioc(_IOC_WRITE, 100, 4)
 UI_SET_KEYBIT = _uinput_ioc(_IOC_WRITE, 101, 4)
 UI_SET_ABSBIT = _uinput_ioc(_IOC_WRITE, 103, 4)
+UI_SET_FFBIT = _uinput_ioc(_IOC_WRITE, 107, 4)
+# _IOW('U', 108, char *): the argument is the string's address, which
+# fcntl.ioctl passes for a bytes argument.
+UI_SET_PHYS = _uinput_ioc(_IOC_WRITE, 108, struct.calcsize("P"))
 UI_GET_SYSNAME = _uinput_ioc(_IOC_READ, 44, UINPUT_SYSNAME_LEN)
+UI_BEGIN_FF_UPLOAD = _uinput_ioc(_IOC_READ | _IOC_WRITE, 200, UINPUT_FF_UPLOAD_SIZE)
+UI_END_FF_UPLOAD = _uinput_ioc(_IOC_WRITE, 201, UINPUT_FF_UPLOAD_SIZE)
+UI_BEGIN_FF_ERASE = _uinput_ioc(_IOC_READ | _IOC_WRITE, 202, struct.calcsize(UINPUT_FF_ERASE_FMT))
+UI_END_FF_ERASE = _uinput_ioc(_IOC_WRITE, 203, struct.calcsize(UINPUT_FF_ERASE_FMT))
 
 # (min, max, fuzz, flat, resolution) per axis, matching the interposer's
 # EVIOCGABS answer so an application cannot tell the two backends apart.
@@ -2512,6 +2835,21 @@ UINPUT_ABS_INFO = {
 }
 
 LOCAL_ARCH_BITS = 64 if struct.calcsize("P") == 8 else 32
+# struct input_event in this process's own ABI.
+LOCAL_EVDEV_EVENT_FMT = "=qqHHi" if LOCAL_ARCH_BITS == 64 else "=llHHi"
+
+# A force-feedback record: what an interposer handle writes to its socket and
+# UInputGamepad.service_ff returns (kind, reserved, effect id, strong, weak,
+# length ms, delay ms, repeat count or gain, reserved). The interposer's
+# sji_ff_record_t is the same 16 bytes.
+FF_RECORD_FMT = "=BBhHHHHHH"
+FF_RECORD_SIZE = struct.calcsize(FF_RECORD_FMT)
+FF_RECORD_PLAY = 1
+FF_RECORD_STOP = 2
+FF_RECORD_GAIN = 3
+# How long a rumble without its own end is played for at a time; it is renewed
+# at half this while it plays, so a client that stops hearing stops shaking.
+FF_LEASE_MS = 2000
 
 
 def uinput_writable() -> bool:
@@ -2561,18 +2899,39 @@ def uinput_gamepads_enabled(mode: Optional[str]) -> bool:
     return True
 
 
+def pad_phys(slot: int) -> str:
+    """The physical path a slot's pad reports, the interposer's EVIOCGPHYS
+    answer on either backend. With the virtual keyboard and pointer's
+    `selkies/virtinput/...`, it is what a host's udev rule keys on to keep
+    kernel devices a container registers off the host's own seat
+    (docs/components/input-interposer.md)."""
+    return f"virtual/input/selkies_ev{slot}/phys"
+
+
+def set_uinput_phys(fd: int, phys: str) -> None:
+    """Name a uinput device's physical path, before UI_DEV_CREATE."""
+    fcntl.ioctl(fd, UI_SET_PHYS, phys.encode("utf-8")[:1023] + b"\0")
+
+
 class UInputGamepad:
     """One slot's kernel gamepad, created through /dev/uinput.
 
     Applications discover it as an ordinary controller, so neither the Joystick
     Interposer nor fake-udev is involved. It carries the evdev event stream the
-    interposer socket carries, presented as the same Xbox pad.
+    interposer socket carries, presented as the same Xbox pad, force feedback
+    included: the kernel hands an application's effect uploads and erasures to
+    this device's owner to answer, and its plays arrive as EV_FF events
+    (`service_ff`). `phys` is the physical path it reports (pad_phys).
     """
 
-    def __init__(self, label: str) -> None:
+    def __init__(self, label: str, phys: str = "") -> None:
         self.label = label
+        self.phys = phys
         self.fd: Optional[int] = None
         self.device_nodes: list = []
+        # Effect id -> (strong, weak, length_ms, delay_ms), the magnitudes as
+        # the interposer resolves them (FF_RECORD_FMT).
+        self.effects: dict = {}
 
     def create(self) -> list:
         """Register the kernel device and return its /dev/input node paths.
@@ -2580,10 +2939,13 @@ class UInputGamepad:
         Raises:
             OSError: The uinput setup ioctls failed; the fd is closed first.
         """
-        fd = os.open(UINPUT_PATH, os.O_WRONLY | os.O_NONBLOCK)
+        fd = os.open(UINPUT_PATH, os.O_RDWR | os.O_NONBLOCK)
         try:
             fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
             fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
+            fcntl.ioctl(fd, UI_SET_EVBIT, EV_FF)
+            for code in FF_MEMLESS_BITS:
+                fcntl.ioctl(fd, UI_SET_FFBIT, code)
             for code in STANDARD_XPAD_CONFIG["btn_map"]:
                 fcntl.ioctl(fd, UI_SET_KEYBIT, code)
             for code in STANDARD_XPAD_CONFIG["axes_map"]:
@@ -2594,6 +2956,8 @@ class UInputGamepad:
                 fcntl.ioctl(fd, UI_ABS_SETUP, struct.pack(
                     UINPUT_ABS_SETUP_FMT, code, 0, minimum, maximum, fuzz, flat, resolution
                 ))
+            if self.phys:
+                set_uinput_phys(fd, self.phys)
             fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack(
                 UINPUT_SETUP_FMT,
                 BUS_USB,
@@ -2601,7 +2965,7 @@ class UInputGamepad:
                 STANDARD_XPAD_CONFIG["product_id"],
                 STANDARD_XPAD_CONFIG["version"],
                 STANDARD_XPAD_CONFIG["name"].encode("utf-8")[:UINPUT_MAX_NAME_SIZE - 1],
-                0,
+                FF_EFFECTS_MAX,
             ))
             fcntl.ioctl(fd, UI_DEV_CREATE)
         except OSError:
@@ -2635,6 +2999,74 @@ class UInputGamepad:
 
     def emit(self, ev_type: int, ev_code: int, ev_value: float) -> None:
         os.write(self.fd, get_evdev_events_packed(ev_type, ev_code, ev_value, LOCAL_ARCH_BITS))
+
+    def service_ff(self) -> list:
+        """Answer the effect uploads and erasures queued on the device, and
+        return what applications played, stopped, and set the gain to since,
+        as FF_RECORD_FMT tuples.
+
+        The kernel holds an application's EVIOCSFF or EVIOCRMFF until this
+        device's owner ends the request, so every one is answered as it is
+        read: a rumble effect keeps its two magnitudes and a periodic one
+        drives both at its own, scaled from 0x7fff to 0xffff, as a memless pad
+        plays them.
+        """
+        size = struct.calcsize(LOCAL_EVDEV_EVENT_FMT)
+        out = []
+        while self.fd is not None:
+            try:
+                data = os.read(self.fd, size * 64)
+            except (BlockingIOError, InterruptedError):
+                break
+            if not data:
+                break
+            for off in range(0, len(data) - size + 1, size):
+                _, _, etype, code, value = struct.unpack_from(LOCAL_EVDEV_EVENT_FMT, data, off)
+                if etype == EV_UINPUT and code == UI_FF_UPLOAD:
+                    self._answer_upload(value)
+                elif etype == EV_UINPUT and code == UI_FF_ERASE:
+                    effect_id = self._answer_erase(value)
+                    if effect_id is not None:
+                        out.append((FF_RECORD_STOP, 0, effect_id, 0, 0, 0, 0, 0, 0))
+                elif etype == EV_FF and code == FF_GAIN:
+                    out.append((FF_RECORD_GAIN, 0, 0, 0, 0, 0, 0, max(0, min(value, 0xffff)), 0))
+                elif etype == EV_FF and code in self.effects and value > 0:
+                    strong, weak, length, delay = self.effects[code]
+                    out.append((FF_RECORD_PLAY, 0, code, strong, weak, length, delay,
+                                min(value, 0xffff), 0))
+                elif etype == EV_FF and code in self.effects:
+                    out.append((FF_RECORD_STOP, 0, code, 0, 0, 0, 0, 0, 0))
+        return out
+
+    def _answer_upload(self, request_id: int) -> None:
+        """End one upload request: keep a rumble or periodic effect, refuse anything else."""
+        buf = bytearray(UINPUT_FF_UPLOAD_SIZE)
+        struct.pack_into("=Ii", buf, 0, request_id, 0)
+        fcntl.ioctl(self.fd, UI_BEGIN_FF_UPLOAD, buf, True)
+        etype, effect_id, _, _, _, length, delay = struct.unpack_from(FF_EFFECT_HEAD_FMT, buf, 8)
+        union = 8 + struct.calcsize(FF_EFFECT_HEAD_FMT)
+        retval = 0
+        if etype == FF_RUMBLE:
+            strong, weak = struct.unpack_from("=HH", buf, union)
+        elif etype == FF_PERIODIC:
+            magnitude = struct.unpack_from("=h", buf, union + 4)[0]
+            strong = weak = min(0xffff, abs(magnitude) * 2)
+        else:
+            retval = -errno.EINVAL
+        if retval == 0:
+            self.effects[effect_id] = (strong, weak, length, delay)
+        struct.pack_into("=i", buf, 4, retval)
+        fcntl.ioctl(self.fd, UI_END_FF_UPLOAD, buf)
+
+    def _answer_erase(self, request_id: int) -> Optional[int]:
+        """End one erase request; the id of the effect it forgets."""
+        buf = bytearray(struct.pack(UINPUT_FF_ERASE_FMT, request_id, 0, 0))
+        fcntl.ioctl(self.fd, UI_BEGIN_FF_ERASE, buf, True)
+        effect_id = struct.unpack(UINPUT_FF_ERASE_FMT, bytes(buf))[2]
+        known = self.effects.pop(effect_id, None) is not None
+        struct.pack_into("=i", buf, 4, 0)
+        fcntl.ioctl(self.fd, UI_END_FF_ERASE, buf)
+        return effect_id if known else None
 
     def destroy(self) -> None:
         if self.fd is None:
@@ -2716,13 +3148,16 @@ class VirtualInputDevice:
     Where /dev/uinput is writable the kernel serves the device, so every
     application finds it without a preload; otherwise the Input Interposer's
     dynamic pool does, and applications preloaded with it read the same evdev
-    stream from a socket beside the descriptor that carries the identity.
+    stream from a socket beside the descriptor that carries the identity. A
+    kernel device reports `phys` as its physical path (pad_phys).
     """
 
     def __init__(self, name: str, vendor: int, product: int,
                  evbits: Iterable[int], keybits: Iterable[int] = (),
-                 relbits: Iterable[int] = (), sock_dir: str = "/tmp") -> None:
+                 relbits: Iterable[int] = (), sock_dir: str = "/tmp",
+                 phys: str = "") -> None:
         self.name = name
+        self.phys = phys
         self.vendor, self.product = vendor, product
         self.evbits, self.keybits, self.relbits = list(evbits), list(keybits), list(relbits)
         self.sock_dir = sock_dir
@@ -2745,6 +3180,8 @@ class VirtualInputDevice:
                 fcntl.ioctl(fd, UI_SET_KEYBIT, code)
             for code in self.relbits:
                 fcntl.ioctl(fd, UI_SET_RELBIT, code)
+            if self.phys:
+                set_uinput_phys(fd, self.phys)
             fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack(
                 UINPUT_SETUP_FMT, BUS_VIRTUAL, self.vendor, self.product, 1,
                 self.name.encode("utf-8")[:UINPUT_MAX_NAME_SIZE - 1], 0))
@@ -2917,6 +3354,14 @@ class SelkiesGamepad:
         _js_state: Last queued js value per (ev_type, number), the source for
             init_state_burst; updated at queue time so the snapshot stays
             truthful even for events the bounded queue drops.
+        on_rumble: Called with the strong and weak motor levels (0 to 1) and
+            how long to hold them in ms whenever the mix of the effects
+            applications play on this pad changes, and again while an effect
+            without an end plays (`_ff_update`); the handler relays it to the
+            client driving the slot.
+        _ff_playing: `(source, effect id) -> [strong, weak, start, end]`, the
+            effects playing or waiting out their delay, in loop time; a source
+            is an interposer connection's writer or the kernel device.
     """
 
     def __init__(self, js_interposer_socket_path: str,
@@ -2944,6 +3389,13 @@ class SelkiesGamepad:
 
         self._held_controls = set()
         self._js_state = {}
+
+        self.on_rumble: Optional[Callable[[float, float, int], None]] = None
+        self._ff_playing: dict = {}
+        self._ff_gain = 0xffff
+        self._ff_timer: Optional[asyncio.TimerHandle] = None
+        self._ff_sent: Optional[tuple] = (0, 0)
+        self._ff_renew_at: Optional[float] = None
 
     def set_config(self, client_input_name: str, client_num_btns: int,
                    client_num_axes: int) -> None:
@@ -2982,7 +3434,9 @@ class SelkiesGamepad:
         killing input."""
         if not self.uinput_enabled or self.uinput is not None:
             return
-        device = UInputGamepad(os.path.basename(self.js_sock_path))
+        match = re.search(r"selkies_js(\d+)\.sock$", self.js_sock_path)
+        device = UInputGamepad(os.path.basename(self.js_sock_path),
+                               pad_phys(int(match.group(1)) if match else 0))
         try:
             nodes = device.create()
         except OSError as e:
@@ -2993,6 +3447,14 @@ class SelkiesGamepad:
             )
             return
         self.uinput = device
+        try:
+            self.loop.add_reader(device.fd, self._service_uinput_ff)
+        except (OSError, ValueError) as e:
+            # Only an emulated /dev/uinput (tests/tools/uinput_shim.c) is a
+            # file the loop cannot watch; a kernel device always can be.
+            logger_selkies_gamepad.warning(
+                f"Gamepad {self.js_sock_path}: force feedback requests cannot be watched ({e})."
+            )
         logger_selkies_gamepad.info(
             f"Gamepad {self.js_sock_path}: kernel device ready ({', '.join(nodes) or 'node path unknown'})."
         )
@@ -3014,9 +3476,116 @@ class SelkiesGamepad:
             logger_selkies_gamepad.error(
                 f"Gamepad {self.js_sock_path}: kernel device write failed ({e}); tearing it down."
             )
-            self.uinput.destroy()
-            self.uinput = None
+            self._drop_uinput()
             self.uinput_enabled = False
+
+    def _drop_uinput(self) -> None:
+        """Destroy the kernel device, and forget the effects applications played on it."""
+        if self.uinput is None:
+            return
+        if self.uinput.fd is not None:
+            self.loop.remove_reader(self.uinput.fd)
+        self.uinput.destroy()
+        self.uinput = None
+        self.ff_forget("uinput")
+
+    def _service_uinput_ff(self) -> None:
+        """Answer the kernel device's queued effect requests and mix what they played."""
+        if self.uinput is None:
+            return
+        try:
+            records = self.uinput.service_ff()
+        except OSError as e:
+            logger_selkies_gamepad.warning(f"Gamepad {self.js_sock_path}: force feedback request failed: {e}")
+            return
+        for record in records:
+            self.ff_record("uinput", record)
+
+    def ff_record(self, source: Any, record: tuple) -> None:
+        """Apply one FF_RECORD_FMT record an application's handle produced.
+
+        A play starts after its delay and lasts its length times its repeat
+        count, or until stopped when its length is 0; a play of an effect
+        already playing replaces it, as a replay does on a kernel pad.
+        """
+        kind, _, effect_id, strong, weak, length, delay, count, _ = record
+        key = (source, effect_id)
+        if kind == FF_RECORD_PLAY and count:
+            start = self.loop.time() + delay / 1000.0
+            end = start + count * length / 1000.0 if length else None
+            self._ff_playing[key] = [strong, weak, start, end]
+        elif kind in (FF_RECORD_PLAY, FF_RECORD_STOP):
+            self._ff_playing.pop(key, None)
+        elif kind == FF_RECORD_GAIN:
+            self._ff_gain = count
+        self._ff_update()
+
+    def ff_replay(self) -> None:
+        """Hand the mix playing now to `on_rumble` again, for a client that has
+        just taken the slot: an unchanged mix is otherwise not sent until its
+        renewal."""
+        if any(self._ff_sent):
+            self._ff_sent = None
+            self._ff_update()
+
+    def ff_forget(self, source: Any) -> None:
+        """Stop every effect one source played: its handle closed, or its device went."""
+        for key in [k for k in self._ff_playing if k[0] == source]:
+            del self._ff_playing[key]
+        self._ff_update()
+
+    def _ff_update(self) -> None:
+        """Mix the effects playing now and hand the result to `on_rumble`.
+
+        The motors take the sum of every playing effect's magnitudes, scaled
+        by the gain and capped, as a memless pad mixes them. The client is told
+        how long to hold the mix: until the next effect starts or ends, or,
+        where that is further off than FF_LEASE_MS or never (an effect without
+        an end), for FF_LEASE_MS at a time, renewed at half that; the Gamepad
+        API plays at most 5 s at once, and a client that stops hearing stops
+        shaking. A mix that did not change is not sent again until a renewal
+        is due, and the timer wakes at the next start, end, or renewal.
+        """
+        if self._ff_timer is not None:
+            self._ff_timer.cancel()
+            self._ff_timer = None
+        now = self.loop.time()
+        for key in [k for k, v in self._ff_playing.items() if v[3] is not None and v[3] <= now]:
+            del self._ff_playing[key]
+        strong = weak = 0
+        boundaries = []
+        endless = False
+        for s_mag, w_mag, start, end in self._ff_playing.values():
+            if start > now:
+                boundaries.append(start)
+                continue
+            strong += s_mag
+            weak += w_mag
+            if end is None:
+                endless = True
+            else:
+                boundaries.append(end)
+        strong = min(0xffff, strong * self._ff_gain // 0xffff)
+        weak = min(0xffff, weak * self._ff_gain // 0xffff)
+        mix = (strong, weak)
+        lease = FF_LEASE_MS / 1000.0
+        change = min((t for t in boundaries if t > now), default=None)
+        leased = any(mix) and (endless or change is None or change - now > lease)
+        hold = lease if leased else (change - now if any(mix) and change is not None else 0.0)
+        renew = self._ff_renew_at is not None and now >= self._ff_renew_at
+        if mix != self._ff_sent or renew:
+            self._ff_sent = mix
+            self._ff_renew_at = now + lease / 2 if leased else None
+            if self.on_rumble is not None:
+                try:
+                    self.on_rumble(strong / 0xffff, weak / 0xffff, int(round(hold * 1000)))
+                except Exception:
+                    logger_selkies_gamepad.debug("rumble relay failed", exc_info=True)
+        wake = [t for t in boundaries if t > now]
+        if self._ff_renew_at is not None:
+            wake.append(self._ff_renew_at)
+        if wake:
+            self._ff_timer = self.loop.call_at(min(wake), self._ff_update)
 
     def _make_interposer_config_payload(self, js_index: int, controller_config: dict) -> bytes:
         """Create the js_config_t payload sent to the C interposer.
@@ -3156,7 +3725,7 @@ class SelkiesGamepad:
         connection open until shutdown or disconnect.
 
         A JS client first gets its current state replayed as INIT events
-        (joydev semantics); the snapshot, its write and the registration share
+        (joydev semantics); the snapshot, its write, and the registration share
         one loop step, so no broadcast can interleave and the client's first
         live event strictly follows its snapshot. evdev has no in-band INIT:
         those clients poll state through the interposer's ioctl emulation.
@@ -3188,8 +3757,15 @@ class SelkiesGamepad:
             await writer.drain()
             logger_selkies_gamepad.debug(f"{log_prefix} Added to active list. Total {socket_type_str} clients: {len(clients_dict)}.")
 
+            # An evdev handle writes its force feedback back as FF_RECORD_FMT
+            # records; a joydev one has none, and what it writes is dropped.
+            # Either way the read is what notices the application closing it.
             while self.running and not writer.is_closing():
-                await asyncio.sleep(0.1) 
+                if is_evdev_socket:
+                    record = await reader.readexactly(FF_RECORD_SIZE)
+                    self.ff_record(writer, struct.unpack(FF_RECORD_FMT, record))
+                elif not await reader.read(4096):
+                    break
             
             if not self.running:
                 logger_selkies_gamepad.debug(f"{log_prefix} Exiting handler normally because self.running is False.")
@@ -3202,10 +3778,11 @@ class SelkiesGamepad:
             logger_selkies_gamepad.error(f"{log_prefix} Unhandled error in handler: {e}", exc_info=True)
         finally:
             logger_selkies_gamepad.debug(f"{log_prefix} Entering finally block.")
+            self.ff_forget(writer)
             if writer in clients_dict:
                 del clients_dict[writer]
                 logger_selkies_gamepad.debug(f"{log_prefix} Removed from active list. Total {socket_type_str} clients now: {len(clients_dict)}.")
-            else:
+            elif self.running:
                 logger_selkies_gamepad.warning(f"{log_prefix} Writer not found in active list during finally block.")
 
             if not writer.is_closing():
@@ -3217,20 +3794,35 @@ class SelkiesGamepad:
     async def _run_single_server(self, interposer_socket_path: str,
                                  is_evdev_socket: bool) -> Optional[asyncio.AbstractServer]:
         """Bind one interposer Unix server (unlinking a stale socket file first);
-        None on failure."""
+        None on failure.
+
+        A file at the path that another account owns is refused: in a shared
+        directory it is that account's listener, and every application of this
+        session would open it as its gamepad.
+        """
         sock_dir = os.path.dirname(interposer_socket_path)
         if sock_dir and not os.path.exists(sock_dir):
             try: os.makedirs(sock_dir, exist_ok=True)
             except OSError as e:
                 logger_selkies_gamepad.error(f"Failed to create directory {sock_dir} for socket: {e}")
                 return None
-        
-        if os.path.exists(interposer_socket_path):
+
+        try:
+            owner = os.lstat(interposer_socket_path).st_uid
+        except FileNotFoundError:
+            owner = None
+        if owner is not None and owner != os.geteuid():
+            logger_selkies_gamepad.error(
+                f"{interposer_socket_path} belongs to uid {owner}, not this session: gamepads are not "
+                f"served there; point js_socket_path at a directory of this user's own.")
+            return None
+        if owner is not None:
             try:
                 os.unlink(interposer_socket_path)
                 logger_selkies_gamepad.debug(f"Removed existing socket file: {interposer_socket_path}")
             except OSError as e:
-                logger_selkies_gamepad.warning(f"Could not remove existing file at {interposer_socket_path}: {e}. Bind might fail.")
+                logger_selkies_gamepad.error(f"Could not remove the stale socket at {interposer_socket_path}: {e}")
+                return None
 
         try:
             server = await asyncio.start_unix_server(
@@ -3341,7 +3933,7 @@ class SelkiesGamepad:
 
     async def _process_event_queue(self) -> None:
         """Drain the event queue until the None sentinel, fanning each event out
-        to JS, EVDEV and uinput consumers.
+        to JS, EVDEV, and uinput consumers.
 
         Each client drain is bounded and a stalled client is closed, so a game
         that stops reading its socket cannot freeze delivery for the others.
@@ -3405,6 +3997,12 @@ class SelkiesGamepad:
         logger_selkies_gamepad.debug(f"Closing gamepad services for JS:{self.js_sock_path}, EVDEV:{self.evdev_sock_path}")
         self.running = False
 
+        # A client handler waits in a read of its connection, and a server's
+        # wait_closed() waits for every connection to close, so the clients go
+        # first.
+        for writer in list(self.js_clients.keys()) + list(self.evdev_clients.keys()):
+            if not writer.is_closing(): writer.close()
+
         if self.js_server:
             self.js_server.close()
             await self.js_server.wait_closed()
@@ -3444,9 +4042,7 @@ class SelkiesGamepad:
                 except OSError as e:
                     logger_selkies_gamepad.warning(f"Could not remove socket file {sock_path} on close: {e}")
 
-        if self.uinput is not None:
-            self.uinput.destroy()
-            self.uinput = None
+        self._drop_uinput()
 
         logger_selkies_gamepad.debug("Gamepad services fully closed.")
 
@@ -3694,7 +4290,7 @@ async def run_client_command(command_to_run: str, logger: logging.Logger,
     display and session bus the desktop uses; None inherits the server's.
     A launch failure or any nonzero exit — above all 127, the
     command-not-installed case — is reported through ``notify`` (async, one
-    text argument) with the runtime, the reason its output gives and the
+    text argument) with the runtime, the reason its output gives, and the
     echoed command, because the dashboards' apps UI marks the action done
     optimistically and needs a counter-signal to roll back. A clean exit
     reaches ``done`` (async, the echoed command), which is what settles a
@@ -3801,6 +4397,11 @@ class WebRTCInput:
             started: the session takes the scale and the capture output, which
             took it while the session was still starting, drops it. Unset,
             only the session is scaled.
+        on_session_screens_changed: Awaitable a transport installs to tell its
+            pages again what a second display can do, once the session behind
+            the displays changed after they connected: a nested compositor
+            adopted, or a rootful Xwayland, which no second display extends,
+            come up.
         _x_event_wake, _x_watcher_fd: Event-driven wake for the keymap watch:
             a loop reader on the input connection's fd sets the Event, so it
             blocks with zero wakeups instead of polling the socket.
@@ -3880,7 +4481,7 @@ class WebRTCInput:
             focused app repeats virtual-keyboard keys itself via wl_keyboard
             repeat_info and a server-side repeat would double it.
         key_repeat_delay, key_repeat_interval, key_repeat_tick: Hold before
-            the first repeat, spacing between repeats (~25 Hz) and the repeat
+            the first repeat, spacing between repeats (~25 Hz), and the repeat
             loop's poll period; the first two adopt the X server's own values.
         key_repeat_heartbeat_grace: Repeat pauses when the held key's last
             heartbeat is older than this (stalled stream / hidden tab); kept
@@ -3956,6 +4557,14 @@ class WebRTCInput:
         self.gamepad_heartbeats = {}
         # The highest pointer message number each connection has sent.
         self._pointer_seq: Dict[Any, int] = {}
+        self._pointer_echoes: Dict[Any, _PointerEcho] = {}
+        self._pointer_echo_at = 0.0
+        self._pointer_moved_at = 0.0
+        self._pointer_echo_trailing: Optional[asyncio.TimerHandle] = None
+        self._pointer_echo_poll: Optional[asyncio.Task] = None
+        self._x_pointer_reader: Optional[_XPointerReader] = None
+        # The number pixelflux gave the last Wayland move (`pointer_location`).
+        self._wl_motion = 0
         self.uinput_gamepads = uinput_gamepads_enabled(uinput_gamepad)
 
         self.clipboard_running = False
@@ -4024,6 +4633,7 @@ class WebRTCInput:
         self.data_server_instance = data_server_instance
         self.on_update_settings = lambda settings_json, display_id="primary": logger_webrtc_input.warning("unhandled update_settings")
         self.on_session_compositor_adopted = None
+        self.on_session_screens_changed = None
         self.is_wayland = is_wayland
         self.wayland_input = None
         self._client_kb_layout = None
@@ -4056,6 +4666,8 @@ class WebRTCInput:
         self._clipboard_reads = set()
         self._bg_tasks = set()
         self.keyboard_queue = asyncio.Queue(maxsize=4096)
+        # Whether the keyboard worker is injecting an entry it has taken off the queue.
+        self._keyboard_busy = False
         self.keyboard_worker_task = None
         self._wl_text_routed = {}
         self.pressed_keys = {}
@@ -4328,7 +4940,8 @@ class WebRTCInput:
         A fresh association starts with no heartbeat, so the previous client's
         last beat cannot date-stamp it into an immediate sweep, and the kernel
         device is brought up before the first input so applications see a
-        plug event rather than a controller appearing mid-press.
+        plug event rather than a controller appearing mid-press. A rumble
+        playing on the slot goes to the new client at once (ff_replay).
         """
         if not (0 <= gamepad_idx < self.num_gamepads):
             logger_webrtc_input.error(f"Client association: Gamepad index {gamepad_idx} out of range (0-{self.num_gamepads-1}).")
@@ -4357,18 +4970,196 @@ class WebRTCInput:
         self.gamepad_heartbeats.pop(gamepad_idx, None)
 
         self.gamepad_instances[gamepad_idx].ensure_uinput()
+        self.gamepad_instances[gamepad_idx].ff_replay()
+
+    def _relay_rumble(self, gamepad_idx: int, strong: float, weak: float, duration_ms: int) -> None:
+        """Send a pad's rumble to the one client driving its slot, as the
+        system action `rumble,<slot>,<strong>,<weak>,<ms>`; with no client
+        driving it, to nobody.
+
+        Args:
+            gamepad_idx: The slot whose applications' effects changed.
+            strong: Strong (low-frequency) motor level, 0 to 1.
+            weak: Weak (high-frequency) motor level, 0 to 1.
+            duration_ms: How long to hold it; 0 with both levels 0 stops it.
+        """
+        conn_id = (self.client_gamepad_associations.get(gamepad_idx) or {}).get("conn_id")
+        if conn_id is None:
+            return
+        self._send_system_to(conn_id, f"rumble,{gamepad_idx},{strong:.3f},{weak:.3f},{duration_ms}")
+
+    def _send_system_to(self, conn_id: Any, action: str) -> None:
+        """Send a system action to one connection alone, addressed as its
+        transport knows it (`send_command_status`); nobody once it is gone."""
+        try:
+            if self._ws_transport():
+                self.rtc_app.send_system_action(action, conn_id=conn_id)
+            else:
+                self.rtc_app.send_system_action(action, peer_id=conn_id, only=True)
+        except Exception:
+            logger_webrtc_input.debug(f"system action {action[:16]!r} not sent", exc_info=True)
 
     async def release_gamepads_for_conn(self, conn_id: Any) -> None:
         """Disassociate (and neutralize, via reset_state) every gamepad slot whose
         association was made by this transport connection, and forget its pointer
-        message count. This is the ungraceful path — a tab that dies mid-press
+        message count and echo. This is the ungraceful path — a tab that dies mid-press
         never sends 'js,d', and only the transport knows the connection is gone."""
         if conn_id is None:
             return
         self._pointer_seq.pop(conn_id, None)
+        self._drop_pointer_echo(conn_id)
         for idx, info in list(self.client_gamepad_associations.items()):
             if info.get("conn_id") == conn_id:
                 await self.__gamepad_disconnect(idx)
+
+    async def release_gamepad_slots_for_conn(self, conn_id: Any, slots: Iterable[int]) -> None:
+        """Disassociate (and neutralize) the one-based `slots` this connection's
+        pads drive. A token table that takes a slot from a connection leaves its
+        page no way to: the `js,d` it sends for the slot is refused, as the slot
+        is no longer its, and anything it held would stay held until its
+        heartbeat lapsed."""
+        if conn_id is None:
+            return
+        for slot in slots:
+            info = self.client_gamepad_associations.get(slot - 1)
+            if info is not None and info.get("conn_id") == conn_id:
+                await self.__gamepad_disconnect(slot - 1)
+
+    async def _set_pointer_echo(self, conn_id: Any, on: bool) -> None:
+        """Start or stop echoing the pointer to a trackpad page, which draws it
+        from the echo: `pointer,<display>,<x>,<y>,<scale>,<seq>`, the position in
+        that display's server pixels, the physical pixels a relative pixel moves
+        it there, and the last of the page's pointer messages it includes. A
+        session that cannot say where its pointer is (host capture, a pixelflux
+        without `pointer_location`) answers `pointer,none`, and the page has the
+        cursor composited instead."""
+        self._drop_pointer_echo(conn_id)
+        if not on or conn_id is None:
+            return
+        at = await self._pointer_at_rest()
+        if at is None:
+            self._send_system_to(conn_id, "pointer,none")
+            return
+        echo = _PointerEcho(self._pointer_seq.get(conn_id, 0))
+        self._pointer_echoes[conn_id] = echo
+        self._echo_pointer_to(conn_id, echo, at)
+        if self._pointer_echo_poll is None:
+            self._pointer_echo_poll = self.loop.create_task(self._poll_pointer_echoes())
+
+    def _drop_pointer_echo(self, conn_id: Any) -> None:
+        self._pointer_echoes.pop(conn_id, None)
+        if not self._pointer_echoes and self._pointer_echo_trailing is not None:
+            self._pointer_echo_trailing.cancel()
+            self._pointer_echo_trailing = None
+
+    def _pointer_moved(self, conn_id: Any, seq: Optional[int], dx: int, dy: int) -> None:
+        """Echo a pointer message's move to every trackpad page whose drawn
+        pointer it leaves behind: at once unless an echo went out under
+        POINTER_ECHO_MIN_S ago, else when that interval ends."""
+        echo = self._pointer_echoes.get(conn_id)
+        if echo is not None and seq is not None:
+            echo.applied(self._wl_motion if self.is_wayland else None, seq, dx, dy)
+        now = self.loop.time()
+        self._pointer_moved_at = now
+        due = self._pointer_echo_at + POINTER_ECHO_MIN_S
+        if now >= due:
+            self._echo_pointer(self._pointer_at())
+        elif self._pointer_echo_trailing is None:
+            self._pointer_echo_trailing = self.loop.call_at(due, self._echo_pointer_trailing)
+
+    def _echo_pointer_trailing(self) -> None:
+        self._pointer_echo_trailing = None
+        self._echo_pointer(self._pointer_at())
+
+    async def _poll_pointer_echoes(self) -> None:
+        """Read a resting pointer again while a trackpad page watches it, so a
+        move no page sent reaches them too."""
+        try:
+            while self._pointer_echoes:
+                await asyncio.sleep(POINTER_ECHO_POLL_S)
+                if self._pointer_echoes and self.loop.time() - self._pointer_moved_at >= POINTER_ECHO_POLL_S:
+                    self._echo_pointer(await self._pointer_at_rest())
+        finally:
+            self._pointer_echo_poll = None
+            reader, self._x_pointer_reader = self._x_pointer_reader, None
+            if reader is not None:
+                try:
+                    self.loop.run_in_executor(None, reader.close)
+                except RuntimeError:
+                    pass
+
+    def _echo_pointer(self, at: Optional[Tuple[float, float, float, Optional[int]]]) -> None:
+        self._pointer_echo_at = self.loop.time()
+        if at is None:
+            return
+        for conn_id, echo in list(self._pointer_echoes.items()):
+            self._echo_pointer_to(conn_id, echo, at)
+
+    def _echo_pointer_to(self, conn_id: Any, echo: _PointerEcho,
+                         at: Tuple[float, float, float, Optional[int]]) -> None:
+        x, y, scale, motion = at
+        did, local_x, local_y, w, h = self._display_at(x, y)
+        seq = echo.through(motion)
+        # As the page reads them back.
+        local_x, local_y, scale = float(f"{local_x:.1f}"), float(f"{local_y:.1f}"), float(f"{scale:g}")
+        if echo.drawn_at(did, local_x, local_y):
+            return
+        echo.echoed(did, local_x, local_y, scale, w, h)
+        self._send_system_to(conn_id, f"pointer,{did},{local_x:.1f},{local_y:.1f},{scale:g},{seq}")
+
+    def _pointer_at(self) -> Optional[Tuple[float, float, float, Optional[int]]]:
+        """Where the pointer is on the desktop while it moves, as (x, y, scale,
+        move number), waiting on nothing: Wayland's compositor position
+        (`pointer_location`), X11's tracked one."""
+        if self.is_wayland:
+            read = getattr(self.wayland_input, "pointer_location", None)
+            at = read() if read is not None else None
+            return (float(at[0]), float(at[1]), float(at[2]), int(at[3])) if at else None
+        return (float(self.last_x), float(self.last_y), 1.0, None)
+
+    async def _pointer_at_rest(self) -> Optional[Tuple[float, float, float, Optional[int]]]:
+        """`_pointer_at` for a pointer at rest, which on X11 asks the server
+        (`_XPointerReader`), so a warp of an application's own shows; the
+        answer comes after every move sent before it, and the tracking goes on
+        from it unless the pointer moved while it was asked. None where the
+        session cannot say where its pointer is."""
+        if self.is_wayland:
+            return self._pointer_at()
+        if self.mouse is None:
+            return None
+        if self._x_pointer_reader is None:
+            self._x_pointer_reader = _XPointerReader()
+        asked = self._pointer_moved_at
+        xy = await asyncio.to_thread(self._x_pointer_reader.read)
+        if xy is None:
+            return None
+        if self._pointer_moved_at != asked:
+            return self._pointer_at()
+        self.last_x, self.last_y = xy
+        return (float(xy[0]), float(xy[1]), 1.0, None)
+
+    def _display_at(self, x: float, y: float) -> Tuple[str, float, float, float, float]:
+        """The display whose laid-out rectangle holds a desktop point, the point
+        in that display's coordinates, and the display's size; for a point outside
+        them all (the framebuffer can be a little wider than the layout), the
+        nearest one, clamped into it."""
+        layouts = getattr(self.data_server_instance, "display_layouts", None) or {}
+        best = None
+        for did, rect in list(layouts.items()):
+            rx, ry = rect.get("x") or 0, rect.get("y") or 0
+            rw, rh = rect.get("w") or 0, rect.get("h") or 0
+            if rw <= 0 or rh <= 0:
+                continue
+            if rx <= x < rx + rw and ry <= y < ry + rh:
+                return did, x - rx, y - ry, rw, rh
+            cx = min(max(x, rx), rx + rw - 1)
+            cy = min(max(y, ry), ry + rh - 1)
+            d = (x - cx) ** 2 + (y - cy) ** 2
+            if best is None or d < best[0]:
+                best = (d, did, cx - rx, cy - ry, rw, rh)
+        if best is None:
+            return "primary", x, y, float("inf"), float("inf")
+        return best[1:]
 
     async def __gamepad_disconnect(self, gamepad_idx: Optional[int] = None) -> None:
         """Disassociate one slot (or all, with None), releasing anything held.
@@ -4547,7 +5338,8 @@ class WebRTCInput:
                 self.virtual_input_devices[key] = live
                 continue
             device = VirtualInputDevice(name, 0x1D6B, product, evbits, keybits, relbits,
-                                        sock_dir=self.js_socket_path_prefix)
+                                        sock_dir=self.js_socket_path_prefix,
+                                        phys=f"selkies/virtinput/{key}")
             if await device.open(kernel=kernel):
                 _persistent_virtual_devices[key] = device
                 self.virtual_input_devices[key] = device
@@ -4576,6 +5368,7 @@ class WebRTCInput:
             existing = _persistent_gamepads.get(i)
             if existing is not None and existing.running:
                 self.gamepad_instances[i] = existing
+                existing.on_rumble = functools.partial(self._relay_rumble, i)
                 logger_webrtc_input.debug(
                     f"Adopted live persistent gamepad instance for index {i} (JS: {existing.js_sock_path})."
                 )
@@ -4594,6 +5387,7 @@ class WebRTCInput:
             std_num_axes = len(STANDARD_XPAD_CONFIG["axes_map"])
 
             gamepad.set_config(gamepad_name_for_interposer, std_num_btns, std_num_axes)
+            gamepad.on_rumble = functools.partial(self._relay_rumble, i)
 
             self._spawn_task(gamepad.run_servers())
             _persistent_gamepads[i] = gamepad
@@ -4616,6 +5410,11 @@ class WebRTCInput:
         handler.
         """
         logger_webrtc_input.debug("Releasing gamepad associations (persistent instances stay up).")
+        for conn_id in list(self._pointer_echoes):
+            self._drop_pointer_echo(conn_id)
+        if self._pointer_echo_poll is not None:
+            self._pointer_echo_poll.cancel()
+            self._pointer_echo_poll = None
         await self.__gamepad_disconnect()
         self.gamepad_instances = {}
         self.gamepad_heartbeats.clear()
@@ -5023,7 +5822,7 @@ class WebRTCInput:
 
         On X11 a keysym with a keycode in the current keymap is injected
         through XTEST on the already-open display, which spares a ~15 ms
-        xdotool fork per shortcut, arrow or function key; a keysym the layout
+        xdotool fork per shortcut, arrow, or function key; a keysym the layout
         lacks is overlay-bound once by the shim and reused, and one only a
         later layout group carries is injected under that group's lock —
         never a per-key xdotool fork, whose transient rebind floods
@@ -5179,7 +5978,10 @@ class WebRTCInput:
         on every letter. With neutralize, conflicting held Shift/AltGr are
         lifted around the whole run (one keymap query, not one per char).
         Unmapped chars are bound in one batch (O(1) MappingNotify broadcasts
-        instead of one per char), and nothing is typed on failure.
+        instead of one per char), and nothing is typed on failure. Where binds
+        are kept to the text spares (`text_room`), a text with more of them
+        than those hold goes out in runs that fit them, each bound behind the
+        keys before it.
 
         Returns:
             True on full success; False (having typed nothing) if the shim is
@@ -5189,16 +5991,26 @@ class WebRTCInput:
         if not self.keyboard or not text:
             return False
         # Pre-resolve every char so a mid-string failure types no partial line.
-        keysyms = []
+        keysyms, overlaid = [], set()
         for ch in text:
             ks = character_to_layout_keysym(ch)
             if not self.keyboard.layout_carries(ks):
                 ks = universal_text_keysym(ch)
                 if ks is None:
                     continue
+                overlaid.add(ks)
             keysyms.append(ks)
         try:
-            if not self.keyboard.prebind(keysyms):
+            room = self.keyboard.text_room()
+            runs, missing = [[]], set()
+            for ks in keysyms:
+                if room and ks in overlaid and ks not in missing:
+                    if len(missing) >= room:
+                        runs.append([])
+                        missing = set()
+                    missing.add(ks)
+                runs[-1].append(ks)
+            if not self.keyboard.prebind(runs[0]):
                 return False
             settle = self.keyboard.settle_delay()
             if settle > 0:
@@ -5211,9 +6023,15 @@ class WebRTCInput:
             for m in lifted:
                 xtest.fake_input(self.keyboard._d, Xlib.X.KeyRelease, m)
             try:
-                for ks in keysyms:
-                    self.keyboard.press(ks)
-                    self.keyboard.release(ks)
+                for i, run in enumerate(runs):
+                    # A later run that cannot bind as a batch binds key by key.
+                    if i and self.keyboard.prebind(run):
+                        settle = self.keyboard.settle_delay()
+                        if settle > 0:
+                            await asyncio.sleep(settle)
+                    for ks in run:
+                        self.keyboard.press(ks)
+                        self.keyboard.release(ks)
             finally:
                 for m in reversed(lifted):
                     xtest.fake_input(self.keyboard._d, Xlib.X.KeyPress, m)
@@ -5661,11 +6479,13 @@ class WebRTCInput:
             if not is_static_relative:
                 if relative:
                     if hasattr(self.wayland_input, 'inject_relative_mouse_move'):
-                        self.wayland_input.inject_relative_mouse_move(float(x), float(y))
+                        motion = self.wayland_input.inject_relative_mouse_move(float(x), float(y))
                     else:
-                        self.wayland_input.inject_mouse_move(float(final_x), float(final_y))
+                        motion = self.wayland_input.inject_mouse_move(float(final_x), float(final_y))
                 else:
-                    self.wayland_input.inject_mouse_move(float(final_x), float(final_y))
+                    motion = self.wayland_input.inject_mouse_move(float(final_x), float(final_y))
+                if isinstance(motion, int):
+                    self._wl_motion = motion
             
             if button_mask != self.button_mask:
                 for bit_index in range(8):
@@ -5689,7 +6509,7 @@ class WebRTCInput:
                         elif bit_index == 3:
                             if scroll_magnitude > 0:
                                 if is_pressed_now:
-                                    self.wayland_input.inject_mouse_scroll(0.0, 10.0 * mag)
+                                    self._wl_scroll(0.0, 10.0 * mag)
                             else:
                                 if is_pressed_now:
                                     # Queued behind pending keys like any key event:
@@ -5701,7 +6521,7 @@ class WebRTCInput:
                         elif bit_index == 4:
                             if scroll_magnitude > 0:
                                 if is_pressed_now:
-                                    self.wayland_input.inject_mouse_scroll(0.0, -10.0 * mag)
+                                    self._wl_scroll(0.0, -10.0 * mag)
                             else:
                                 if is_pressed_now:
                                     self._keyboard_enqueue_chord((
@@ -5710,10 +6530,10 @@ class WebRTCInput:
 
                         elif bit_index == 6:
                             if scroll_magnitude > 0 and is_pressed_now:
-                                self.wayland_input.inject_mouse_scroll(-10.0 * mag, 0.0)
+                                self._wl_scroll(-10.0 * mag, 0.0)
                         elif bit_index == 7:
                             if scroll_magnitude > 0 and is_pressed_now:
-                                self.wayland_input.inject_mouse_scroll(10.0 * mag, 0.0)
+                                self._wl_scroll(10.0 * mag, 0.0)
 
             self.button_mask = button_mask
             return
@@ -5923,6 +6743,7 @@ class WebRTCInput:
                 logger_webrtc_input.debug(
                     f"pixelflux set_app_wayland_display failed: {e}")
             self._schedule_session_scale()
+            self._announce_session_screens()
             self._schedule_spare_screen_hold()
             self._schedule_seat_layout_restore()
         return resolved
@@ -5930,7 +6751,7 @@ class WebRTCInput:
     def app_session(self) -> dict:
         """Where the session's applications run: ``x11_display`` (the X server
         they connect to, if any), ``wayland_display`` (the compositor socket,
-        when they are Wayland clients) and ``type`` ("x11" or "wayland").
+        when they are Wayland clients), and ``type`` ("x11" or "wayland").
 
         X11 backend: the server's own DISPLAY. Wayland backend: apps under a
         nested session compositor use its socket and the Xwayland it spawned (the
@@ -6095,7 +6916,7 @@ class WebRTCInput:
     async def note_app_command_finished(self, command: str) -> None:
         """Re-read and announce the installed set after an apps command ran.
 
-        Install, remove and update change it; a launch does not. Broadcast
+        Install, remove, and update change it; a launch does not. Broadcast
         rather than answered to the requester, which already applied the change
         optimistically: it is the session's other pages that have no other way
         to hear.
@@ -6154,9 +6975,9 @@ class WebRTCInput:
     #: nested-Wayland backend: a wlroots session cannot grow a screen without
     #: it. KWin serves no socket and needs none — its screens are grown as
     #: `zkde_screencast_unstable_v1` virtual outputs through pixelflux
-    #: (`add_app_screen`), the rung probed when this socket is absent by
-    #: growing a probe screen (the protocol answers on stock kwin too, but
-    #: only a patched kwin registers a nested virtual output).
+    #: (`add_app_screen`), the rung offered when this socket is absent and the
+    #: session serves the protocol; whether its kwin registers the screen it
+    #: grows is proven by the first display that asks for one.
     SESSION_IPC_SOCKET = "labwc.sock"
 
     def _session_ipc_path(self) -> Optional[str]:
@@ -6206,7 +7027,7 @@ class WebRTCInput:
         return ok
 
     def _session_socket_identity(self, display: str) -> Tuple[str, int, int]:
-        """The session compositor's socket as an identity — its path, inode
+        """The session compositor's socket as an identity — its path, inode,
         and creation time, zeros where none exists — so a restarted compositor
         reads as a new one and a cached probe answer stays with the instance
         it was measured on."""
@@ -6233,12 +7054,15 @@ class WebRTCInput:
 
         A nested session compositor with a screen control grows a screen on
         demand — over the labwc control socket, or KWin's virtual-output
-        protocol; without one, spare screens it opened at startup can
-        still be arranged for a display (the spare-screen hold). A session
-        running directly on the capture compositor needs neither: every
-        capture output is a monitor of its own there. Only a nested session
-        holding a single screen with no screen control has nowhere to show a
-        second display.
+        protocol, whose presence is the offer and whose screen is proven when
+        a display asks for one; without one, spare screens it opened at
+        startup can still be arranged for a display (the spare-screen hold).
+        A session of Wayland clients running directly on the capture
+        compositor needs neither: every capture output is a monitor of its own
+        there. An X11 desktop in a rootful Xwayland on the capture compositor
+        is one X screen of a fixed size, which no second capture output
+        extends, and a nested session holding a single screen with no screen
+        control has nowhere to show one either.
 
         Returns:
             `(available, reason)`; the reason is empty when available.
@@ -6248,6 +7072,9 @@ class WebRTCInput:
         if self.session_screen_control_available():
             return True, ""
         if not self._session_is_nested():
+            if self._x11_session_display():
+                return False, ("An X11 desktop in a rootful Xwayland is one screen of a "
+                               "fixed size: a second display has nowhere to show.")
             return True, ""
         if int(getattr(self, "_session_screen_count", 0) or 0) >= 2:
             return True, ""
@@ -6258,16 +7085,15 @@ class WebRTCInput:
         """Re-probe what backs a second display and return the fresh answer.
 
         The control socket decides when it answers; without one, a nested
-        session is probed for KWin's virtual-output protocol, and a session
-        with neither control is asked for its screen count instead, so a
-        compositor started with spare screens keeps its second display.
+        session is asked whether it serves KWin's virtual-output protocol, and
+        a session with neither control is asked for its screen count instead,
+        so a compositor started with spare screens keeps its second display.
 
-        The KWin probe grows a token-sized screen and gives it back, since a
-        stock kwin serves the protocol without registering the output and
-        nothing in the globals tells the two apart. The session sees that
-        screen come and go, so the answer is kept for as long as the session
-        compositor's socket is the same one, and only an unreachable
-        compositor is asked again.
+        The KWin answer is read off the registry, so nothing on the session
+        changes for the asking; the screen a display asks for is what proves
+        the compositor registers one (`ensure_session_screen`). The answer is
+        kept for as long as the session compositor's socket is the same one,
+        and only an unreachable compositor is asked again.
         """
         await self.probe_session_screen_ipc()
         kde = False
@@ -6282,14 +7108,14 @@ class WebRTCInput:
             else:
                 try:
                     kde = bool(await asyncio.to_thread(
-                        self.wayland_input.app_screen_control_available, display))
+                        self.wayland_input.app_screen_control_offered, display))
                 except Exception as e:
                     logger_webrtc_input.debug(f"Session screen control probe failed: {e}")
                 else:
                     self._session_kde_probe = (identity, kde)
                     logger_webrtc_input.debug(
-                        "Session compositor grows screens on demand." if kde else
-                        "Session compositor registers no virtual output; "
+                        "Session compositor offers screens on demand." if kde else
+                        "Session compositor serves no virtual-output protocol; "
                         "a second display needs a spare screen.")
             if not kde:
                 try:
@@ -6401,7 +7227,7 @@ class WebRTCInput:
 
     async def ensure_session_screen(self, display_id: str,
                                     size: Optional[Tuple[int, int]] = None,
-                                    scale: float = 1.0) -> None:
+                                    scale: float = 1.0) -> bool:
         """Grow the session screen a display owns, right before its capture
         output is created.
 
@@ -6422,18 +7248,24 @@ class WebRTCInput:
                 output (the capture output drives the real size); the labwc
                 rung sizes screens through output management instead.
             scale: The display's scale, seeding a KWin virtual output.
+
+        Returns:
+            False when the session compositor refused the screen -- a control
+            socket answering no, or a KWin whose grown output registers as no
+            screen -- which leaves the display nowhere to show; True when it
+            has one, or needs none.
         """
         did = str(display_id or "")
         if (not did or did == "primary" or self.wayland_input is None
                 or not self.session_screen_control_available()):
-            return
+            return True
         if (getattr(settings, "wayland_host_display", "") or "").strip():
-            return
+            return True
         lock = self.__dict__.setdefault("_session_screen_lock", asyncio.Lock())
         async with lock:
             owned = self.__dict__.setdefault("_session_screens", {})
             if did in owned:
-                return
+                return True
 
             async def parked() -> int:
                 try:
@@ -6449,7 +7281,7 @@ class WebRTCInput:
                     logger_webrtc_input.warning(
                         f"Session compositor could not add a screen for '{did}': "
                         f"{reply.get('error', 'no reply')}")
-                    return
+                    return False
                 owned[did] = str(reply.get("output", ""))
             else:
                 name = f"SELKIES-{wayland_output_id(did)}"
@@ -6462,7 +7294,7 @@ class WebRTCInput:
                 except Exception as e:
                     logger_webrtc_input.warning(
                         f"Session compositor could not add a screen for '{did}': {e}")
-                    return
+                    return False
                 owned[did] = name
             logger_webrtc_input.info(
                 f"Session compositor added screen '{owned[did]}' for '{did}'.")
@@ -6473,6 +7305,7 @@ class WebRTCInput:
                         f"Screen '{owned[did]}' produced no host window to adopt.")
                     break
                 await asyncio.sleep(0.05)
+            return True
 
     async def _session_screen_positions(self, display_ids) -> dict:
         """Position of each display's screen among the session's screens,
@@ -6686,6 +7519,14 @@ class WebRTCInput:
                 f"Session compositor has {held} screen(s) with no capture output; "
                 f"held at {self.SPARE_SCREEN_SIZE[0]}x{self.SPARE_SCREEN_SIZE[1]}.")
 
+    def _announce_session_screens(self) -> None:
+        """Hand the transport's `on_session_screens_changed` the change, so a
+        page offered a second display before the session came up is told what
+        it can do now."""
+        hook = getattr(self, "on_session_screens_changed", None)
+        if hook is not None:
+            self._spawn_task(hook())
+
     def _schedule_session_scale(self) -> None:
         """A session compositor was just adopted: hand it the effective DPI as
         its output scale, through the transport's ladder when it installed
@@ -6784,7 +7625,8 @@ class WebRTCInput:
 
     async def _app_clipboard_read(self, use_binary: bool) -> tuple:
         """Read the selection of the compositor the apps use over the pixelflux
-        data-control ABI; (None, None) when it is empty or unreadable."""
+        data-control ABI; (None, None) when it is empty or unreadable. A copy
+        its owner marked secret reads as its text alone (`SecretText`)."""
         read_fn = getattr(self.wayland_input, 'clipboard_read_app', None)
         types_fn = getattr(self.wayland_input, 'clipboard_types_app', None)
         if read_fn is None or types_fn is None:
@@ -6792,11 +7634,27 @@ class WebRTCInput:
             return None, None
         display = self._app_wayland_display()
         loop = asyncio.get_running_loop()
+        text_mimes = ['text/plain;charset=utf-8', 'text/plain',
+                      'UTF8_STRING', 'STRING', 'TEXT']
         try:
             available_types = await loop.run_in_executor(
                 None, types_fn, display)
             self._app_clip_read_failure = None
-            if use_binary:
+            hint = next((m for m in CLIPBOARD_SECRET_HINTS if m in available_types), None)
+            if hint is not None and clipboard_secret_hint(
+                    await loop.run_in_executor(None, read_fn, display, hint)):
+                source_mime = next((m for m in text_mimes if m in available_types), None)
+                if source_mime is None:
+                    return SecretText(''), 'text/plain'
+                data = await loop.run_in_executor(None, read_fn, display, source_mime)
+                if data is None:
+                    return None, None
+                return SecretText(bytes(data).decode('utf-8', errors='replace')), 'text/plain'
+            html = None
+            if 'text/html' in available_types:
+                html = await loop.run_in_executor(None, read_fn, display, 'text/html')
+            # A copy whose markup carries text is text (`clipboard_markup_has_text`).
+            if use_binary and not (html and clipboard_markup_has_text(bytes(html))):
                 image_mimes = ['image/png', 'image/jpeg', 'image/bmp', 'image/webp',
                                'image/svg+xml', 'image/svg']
                 target_mime = next((m for m in image_mimes if m in available_types), None)
@@ -6805,19 +7663,15 @@ class WebRTCInput:
                         None, read_fn, display, target_mime)
                     if data:
                         return bytes(data), target_mime
-            if 'text/html' in available_types:
-                html = await loop.run_in_executor(None, read_fn, display, 'text/html')
-                if html:
-                    plain = b''
-                    beside = next((m for m in ('text/plain;charset=utf-8', 'text/plain',
-                                               'UTF8_STRING') if m in available_types), None)
-                    if beside:
-                        plain = bytes(await loop.run_in_executor(
-                            None, read_fn, display, beside) or b'')
-                    entries = [("text/html", bytes(html))] + ([("text/plain", plain)] if plain else [])
-                    return clipboard_envelope(entries), CLIPBOARD_FLAVOURS_MIME
-            text_mimes = ['text/plain;charset=utf-8', 'text/plain',
-                          'UTF8_STRING', 'STRING', 'TEXT']
+            if html:
+                plain = b''
+                beside = next((m for m in ('text/plain;charset=utf-8', 'text/plain',
+                                           'UTF8_STRING') if m in available_types), None)
+                if beside:
+                    plain = bytes(await loop.run_in_executor(
+                        None, read_fn, display, beside) or b'')
+                entries = [("text/html", bytes(html))] + ([("text/plain", plain)] if plain else [])
+                return clipboard_envelope(entries), CLIPBOARD_FLAVOURS_MIME
             source_mime = next((m for m in text_mimes if m in available_types), None)
             if source_mime:
                 data = await loop.run_in_executor(None, read_fn, display, source_mime)
@@ -6837,12 +7691,22 @@ class WebRTCInput:
         """What the capture compositor's own selection reads as, from the
         flavours its callback delivered: a picture as bytes with its mime where
         pictures are taken, markup with the text beneath it as one envelope,
-        text as str; (None, None) for a picture where none is taken."""
-        image = next(((data, mime) for mime, data in entries if mime.startswith('image/')), None)
-        if image is not None:
-            return image if use_binary else (None, None)
+        text as str, and the text alone as `SecretText` where the owner marked
+        the copy secret; (None, None) for a picture where none is taken, and
+        for a cleared selection, which is delivered without flavours. A copy
+        whose markup carries text is text, a picture beside it notwithstanding
+        (`clipboard_markup_has_text`)."""
+        hinted = any(mime in CLIPBOARD_SECRET_HINTS and clipboard_secret_hint(data)
+                     for mime, data in entries)
+        entries = [(mime, data) for mime, data in entries if mime not in CLIPBOARD_SECRET_HINTS]
+        plain = next((data for mime, data in entries
+                      if mime != 'text/html' and not mime.startswith('image/')), None)
+        if hinted:
+            return SecretText((plain or b'').decode('utf-8', errors='replace')), 'text/plain'
         html = next((data for mime, data in entries if mime == 'text/html'), None)
-        plain = next((data for mime, data in entries if mime != 'text/html'), None)
+        image = next(((data, mime) for mime, data in entries if mime.startswith('image/')), None)
+        if image is not None and not (html and clipboard_markup_has_text(html)):
+            return image if use_binary else (None, None)
         if html:
             return clipboard_envelope([("text/html", html)] + ([("text/plain", plain)] if plain else [])), \
                 CLIPBOARD_FLAVOURS_MIME
@@ -6867,10 +7731,10 @@ class WebRTCInput:
                 before falling back to text.
 
         Returns:
-            (data, mime): text as str with mime 'text/plain', markup with the
-            text beneath it as one envelope under CLIPBOARD_FLAVOURS_MIME,
-            images as bytes with their mime, or (None, None) when nothing is
-            readable.
+            (data, mime): text as str with mime 'text/plain' (`SecretText` for a
+            copy its owner marked secret), markup with the text beneath it as
+            one envelope under CLIPBOARD_FLAVOURS_MIME, images as bytes with
+            their mime, or (None, None) when nothing is readable.
         """
         if self.is_wayland:
             monitor = await self._ensure_x11_clipboard_monitor_async()
@@ -6905,7 +7769,27 @@ class WebRTCInput:
             if proc_targets.returncode != 0:
                 return None, None
             targets = stdout_targets.decode().strip().split('\n')
-            if use_binary:
+            secret = False
+            hint = next((m for m in CLIPBOARD_SECRET_HINTS if m in targets), None)
+            if hint is not None:
+                proc_hint = await subprocess.create_subprocess_exec(
+                    "xclip", "-selection", "clipboard", "-o", "-t", hint,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                stdout_hint, _ = await self._communicate_or_kill(proc_hint, 1, "xclip password-manager hint")
+                secret = proc_hint.returncode == 0 and clipboard_secret_hint(stdout_hint)
+            # A copy whose markup carries text is text (`clipboard_markup_has_text`);
+            # this rung sends its plain text.
+            text_copy = False
+            if use_binary and not secret and 'text/html' in targets and any(
+                    t.startswith('image/') for t in targets):
+                proc_html = await subprocess.create_subprocess_exec(
+                    "xclip", "-selection", "clipboard", "-o", "-t", "text/html",
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                stdout_html, _ = await self._communicate_or_kill(proc_html, 1, "xclip text/html")
+                text_copy = proc_html.returncode == 0 and clipboard_markup_has_text(stdout_html)
+            if use_binary and not secret and not text_copy:
                 for mime_type in ['image/png', 'image/jpeg', 'image/bmp', 'image/webp',
                                   'image/svg+xml', 'image/svg']:
                     if mime_type in targets:
@@ -6951,8 +7835,9 @@ class WebRTCInput:
                 )
                 stdout_text, _ = await self._communicate_or_kill(proc_text, 1, "xclip UTF8_STRING")
                 if proc_text.returncode == 0:
-                    return stdout_text.decode(), 'text/plain'
-            return None, None
+                    text = stdout_text.decode()
+                    return (SecretText(text) if secret else text), 'text/plain'
+            return (SecretText(''), 'text/plain') if secret else (None, None)
         except FileNotFoundError:
             if not self._xclip_missing_warned:
                 self._xclip_missing_warned = True
@@ -6978,9 +7863,52 @@ class WebRTCInput:
         the payload is also offered on the unbridged X server (a rootful
         Xwayland sees no Wayland selection) so the X11 desktop can paste it.
 
+        An image in another format is offered as PNG as well, first, since
+        that is what most applications paste (`clipboard_png_beside`), which
+        makes the PNG the flavour read back. `SecretText` is offered with the
+        hint that marked it, so the session's clipboard history skips it again. The client's messages wait for
+        this write, so the conversion is waited for only briefly: a photo
+        taking longer is offered as it came at once, and the PNG joins it
+        when ready unless something newer took the clipboard meanwhile.
+
         Returns:
             True when the clipboard was set (an empty payload is a no-op True).
         """
+        if flavours is None and data and isinstance(data, bytes) \
+                and mime_type.startswith("image/") and mime_type != "image/png":
+            conversion = asyncio.ensure_future(
+                asyncio.to_thread(clipboard_png_beside, mime_type, data))
+            done, _ = await asyncio.wait({conversion}, timeout=CLIPBOARD_PNG_WAIT_S)
+            if not done:
+                ok = await self._set_clipboard(data, mime_type)
+                if ok:
+                    self._spawn_task(self._add_png_beside(conversion, mime_type, data),
+                                     name="ClipboardPng")
+                return ok
+            png = conversion.result()
+            if png is not None:
+                return await self._set_clipboard(png, "image/png",
+                                                 [("image/png", png), (mime_type, data)])
+        return await self._set_clipboard(data, mime_type, flavours)
+
+    async def _add_png_beside(self, conversion: "asyncio.Future", mime_type: str,
+                              data: bytes) -> None:
+        """Offer a client's image as PNG as well once its conversion is done,
+        if that image is still the session's clipboard: a copy made since, by
+        a client or in the session, is newer and keeps the clipboard."""
+        try:
+            png = await conversion
+        except Exception:
+            return
+        monitor = self._x11_clipboard_monitor
+        if png is None or self._clipboard_last_bytes is not data \
+                or (monitor is not None and not monitor.owns_selection()):
+            return
+        await self._set_clipboard(png, "image/png", [("image/png", png), (mime_type, data)])
+
+    async def _set_clipboard(self, data: Union[str, bytes], mime_type: str = "text/plain",
+                             flavours: Optional[List[Tuple[str, bytes]]] = None) -> bool:
+        """The write `write_clipboard` describes, for content offered as it is."""
         if not data:
             return True
         input_bytes = data if isinstance(data, bytes) else data.encode('utf-8')
@@ -6990,6 +7918,8 @@ class WebRTCInput:
         # against; `flavours` is everything the copy carried, offered together.
         entries = [(m, d if isinstance(d, bytes) else d.encode('utf-8'))
                    for m, d in (flavours or [(mime_type, input_bytes)])]
+        if isinstance(data, SecretText):
+            entries += [(hint, b"secret") for hint in CLIPBOARD_SECRET_HINTS]
 
         if self.is_wayland:
             if not self._has_separate_app_compositor():
@@ -7138,6 +8068,8 @@ class WebRTCInput:
             monitor = await asyncio.to_thread(self._ensure_x11_clipboard_monitor, display_name)
             if monitor is None:
                 self._x11_monitor_retry_at = time.monotonic() + 10.0
+            elif display_name is not None:
+                self._announce_session_screens()
             return monitor
 
     @staticmethod
@@ -7247,10 +8179,20 @@ class WebRTCInput:
         compositor callback, app-compositor data-control watch), with xclip
         polling as the last X11 fallback; each pass reads the selection,
         compares against the echo baseline, and broadcasts real changes to
-        clients. The first consumer after a consumer-less stretch gets the
-        current selection once, since change events during that stretch were
-        skipped and a copy made before any client connected would otherwise
-        never arrive.
+        clients. A broadcast runs beside the loop rather than inside it: a
+        multi-megabyte payload takes seconds to cross a link, and a copy made
+        meanwhile has to reach the clients as it happens, superseding the one
+        still in flight (each transport's sender drops the older payload),
+        rather than queue behind it, since a client writes its local clipboard
+        only while the user is still there to allow it. The first consumer
+        after a consumer-less stretch gets the current selection once, since
+        change events during that stretch were skipped and a copy made before
+        any client connected would otherwise never arrive.
+
+        A selection that goes empty, or unreadable, after a `SecretText` was
+        broadcast is broadcast as an empty one, so the clients take the secret
+        back as the session's clipboard lets it go (a password manager clearing
+        its copy); any other copy retracts it by replacing it.
 
         The compositor callback watches the capture compositor's selection;
         with a separate app compositor the apps' copies land on its selection
@@ -7290,6 +8232,7 @@ class WebRTCInput:
         first_pass = True
         had_consumers = False
         reread_pending = 0
+        secret_out = False
         try:
             while self.clipboard_running:
                 try:
@@ -7364,9 +8307,9 @@ class WebRTCInput:
                             changed = False
                     elif app_watch_queue is not None:
                         try:
-                            await asyncio.wait_for(app_watch_queue.get(), 2.0)
+                            # No mimes is a cleared selection: nothing to settle and re-read.
+                            from_edge = bool(await asyncio.wait_for(app_watch_queue.get(), 2.0))
                             changed = True
-                            from_edge = True
                         except asyncio.TimeoutError:
                             changed = False
                             # A watch on a dead compositor never fires again; a dead
@@ -7421,6 +8364,8 @@ class WebRTCInput:
                         curr_data_bytes = curr_data.encode('utf-8') if isinstance(curr_data, str) else curr_data
                     if curr_data_bytes is None and from_edge:
                         reread_pending = _CLIPBOARD_REREAD_ATTEMPTS
+                    if curr_data_bytes is None and secret_out and not reread_pending:
+                        curr_data, curr_mime, curr_data_bytes = SecretText(''), 'text/plain', b''
                     # The baseline exists to swallow this server's own write
                     # coming back. A delivery that is neither that write nor an
                     # arm's staged read is a copy someone made, and a client
@@ -7443,7 +8388,9 @@ class WebRTCInput:
                             recopied or curr_data_bytes != self._clipboard_last_bytes):
                         logger_webrtc_input.debug(f"Clipboard changed. Sending content ({curr_mime})")
                         self._clipboard_last_bytes = curr_data_bytes
-                        await self.on_clipboard_read(curr_data, curr_mime)
+                        secret_out = isinstance(curr_data, SecretText) and bool(curr_data)
+                        self._spawn_task(self.on_clipboard_read(curr_data, curr_mime),
+                                         name="ClipboardBroadcast")
                 except asyncio.CancelledError:
                     logger_webrtc_input.debug("Clipboard monitor task canceled.")
                     break
@@ -7683,6 +8630,44 @@ class WebRTCInput:
             except asyncio.QueueFull:
                 logger_webrtc_input.warning("keyboard queue full; dropping input event.")
 
+    def _wl_scroll(self, dx: float, dy: float) -> None:
+        """Scroll the Wayland seat, behind any key still waiting in the keyboard worker.
+
+        Keys reach the seat through the worker and pointer events straight
+        from the message, so a modifier and a wheel click sent back to back --
+        a pinch, which arrives as Ctrl+wheel -- would otherwise scroll before
+        the modifier is down. With nothing queued the click goes out at once.
+
+        Args:
+            dx: Horizontal axis value.
+            dy: Vertical axis value.
+        """
+        if self.keyboard_queue.qsize() or self._keyboard_busy:
+            self._keyboard_enqueue(("scroll", (dx, dy)))
+        else:
+            self.wayland_input.inject_mouse_scroll(dx, dy)
+
+    def finger_scroll_available(self) -> bool:
+        """Whether this session takes a touchpad's scroll as a finger's: Wayland,
+        with a pixelflux that injects one. The display config tells the page
+        (`finger_scroll`); X11 scrolls by the page's wheel notches."""
+        return bool(self.is_wayland and self.wayland_input is not None
+                    and hasattr(self.wayland_input, "inject_finger_scroll"))
+
+    def _wl_finger_scroll(self, delta: Optional[Tuple[float, float]]) -> None:
+        """A touchpad's scroll on the Wayland seat, or its end with None, behind
+        any key still waiting in the keyboard worker, as `_wl_scroll` is."""
+        if self.keyboard_queue.qsize() or self._keyboard_busy:
+            self._keyboard_enqueue(("finger_scroll", delta))
+        else:
+            self._inject_finger_scroll(delta)
+
+    def _inject_finger_scroll(self, delta: Optional[Tuple[float, float]]) -> None:
+        if delta is None:
+            self.wayland_input.inject_finger_scroll_end()
+        else:
+            self.wayland_input.inject_finger_scroll(*delta)
+
     def _keyboard_enqueue_chord(self, keys: Iterable[tuple]) -> None:
         """Enqueue a server-synthesized press/release sequence as ONE entry, so
         overflow eviction can only lose it whole.
@@ -7760,6 +8745,7 @@ class WebRTCInput:
                 else:
                     msg_type, data = await self.keyboard_queue.get()
 
+                self._keyboard_busy = True
                 try:
                     keysym = data if msg_type in ("kd", "ku") else None
                     is_unicode_fallback = False
@@ -7818,6 +8804,14 @@ class WebRTCInput:
                         else:
                             await self.send_x11_keypress(keysym, down=False)
 
+                    elif msg_type == "scroll":
+                        await flush_buffer()
+                        self.wayland_input.inject_mouse_scroll(*data)
+
+                    elif msg_type == "finger_scroll":
+                        await flush_buffer()
+                        self._inject_finger_scroll(data)
+
                     elif msg_type == "chord":
                         # Back-to-back, so no other queued key lands inside the chord.
                         await flush_buffer()
@@ -7864,6 +8858,7 @@ class WebRTCInput:
                             unicode_buffer.append(data)
 
                 finally:
+                    self._keyboard_busy = False
                     self.keyboard_queue.task_done()
 
             except asyncio.CancelledError:
@@ -7997,11 +8992,16 @@ class WebRTCInput:
             # Dropped rather than defaulted: a default would warp to the origin.
             try: x, y, button_mask, scroll_magnitude = [int(i) for i in toks[1:5]]
             except (ValueError, IndexError): return
+            seq = None
             if len(toks) > 5:
                 # Motion may travel a channel that keeps no order, so pointer
                 # messages are numbered: an absolute position older than the
                 # last message applied for this connection is stale, not a move
-                # back; a delta still counts, in whatever order it lands.
+                # back; a delta still counts, in whatever order it lands. Every
+                # message carries the buttons held when it was sent, so a late
+                # one's are older than those applied since and are not applied
+                # again; only a wheel pulse's scroll bits, a click rather than
+                # a state, still land.
                 try: seq = int(toks[5])
                 except ValueError: return
                 last = self._pointer_seq.get(conn_id, 0)
@@ -8009,8 +9009,31 @@ class WebRTCInput:
                     return
                 if seq > last:
                     self._pointer_seq[conn_id] = seq
+                else:
+                    pulse = MOUSE_MASK_SCROLL_BITS if scroll_magnitude > 0 else 0
+                    button_mask = (self.button_mask & ~pulse) | (button_mask & pulse)
             try: await self.send_x11_mouse(x, y, button_mask, scroll_magnitude, relative, display_id=display_id)
             except Exception as e: logger_webrtc_input.warning(f"Failed to set mouse cursor: {e}")
+            if self._pointer_echoes:
+                self._pointer_moved(conn_id, seq, x if relative else 0, y if relative else 0)
+        elif msg_type in ("sf", "sfe"):
+            # A touchpad's scroll in stream pixels (`sf,<dx>,<dy>`) and the
+            # finger's lift (`sfe`), sent only where `finger_scroll_available`.
+            if not self.finger_scroll_available():
+                return
+            if msg_type == "sfe":
+                self._wl_finger_scroll(None)
+                return
+            try:
+                dx, dy = float(toks[1]), float(toks[2])
+            except (ValueError, IndexError):
+                return
+            if not (math.isfinite(dx) and math.isfinite(dy)):
+                return
+            self._wl_finger_scroll((max(-FINGER_SCROLL_MAX_PX, min(FINGER_SCROLL_MAX_PX, dx)),
+                                    max(-FINGER_SCROLL_MAX_PX, min(FINGER_SCROLL_MAX_PX, dy))))
+        elif msg_type == "_pointer_echo":
+            await self._set_pointer_echo(conn_id, len(toks) > 1 and toks[1].strip() == "1")
         elif msg_type == "p": await self.on_mouse_pointer_visible(bool(int(toks[1])))
         elif msg_type == "vp":
             # Where this display's page shows its stream on the user's desktop,
@@ -8340,8 +9363,8 @@ class WebRTCInput:
                 logger_webrtc_input.warning("Received 'cmd' message without a command string.")
         elif msg_type == "_arg_fps":
             try:
-                fps = int(toks[1])
-                if fps <= 0:
+                fps = float(toks[1])
+                if not 0 < fps < float("inf"):
                     return
                 await self.on_set_fps(fps, display_id)
             except Exception as e:
@@ -8377,8 +9400,9 @@ class WebRTCInput:
             except Exception as e: logger_webrtc_input.warning(f"Error with co,end type: {e}")
         elif msg_type == "_ebc":
             try:
-                enable = toks[1].lower() == "true"
-                self._spawn_task(self.update_binary_clipboard_setting(enable))
+                enable = sanitize_client_setting("enable_binary_clipboard", toks[1].lower() == "true",
+                                                 settings, logger_webrtc_input)
+                self._spawn_task(self.update_binary_clipboard_setting(bool(enable)))
             except Exception as e:
                 logger_webrtc_input.error(f"Error updating binary clipboard setting: {e}")
         elif msg_type == "_rc":
@@ -8461,6 +9485,9 @@ MOUSE_BUTTON_RIGHT_ID = 43
 # (Pointer Events button 5) drives the primary button (see send_x11_mouse).
 MOUSE_MASK_BIT_PRIMARY = 1 << 0
 MOUSE_MASK_BIT_ERASER = 1 << 5
+# The wheel's bits: 3 and 4 vertical, 6 and 7 horizontal, each a click on its
+# rising edge while the message carries a scroll magnitude.
+MOUSE_MASK_SCROLL_BITS = (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7)
 
 # Codes for the uinput mouse helper socket.
 UINPUT_BTN_LEFT = (EV_KEY, BTN_LEFT) 

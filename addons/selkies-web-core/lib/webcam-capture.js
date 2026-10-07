@@ -50,7 +50,7 @@ export const WEBCAM_CODEC_H265 = 5;
 /**
  * Candidates in preference order; support reports are no promise of speed,
  * so the probe measures each on real frames (Firefox's software H.264 tops
- * out under 30 fps at 720p where its VP8 runs three times faster). VP9, AV1
+ * out under 30 fps at 720p where its VP8 runs three times faster). VP9, AV1,
  * and H.265 come after the two every engine encodes: their software encoders
  * are slower still, and H.265 exists only where the platform encodes it.
  */
@@ -706,7 +706,9 @@ export class WebcamCapture {
   /**
    * Opens the camera and starts sending. Failures are reported through
    * `onError` rather than thrown, and a track that ends (device unplugged,
-   * permission revoked) stops the capture.
+   * permission revoked) stops the capture. A stop while the permission
+   * request is still pending withdraws the start: the camera it gets is
+   * released at once, and a failure after it is not reported.
    * @param {string=} deviceId Camera to open; the default device otherwise.
    */
   async start(deviceId) {
@@ -727,11 +729,18 @@ export class WebcamCapture {
     if (deviceId) {
       video.deviceId = { exact: deviceId };
     }
+    const asked = ++this._generation;
     let stream;
     try {
       stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
     } catch (error) {
-      this._onError(error);
+      if (this._generation === asked) {
+        this._onError(error);
+      }
+      return;
+    }
+    if (this._generation !== asked) {
+      stream.getTracks().forEach((t) => t.stop());
       return;
     }
     const track = stream.getVideoTracks()[0];
@@ -779,12 +788,15 @@ export class WebcamCapture {
     }
   }
 
-  /** Stops the capture and releases the camera, encoder and workers; idempotent. */
+  /**
+   * Stops the capture and releases the camera, encoder, and workers, or
+   * withdraws a start still waiting on its permission request; idempotent.
+   */
   stop() {
+    this._generation++;
     if (!this._active && !this._stream) {
       return;
     }
-    this._generation++;
     this._active = false;
     this._stopEncodeWorker();
     if (this._source) {
@@ -884,9 +896,10 @@ export class WebcamCapture {
    * read-and-encode; null when the engine cannot transfer tracks or the
    * worker lacks a MediaStreamTrackProcessor. A clone is transferred, so a
    * refusal (DataCloneError on Chromium) leaves the original for the
-   * page-read fallback.
+   * page-read fallback. A reply that comes after a later capture began leaves
+   * that capture's state alone, and its handle closes only its own worker.
    * @param {MediaStreamTrack} track
-   * @param {number} generation
+   * @param {number} generation Capture generation the worker serves.
    * @returns {Promise<?{close: function(): void}>}
    */
   _tryCombinedWorker(track, generation) {
@@ -910,11 +923,13 @@ export class WebcamCapture {
       const onMessage = (e) => {
         const m = e.data;
         if (m.type === "track_reading") {
-          this._workerIsSource = true;
-          this._deriveOrientation = canDeriveOrientation();
-          this._watchOrientation();
-          this._logPath("capture+encode: camera read and encoded in a worker");
-          finish({ close: () => this._stopEncodeWorker() });
+          if (this._generation === generation) {
+            this._workerIsSource = true;
+            this._deriveOrientation = canDeriveOrientation();
+            this._watchOrientation();
+            this._logPath("capture+encode: camera read and encoded in a worker");
+          }
+          finish({ close: () => { if (this._encodeWorker === worker) this._stopEncodeWorker(); } });
         } else if (m.type === "track_unsupported") {
           // No worker MediaStreamTrackProcessor here, so a second worker would
           // fail the same way: _openSource skips straight to the page's.
@@ -1408,7 +1423,7 @@ export class WebcamCapture {
       }
     }
     if (typeof VideoEncoder === "undefined" || this._candidateIndex >= this._encoderCandidates.length) {
-      this._encodeJpeg(frame, now);
+      this._encodeJpeg(frame);
       return;
     }
     const w = frame.displayWidth || frame.codedWidth;
@@ -1529,7 +1544,7 @@ export class WebcamCapture {
         latencyMode: "realtime",
         ...cand.extra,
       };
-      let support = null;
+      let support;
       try {
         support = await VideoEncoder.isConfigSupported(config);
       } catch (error) {
@@ -1641,14 +1656,13 @@ export class WebcamCapture {
   }
 
   /**
-   * Encodes a frame as JPEG through `OffscreenCanvas.convertToBlob`, one in
-   * flight at a time. A JPEG leaves upright with no transform on the wire:
-   * drawImage bakes in the engine's, a derived one is applied as a canvas
-   * transform.
+   * Encodes a frame as JPEG through `OffscreenCanvas.convertToBlob`, or a page
+   * canvas's `toBlob` where the engine has no OffscreenCanvas, one in flight at
+   * a time. A JPEG leaves upright with no transform on the wire: drawImage
+   * bakes in the engine's, a derived one is applied as a canvas transform.
    * @param {VideoFrame|HTMLVideoElement} frame
-   * @param {number} now `performance.now()` at receipt.
    */
-  _encodeJpeg(frame, now) {
+  _encodeJpeg(frame) {
     if (this._jpegBusy) {
       closeFrame(frame);
       return;
@@ -1660,8 +1674,15 @@ export class WebcamCapture {
     const w = sideways ? dh : dw;
     const h = sideways ? dw : dh;
     if (!this._canvas) {
-      this._logPath("encoder: JPEG through OffscreenCanvas");
-      this._canvas = new OffscreenCanvas(w, h);
+      if (typeof OffscreenCanvas !== "undefined") {
+        this._logPath("encoder: JPEG through OffscreenCanvas");
+        this._canvas = new OffscreenCanvas(w, h);
+      } else {
+        this._logPath("encoder: JPEG through a page canvas");
+        this._canvas = document.createElement("canvas");
+        this._canvas.width = w;
+        this._canvas.height = h;
+      }
       this._ctx = this._canvas.getContext("2d", { alpha: false, desynchronized: true });
     } else if (this._canvas.width !== w || this._canvas.height !== h) {
       this._canvas.width = w;
@@ -1684,8 +1705,12 @@ export class WebcamCapture {
     closeFrame(frame);
     this._jpegBusy = true;
     const generation = this._generation;
-    this._canvas
-      .convertToBlob({ type: "image/jpeg", quality: this.quality })
+    const canvas = this._canvas;
+    const jpeg = canvas.convertToBlob
+      ? canvas.convertToBlob({ type: "image/jpeg", quality: this.quality })
+      : new Promise((resolve, reject) => canvas.toBlob(
+        (blob) => (blob ? resolve(blob) : reject(new Error("the canvas gave no JPEG"))), "image/jpeg", this.quality));
+    jpeg
       .then((blob) => blob.arrayBuffer())
       .then((buf) => {
         if (this._active && this._generation === generation) {

@@ -44,7 +44,7 @@ The settings are grouped by what they govern, the ones a deployment reaches for 
 # one is placed on purpose rather than appended to the end of the page.
 SECTIONS = [
     ("Stream", "The video encoder and its rate control. The dashboard chooses among what the server allows.", [
-        "encoder", "video_fullcolor", "framerate", "video_bitrate", "video_crf", "rate_control_mode",
+        "encoder", "video_fullcolor", "video_10bit", "framerate", "video_bitrate", "video_crf", "rate_control_mode",
         "enable_rate_control", "congestion_control", "keyframe_interval", "video_min_qp", "video_max_qp",
         "jpeg_quality", "video_streaming_mode", "use_paint_over_quality", "paint_over_jpeg_quality",
         "video_paintover_crf", "video_paintover_burst_frames", "use_cpu", "gpu_id", "encode_dri",
@@ -54,24 +54,24 @@ SECTIONS = [
         "audio_enabled", "audio_bitrate", "audio_channels", "audio_device_name", "audio_frame_duration_ms",
         "audio_redundancy", "audio_redundancy_distance", "microphone_enabled",
     ]),
-    ("Display", "Resolution, scaling, cursors and the second display.", [
+    ("Display", "Resolution, scaling, cursors, and the second display.", [
         "enable_resize", "manual_resolution", "manual_width", "manual_height", "force_aligned_resolution",
         "scaling_dpi", "use_css_scaling", "second_screen", "enable_cursors", "cursor_size",
         "use_browser_cursors", "raw_pointer_motion", "watermark_path", "watermark_location", "debug_cursors",
     ]),
     ("Backends", "The X11 or Wayland capture backend and the GPU it renders on.", [
         "wayland", "render_dri", "auto_gpu", "app_wayland_display", "wayland_host_display",
-        "wayland_socket_index", "computer_use_bind",
+        "wayland_socket_index", "computer_use_bind", "computer_use_token",
     ]),
     ("Session start", "What a session starts with, and hooks around its first and last client.", [
         "video_on_start", "audio_on_start", "microphone_on_start", "webcam_on_start", "gamepad_on_start",
         "app_wait_ready", "app_ready_file", "run_after_connect", "run_after_disconnect",
     ]),
-    ("Input", "Gamepads, keyboard chords and the input devices published to the session.", [
+    ("Input", "Gamepads, keyboard chords, and the input devices published to the session.", [
         "gamepad_enabled", "uinput_gamepad", "js_socket_path", "uinput_mouse_socket", "publish_input_devices",
         "keyboard_shortcuts", "mac_cmd_as_ctrl",
     ]),
-    ("Clipboard, files and printing", "What leaves and enters the session besides the stream.", [
+    ("Clipboard, files, and printing", "What leaves and enters the session besides the stream.", [
         "enable_clipboard", "enable_binary_clipboard", "clipboard_seamless", "file_transfers",
         "file_manager_path", "file_transfer_limit_mbps", "printing_enabled", "print_spool_path",
     ]),
@@ -83,27 +83,28 @@ SECTIONS = [
         "enable_sharing", "enable_shared", "enable_collab", "enable_player2", "enable_player3", "enable_player4",
     ]),
     ("Client interface", "What the shipped web interface shows; the feature behind a hidden control keeps working.", [
-        "ui_title", "ui_show_logo", "ui_show_sidebar", "ui_show_core_buttons", "ui_sidebar_show_video_settings",
+        "ui_title", "ui_show_logo", "ui_show_sidebar", "ui_show_connection_indicator", "ui_show_core_buttons",
+        "ui_sidebar_show_video_settings",
         "ui_sidebar_show_screen_settings", "ui_sidebar_show_audio_settings", "ui_sidebar_show_stats",
         "ui_sidebar_show_shortcuts", "ui_sidebar_show_clipboard", "ui_sidebar_show_files", "ui_sidebar_show_apps",
         "ui_sidebar_show_sharing", "ui_sidebar_show_gamepads", "ui_sidebar_show_webcam",
         "ui_sidebar_show_fullscreen", "ui_sidebar_show_gaming_mode", "ui_sidebar_show_trackpad",
         "ui_sidebar_show_keyboard_button", "ui_sidebar_show_soft_buttons",
     ]),
-    ("Server", "The transport, the listening address, TLS, the login and the master token.", [
+    ("Server", "The transport, the listening address, TLS, the login, and the master token.", [
         "mode", "enable_dual_mode", "addr", "public", "port", "unix_socket", "subfolder", "web_root",
-        "allowed_origins", "enable_https", "https_cert", "https_key", "cert_reload_interval",
+        "allowed_origins", "frame_ancestors", "enable_https", "https_cert", "https_key", "cert_reload_interval",
         "enable_basic_auth", "basic_auth_user", "basic_auth_password", "basic_auth_viewonly_password",
         "master_token", "master_token_file", "command_enabled", "debug",
     ]),
-    ("WebRTC and TURN", "The opt-in WebRTC transport's ICE, STUN and TURN configuration.", [
+    ("WebRTC and TURN", "The opt-in WebRTC transport's ICE, STUN, and TURN configuration.", [
         "rtc_config_json", "turn_host", "turn_port", "turn_protocol", "turn_tls", "turn_shared_secret",
         "turn_username", "turn_password", "turn_rest_uri", "turn_rest_api_key", "turn_rest_username",
         "turn_rest_username_auth_header", "turn_rest_protocol_header", "turn_rest_tls_header", "stun_host",
         "stun_port", "enable_cloudflare_turn", "cloudflare_turn_token_id", "cloudflare_turn_api_token",
         "webrtc_public_ip", "webrtc_port_range", "webrtc_udp_mux_port", "webrtc_tcp_mux_port", "webrtc_ice_lite",
     ]),
-    ("Recording, audit and metrics", "The recording tap, the audit webhook and the metrics endpoints.", [
+    ("Recording, audit, and metrics", "The recording tap, the audit webhook, and the metrics endpoints.", [
         "recording_socket", "audit_webhook_url", "audit_webhook_token", "audit_webhook_timeout",
         "enable_metrics_http", "enable_webrtc_statistics", "webrtc_statistics_dir",
     ]),

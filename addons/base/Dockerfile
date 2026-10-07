@@ -19,14 +19,14 @@
 #
 #   - X11 display server (XLibre's Xvfb, with glamor and DRI3) and the headless Wayland backend
 #     with SELKIES_WAYLAND=true, whose nested labwc supplies window management,
-#     decorations and XWayland
+#     decorations, and XWayland
 #   - s6 service supervision, running as PID 1 or below a foreign init
 #   - Joystick interposer + fake-udev (container-only gamepad plumbing) and the
 #     V4L2 webcam interposer, all built in-tree and wired with LD_PRELOAD
 #   - GPU wiring: NVIDIA/VA-API/Vulkan runtime, Zink for hardware OpenGL, and
 #     the 32-bit graphics runtime on x86, which a 32-bit application needs a
 #     complete second copy of
-#   - Audio: PipeWire with the PulseAudio, ALSA, JACK and V4L2 interfaces,
+#   - Audio: PipeWire with the PulseAudio, ALSA, JACK, and V4L2 interfaces,
 #     recorded through the PulseAudio one by pcmflux
 #   - Embedded coTURN for WebRTC firewall traversal
 #   - Selkies installed with pip from the wheels dropped into `wheels/` (its
@@ -45,7 +45,14 @@ ARG DISTRIB_RELEASE="26.04"
 # addons/base/patches/xvfb-gpu-screen-pixmap.patch, which keeps the screen
 # pixmap on the GPU and sizes the framebuffer to the RandR screen, and
 # addons/base/patches/xvfb-hotplug-outputs.patch, which gives the server spare
-# outputs with CRTCs of their own that Selkies plugs in as a display is added.
+# outputs with CRTCs of their own that Selkies plugs in as a display is added,
+# addons/base/patches/xvfb-syncobj-present.patch, which lets a DRI3 client
+# synchronize its presents explicitly, as the NVIDIA driver's must, and
+# addons/base/patches/xvfb-vblank-rate.patch, which runs the vblank the server
+# fakes at the rate the session is captured at, to the millihertz, and
+# addons/base/patches/xvfb-zero-copy-semaphore.patch, which signals a GPU
+# semaphore the capture shares with glamor after its blit, so the encoder waits
+# for it on the GPU rather than on the CPU.
 ARG WLROOTS_VERSION="0.19.3"
 ARG LABWC_VERSION="0.9.7"
 # Both come as the archives GitHub generates for their tags, with no tarball
@@ -270,7 +277,7 @@ ARG DISTRIB_IMAGE
 ARG DISTRIB_RELEASE
 
 # Every network fetch in this image is retried, because a build that reaches for
-# a package index, a signing key or a wheel is one transient failure away from
+# a package index, a signing key, or a wheel is one transient failure away from
 # losing the whole run. apt is configured once here so each of its later
 # invocations inherits it; curl and pip carry their own flags at each call.
 RUN printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\nAcquire::Retries::Delay::Maximum "30";\n' \
@@ -327,7 +334,7 @@ RUN apt-get clean && apt-get update && apt-get dist-upgrade -y && apt-get instal
     # released for the whole rootless build in between: dpkg replaces a file by
     # hardlinking the old one aside, which the kernel denies uid 1000 on a
     # setuid file it does not own, and an archive update to util-linux, shadow,
-    # sudo, fuse3 or dbus would fail the layer taking it.
+    # sudo, fuse3, or dbus would fail the layer taking it.
     selkies-privileged-files release && \
     { chown -R -f -h --no-preserve-root ubuntu:ubuntu / || echo 'Failed to set filesystem ownership in some paths to ubuntu user'; }
 
@@ -360,7 +367,7 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then dpkg --add-architectur
         dnsutils \
         # A session hands the user a terminal: `file` is what desktop tooling
         # types a path with, `less` is the pager man and git reach for, and the
-        # editors, monitor and version control a shell session is expected to
+        # editors, monitor, and version control a shell session is expected to
         # have. Not desktop components: any session built on this one wants them
         file \
         less \
@@ -431,15 +438,6 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then dpkg --add-architectur
         libxfixes3 \
         libxtst6 \
         libxext6 \
-        # x264 for pixelflux's striped software H.264 encoder (optional GPL
-        # feature of prebuilt wheels; the package pulls the matching runtime)
-        x264 \
-        # ffmpeg sidecars pixelflux links (hardware VA-API and PPM sinks); the
-        # metapackage resolves the ABI-versioned libavutil/libavfilter/libavcodec
-        # per release, whose suffixes move every LTS. opus-tools covers pcmflux's
-        # audio encoder
-        ffmpeg \
-        opus-tools \
         # Wayland backend: pixelflux opens libwayland-server for the capture
         # compositor, and XWayland serves the X11-only applications running
         # under the nested session compositor installed below
@@ -512,8 +510,10 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then dpkg --add-architectur
         aspell-en \
         hunspell \
         enchant-2 \
-        # The codecs the distribution's default ffmpeg build leaves out, which
-        # a player or a browser falls back to for anything it cannot decode
+        # The distribution's ffmpeg, with the codecs its default build leaves
+        # out, for the desktop's players and browsers, which fall back to it
+        # for anything they cannot decode themselves
+        ffmpeg \
         libavcodec-extra \
         # Fonts: DejaVu/Liberation for Latin, Noto for worldwide script and emoji coverage
         fonts-dejavu-core \
@@ -593,8 +593,12 @@ ENV PATH="/usr/local/nvidia/bin${PATH:+:${PATH}}"
 ENV LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 ENV NVIDIA_VISIBLE_DEVICES="all"
 ENV NVIDIA_DRIVER_CAPABILITIES="all"
-# Off because the stream's rate is Selkies' to change; a GL client locked to the
-# framebuffer's refresh would pace itself against a rate that is not the stream's.
+# Off: vsync here costs an application about two frames of input latency, the
+# frames its driver queues behind the fake vblank, and does not reliably keep
+# a GPU-bound one from starving the capture, which a frame limiter does
+# (docs/components/desktop-image.md). GLX takes it as the default an
+# application's own swap interval overrides; NVIDIA's EGL applies it over the
+# application's choice.
 ENV __GL_SYNC_TO_VBLANK="0"
 
 # Package state is already owned by the session user: the recursive chown above
@@ -636,7 +640,7 @@ RUN --mount=type=bind,source=addons/base/wheels,target=/tmp/wheels \
 RUN set -e; \
     selkies --help > /dev/null; \
     python3 -c "import selkies, pixelflux, pcmflux"; \
-    python3 -c "import ctypes; [ctypes.CDLL(name) for name in ('libwayland-server.so.0', 'libEGL.so.1', 'libgbm.so.1', 'libpulse.so.0', 'libva.so.2', 'libdrm.so.2', 'libxkbcommon.so.0', 'libpixman-1.so.0')]"
+    python3 -c "import ctypes; [ctypes.CDLL(name) for name in ('libwayland-server.so.0', 'libEGL.so.1', 'libgbm.so.1', 'libpulse.so.0', 'libva.so.2', 'libva-drm.so.2', 'libdrm.so.2', 'libxkbcommon.so.0', 'libpixman-1.so.0')]"
 
 # XLibre's server replaces the distribution's /usr/bin/Xvfb; chowned
 # to the session user like the rest of the image so fakeroot-sudo apt can
@@ -662,6 +666,9 @@ COPY --from=add-ons --chown=1000:1000 /opt/add-ons/lib/ /usr/lib/
 # applications
 COPY --chown=1000:1000 addons/base/labwc-rc.xml /etc/xdg/labwc/rc.xml
 
+# A PulseAudio client that leaves its buffer to pipewire-pulse gets 40 ms, not 2 s
+COPY --chown=1000:1000 addons/base/pipewire-pulse.conf.d/ /etc/pipewire/pipewire-pulse.conf.d/
+
 # Copy the startup scripts and s6 service definitions (same /etc/service/<svc>/run layout as runit, supervised by s6-supervise)
 COPY --chown=1000:1000 addons/base/container-entrypoint.sh /etc/container-entrypoint.sh
 COPY --chown=1000:1000 addons/base/selkies-entrypoint.sh /etc/selkies-entrypoint.sh
@@ -672,7 +679,7 @@ RUN chmod -f 755 /etc/container-entrypoint.sh /etc/selkies-entrypoint.sh && \
 # Configure bashrc to show /etc/motd and enable bash completion, and to give an
 # interactive shell the running session's environment. A shell started with
 # `docker exec` is not a child of the entrypoint and inherits none of what it
-# resolved, so DISPLAY, WAYLAND_DISPLAY and the audio socket are all unset and
+# resolved, so DISPLAY, WAYLAND_DISPLAY, and the audio socket are all unset and
 # every graphical command fails. Only filled in when the caller passed no
 # display of their own.
 RUN echo "[ -n \"\$PS1\" ] && [ -z \"\$DISPLAY\" ] && [ -z \"\$WAYLAND_DISPLAY\" ] && [ -r \"\${XDG_RUNTIME_DIR:-/tmp/runtime-ubuntu}/container-env\" ] && . \"\${XDG_RUNTIME_DIR:-/tmp/runtime-ubuntu}/container-env\"" >> /etc/bash.bashrc && \

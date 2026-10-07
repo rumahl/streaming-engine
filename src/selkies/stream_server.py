@@ -71,13 +71,15 @@ UPLOAD_STAGING_PREFIX: str = ".selkies-upload-"
 
 
 class PathOnlyAccessLogger(AbstractAccessLogger):
-    """aiohttp access log whose request line carries the path without its query.
+    """aiohttp access log whose request line and Referer carry no query.
 
-    The secure-mode session token rides the data WebSocket URL as a query
-    parameter, so the stock request-line atom (which logs ``path_qs``) would
-    write credentials into the access log. The line otherwise has the default
-    shape: remote address, start time, method + path + version, status, body
-    size, Referer and User-Agent.
+    A secure-mode session token rides a query parameter when the page was
+    opened with ``?token=``: on the data WebSocket URL, the file-manager
+    listing, and the Referer of every request that page makes. The stock
+    request-line atom (which logs ``path_qs``) would write it into the access
+    log, and so would the Referer, so both are logged without their query. The
+    line otherwise has the default shape: remote address, start time, method +
+    path + version, status, body size, Referer, and User-Agent.
     """
 
     @property
@@ -97,7 +99,7 @@ class PathOnlyAccessLogger(AbstractAccessLogger):
                 request.version.minor,
                 response.status,
                 response.body_length,
-                request.headers.get("Referer", "-"),
+                request.headers.get("Referer", "-").split("?", 1)[0].split("#", 1)[0],
                 request.headers.get("User-Agent", "-"),
             )
         except Exception:
@@ -144,6 +146,10 @@ TRANSFER_CHUNK_MAX_BYTES: int = 1 << 20
 # Below this a transfer is over before a queue could matter, and gauging it
 # would only make a small file feel slow.
 TRANSFER_MIN_GAUGED_BYTES: int = 4 * 1024 * 1024
+
+
+# The web client's files whose staleness changes what a page does.
+WEB_CODE = (".html", ".js", ".mjs", ".css", ".wasm")
 
 
 class _AuditedFileResponse(web.FileResponse):
@@ -217,7 +223,9 @@ def note_pong(ws: Any, data: Any) -> None:
     The transports' message loops call this for every `WSMsgType.PONG` (their
     sockets run with autoping off so the frames reach them). A payload the
     clock did not send — an answer to an aiohttp heartbeat ping, or a peer's
-    unsolicited pong — misses the pending map and is ignored.
+    unsolicited pong — misses the pending map and is ignored. `answered` keeps
+    when the newest answered ping was sent: everything written to the socket
+    before it has reached the peer.
     """
     state = _UPLINK_SESSIONS.get(ws)
     if state is None:
@@ -230,6 +238,20 @@ def note_pong(ws: Any, data: Any) -> None:
         return
     state["rtt_us"] = int((time.monotonic() - sent) * 1e6)
     state["seq"] += 1
+    state["answered"] = max(state.get("answered", 0.0), sent)
+
+
+async def ping_behind(ws: Any) -> None:
+    """Ping `ws` behind everything written to it so far: its pong says all of that
+    reached the peer (`note_pong` keeps when the newest answered ping went out)."""
+    state = _uplink_session_state(ws)
+    payload = state["next_ping"].to_bytes(8, "big")
+    state["next_ping"] += 1
+    pending = state["pending"]
+    pending[payload] = time.monotonic()
+    while len(pending) > UplinkGauge._PENDING_MAX:
+        pending.pop(next(iter(pending)))
+    await ws.ping(payload)
 
 
 def _observe_rtt_floor(state: Dict[str, Any], rtt_us: int, now: float) -> int:
@@ -250,6 +272,243 @@ def _observe_rtt_floor(state: Dict[str, Any], rtt_us: int, now: float) -> int:
     else:
         buckets.append([bucket, rtt_us])
     return min(b[1] for b in buckets)
+
+
+class CongestionSteer:
+    """The steer of one display's CBR target over congestion ticks, for both
+    transports. A tick carries two kinds of evidence: the queue standing on the
+    path (the WebSockets backpressure loop measures it from the display's frame
+    round trip, `DataStreamingServer._steer_bitrate_to_link`, and WebRTC's loop
+    from one-way delay, `RTCDtlsTransport.take_twcc_window`) and the loss the
+    receiver reported (WebRTC's loop, from the same transport-wide-cc feedback).
+
+    A standing queue backs the target off on the first tick that shows it: a
+    delay verdict fires at a queue that is still small, where waiting a second
+    tick lets it grow by the whole overshoot. The rate the path delivered while
+    the queue stood is its capacity, so the target drops to HEADROOM of that
+    rather than by a blind fraction, and lower still while the queue already
+    written ahead drains: at the depth that empties it in DRAIN_S, never under
+    DRAIN_FLOOR of the capacity, for as long as that takes at that rate. No cut
+    follows until the drain and SETTLE_S more have passed, because the queue the
+    cut is emptying reads as a queue meanwhile; cutting again on it would take
+    the target to the floor while the path only drains. The target returns to
+    HEADROOM of the capacity on the first tick past the drain that reads no
+    queue and no loss past LOSS, and that return clears a loss strike: a queue
+    the drain left keeps the drain's target through the hold, and the tick
+    after the hold backs off again. Without a measured
+    delivery the backoff is BACKOFF of the target, held for HOLD_S. A tick whose
+    stream offered the path less than APP_LIMITED of the target, and whose
+    path delivered at least APP_LIMITED_DELIVERED of it, a still screen's
+    trickle, cuts nothing on a queue: what the path delivered is then what the
+    stream sent rather than what the path carries, and a cut to it would put
+    the next motion at the floor while draining nothing the stream queued. A
+    stream the path delivers less of than it offers is filling the queue,
+    whatever its target, and backs off.
+
+    Loss backs the target off only on the second lossy tick in a row: one tick
+    of a thin stream is too few packets for its loss fraction to mean anything.
+    That backoff is BACKOFF of the target, held for HOLD_S, so the recovery does
+    not climb straight back onto the loss that caused it.
+
+    A clean tick outside a hold raises the target, by STEP a second while what
+    the path delivers is far from the last capacity it showed and by STEP_NEAR
+    once it is within NEAR of it, where the next queue waits: probing there
+    slowly keeps the overshoot that finds it small. Delivered rates rather than
+    targets are compared, since an encoder need not emit what it is asked for
+    (a CBR encoder with a small buffer runs under its target, and content it
+    cannot compress that far runs over). A path that delivers clear past the
+    old capacity with no queue forgets it, since it now carries more. A raise
+    also follows HEADROOM of the measured goodput where that is higher, never
+    past the ceiling.
+    """
+
+    LOSS = 0.10
+    BACKOFF = 0.7
+    HOLD_S = 2.0
+    STEP = 1.15
+    STEP_NEAR = 1.05
+    NEAR = 0.9
+    HEADROOM = 0.85
+    DRAIN_S = 1.0
+    DRAIN_FLOOR = 0.5
+    SETTLE_S = 0.5
+    APP_LIMITED = 0.5
+    APP_LIMITED_DELIVERED = 0.8
+
+    def __init__(self) -> None:
+        self.strikes = 0
+        self.hold_until = 0.0
+        self.capacity_kbps: Optional[float] = None
+        self._cruise_kbps: Optional[float] = None
+        self._drain_until = 0.0
+        self._tick_at: Optional[float] = None
+
+    def target(self, current: float, ceiling: float, floor: float,
+               goodput_bps: float, loss: float, now: float,
+               queue_s: Optional[float] = None,
+               offered_bps: Optional[float] = None) -> float:
+        """The next target in kbps for one tick.
+
+        Args:
+            current: The target in force, in kbps.
+            ceiling: The configured target, which the steer never exceeds.
+            floor: The lowest target allowed.
+            goodput_bps: What the path delivered over the tick, or 0 when unmeasured.
+            loss: The loss fraction the receiver reported over the tick.
+            now: Monotonic time of the tick.
+            queue_s: The queue standing on the path through the tick, in seconds:
+                0 for a clean tick, None where the transport measures no delay.
+            offered_bps: What the stream sent over the tick, or None when
+                unmeasured.
+        """
+        dt = 1.0 if self._tick_at is None else min(max(now - self._tick_at, 0.0), 2.0)
+        self._tick_at = now
+        drained = (
+            self._cruise_kbps is not None
+            and now >= self._drain_until
+            and not queue_s
+            and loss <= self.LOSS
+        )
+        if drained:
+            current, self._cruise_kbps = self._cruise_kbps, None
+        if queue_s:
+            self.strikes = 0
+            limited = (offered_bps is not None
+                       and offered_bps < current * 1_000 * self.APP_LIMITED
+                       and (goodput_bps <= 0 or offered_bps <= goodput_bps / self.APP_LIMITED_DELIVERED))
+            if now >= self.hold_until and not limited:
+                current = self._queue_backoff(current, goodput_bps / 1_000, queue_s, now)
+            return max(floor, min(ceiling, current))
+        if drained:
+            self.strikes = 0
+            return max(floor, min(ceiling, current))
+        if loss > self.LOSS:
+            self.strikes += 1
+            if self.strikes < 2:
+                return max(floor, min(ceiling, current))
+            self.strikes = 0
+            self._cruise_kbps = None
+            self.hold_until = now + self.HOLD_S
+            return max(floor, min(ceiling, current * self.BACKOFF))
+        self.strikes = 0
+        if now < self.hold_until:
+            return max(floor, min(ceiling, current))
+        step = self.STEP
+        capacity = self.capacity_kbps
+        delivered = goodput_bps / 1_000
+        if capacity is not None:
+            if delivered * self.NEAR > capacity:
+                self.capacity_kbps = None
+            elif delivered >= capacity * self.NEAR:
+                step = self.STEP_NEAR
+        return max(floor, min(ceiling, max(current * step ** dt, delivered * self.HEADROOM)))
+
+    def _queue_backoff(self, current: float, delivered_kbps: float, queue_s: float, now: float) -> float:
+        """The target a standing queue of `queue_s` backs off to, with the drain it plans."""
+        if delivered_kbps <= 0:
+            self._cruise_kbps = None
+            self.hold_until = now + self.HOLD_S
+            return current * self.BACKOFF
+        self.capacity_kbps = delivered_kbps
+        fraction = max(self.DRAIN_FLOOR, self.HEADROOM - queue_s / self.DRAIN_S)
+        self._drain_until = now + queue_s / (1.0 - fraction)
+        self._cruise_kbps = delivered_kbps * self.HEADROOM
+        self.hold_until = self._drain_until + self.SETTLE_S
+        return min(current, delivered_kbps * fraction)
+
+
+class RateHold:
+    """Whether a display's steered rate has held long enough for its page to
+    keep: a rate that stays within HOLD_BAND of where it settled for HOLD_S is
+    returned by `note` once, and a move out of the band starts over. The page
+    sends it back when it next connects (`start_kbps`), so a restarted server
+    starts that page's stream at what its path carried rather than at the
+    configured rate and the queue a start at the configured rate builds."""
+
+    HOLD_S = 10.0
+    HOLD_BAND = 0.05
+
+    def __init__(self) -> None:
+        self.kbps: Optional[float] = None
+        self.since = 0.0
+        self.told = False
+
+    def note(self, kbps: float, now: float) -> Optional[int]:
+        """Fold in the rate in force at `now`; the rate to tell the page, or None."""
+        if self.kbps is None or abs(kbps - self.kbps) > self.HOLD_BAND * self.kbps:
+            self.kbps, self.since, self.told = kbps, now, False
+            return None
+        if self.told or now - self.since < self.HOLD_S:
+            return None
+        self.told = True
+        return round(self.kbps)
+
+
+class ConnectionVerdict:
+    """Whether one page's connection is poor: the share of its display's
+    frames that do not reach it, lost on the way past repair or held back for
+    its link, judged over windows of WINDOW_S with the hysteresis of
+    Moonlight's connection warning. A window at POOR_SHARE, or at TWICE_SHARE
+    after one that was too, makes the verdict poor, and one at OK_SHARE or
+    under makes it good again. A window that ends with fewer than MIN_FRAMES
+    frames held a still screen or a caret (the capture is damage-gated) and is
+    not judged, nor is the first, which a joining page's wait for its key frame
+    takes up. `note` returns the verdict only when it changes, which is when
+    the page is told."""
+
+    WINDOW_S = 3.0
+    POOR_SHARE = 0.30
+    TWICE_SHARE = 0.15
+    OK_SHARE = 0.05
+    MIN_FRAMES = 15
+
+    def __init__(self) -> None:
+        self.poor = False
+        self._since: Optional[float] = None
+        self._frames = 0
+        self._missed = 0
+        self._judged = 0
+        self._share = 0.0
+
+    def note(self, frames: int, missed: int, now: float) -> Optional[bool]:
+        """Count `frames` the display produced for the page and `missed` frames
+        of those or earlier ones that will not reach it; the new verdict, or None."""
+        if self._since is None:
+            self._since = now
+        self._frames += frames
+        self._missed += missed
+        if now - self._since < self.WINDOW_S:
+            return None
+        frames, missed = self._frames, self._missed
+        self._since, self._frames, self._missed = now, 0, 0
+        if frames < self.MIN_FRAMES:
+            return None
+        share, previous = min(1.0, missed / frames), self._share
+        self._share = share
+        self._judged += 1
+        if self._judged == 1:
+            return None
+        if not self.poor and (share >= self.POOR_SHARE
+                              or (share >= self.TWICE_SHARE and previous >= self.TWICE_SHARE)):
+            self.poor = True
+            return True
+        if self.poor and share <= self.OK_SHARE:
+            self.poor = False
+            return False
+        return None
+
+
+def start_kbps(remembered: Any, lo_kbps: float, ceiling_kbps: float) -> Optional[float]:
+    """The rate a steered stream starts at from the one its page remembered
+    (`RateHold`): within the configured range and under the ceiling, or None
+    where the page sent no positive number."""
+    try:
+        kbps = float(remembered)
+    except (TypeError, ValueError):
+        return None
+    if not kbps > 0 or kbps == float("inf"):
+        return None
+    return max(lo_kbps, min(ceiling_kbps, kbps))
 
 
 class UplinkGauge:
@@ -327,15 +586,8 @@ class UplinkGauge:
         if now - self._last_ping >= self.PING_INTERVAL:
             self._last_ping = now
             for conn in list(self._conns):
-                ws, state, _last = conn
-                payload = state["next_ping"].to_bytes(8, "big")
-                state["next_ping"] += 1
-                pending = state["pending"]
-                pending[payload] = now
-                while len(pending) > self._PENDING_MAX:
-                    pending.pop(next(iter(pending)))
                 try:
-                    await ws.ping(payload)
+                    await ping_behind(conn[0])
                 except Exception:
                     self._conns.remove(conn)
         verdict: Optional[bool] = None
@@ -567,6 +819,24 @@ def _carry_destination_mode(staging: str, dest: str) -> None:
         logger.debug(f"Could not carry the mode of {dest} onto the staged upload: {e}")
 
 
+def _finalize_upload(staging: str, dest: str) -> None:
+    """Rename a complete staged upload onto ``dest``, carrying its mode over.
+
+    Raises:
+        OSError: The rename failed; the staged file is left for the caller.
+    """
+    _carry_destination_mode(staging, dest)
+    os.replace(staging, dest)
+
+
+def _remove_quietly(path: str) -> None:
+    """Remove ``path``, ignoring a file that is already gone or cannot go."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _ipv6_loopback_redirect(request: web.Request, path: str) -> Optional[str]:
     """Where to serve a page that arrived on the IPv6 loopback from, or ``None``.
 
@@ -596,7 +866,8 @@ def _ipv6_loopback_redirect(request: web.Request, path: str) -> Optional[str]:
         return None
     # Where the browser goes is this process's to say: the literal host, the port
     # this socket listens on, and the caller's own route. Only the query rides
-    # along, which a session's token needs and which cannot name another origin.
+    # along, which a page opened with ``?token=`` needs (the browser keeps a
+    # fragment across the redirect itself) and which cannot name another origin.
     scheme = "https" if request.secure else "http"
     query = f"?{request.query_string}" if request.query_string else ""
     return f"{scheme}://127.0.0.1:{int(sockname[1])}{path}{query}"
@@ -672,6 +943,23 @@ async def _bind_listen_sockets(addr: str, port: int) -> List[socket.socket]:
     return socks
 
 
+def _frame_ancestors_directive(value: str) -> str:
+    """The Content-Security-Policy that `frame_ancestors` asks for, "" when it names none.
+
+    Entries are comma- or space-separated; `self` and `none` become the quoted
+    keywords, and an entry carrying a quote or a semicolon, which would end the
+    directive, is dropped.
+    """
+    sources = []
+    for item in (value or "").replace(",", " ").split():
+        keyword = item.strip("'").lower()
+        if keyword in ("self", "none"):
+            sources.append(f"'{keyword}'")
+        elif "'" not in item and ";" not in item:
+            sources.append(item)
+    return f"frame-ancestors {' '.join(sources)}" if sources else ""
+
+
 def _unix_socket_is_live(path: str) -> bool:
     """Return True when something accepts a connection on ``path``, i.e. the
     socket file belongs to a running listener rather than being a leftover from
@@ -700,12 +988,48 @@ WEBSOCKET_ROUTES: Tuple[str, ...] = ("/api/websockets", "/api/webrtc/signaling",
 # Mirror of the secure-mode session token for requests the client cannot put
 # a header on (the file-manager iframe and its download links).
 SESSION_TOKEN_COOKIE: str = "selkies_token"
+# Subprotocols of a handshake presenting its session token without a URL: the
+# one selected, and the prefix of the base64url token (``handshake_session_token``).
+SESSION_TOKEN_PROTOCOL: str = "selkies"
+SESSION_TOKEN_PROTOCOL_PREFIX: str = "selkies.token."
 # Fallback carrier for the master token on the token and mode-switch
 # endpoints, same ``Bearer <token>`` grammar as Authorization. A request has
 # one Authorization header, so a caller behind a Basic login (a reverse
 # proxy's, typically) must spend it on the Basic credentials and present the
 # master token here instead; Authorization is still tried first.
 MASTER_TOKEN_HEADER: str = "Selkies-Authorization"
+
+
+def handshake_session_token(request: web.BaseRequest) -> Optional[str]:
+    """The session token a WebSocket handshake presents, or None.
+
+    A client that took its token from the page's fragment offers it as the
+    ``selkies.token.<base64url>`` subprotocol beside ``selkies``, so no request
+    line carries it; one that took it from the query presents it as ``?token=``
+    on the socket URL. The subprotocol wins when both are there.
+
+    Raises:
+        web.HTTPBadRequest: The token subprotocol arrived without ``selkies``,
+            or does not decode. aiohttp logs the offered subprotocols when it
+            finds none it can select, which would write the token into the log,
+            so such a handshake is refused before it gets that far.
+    """
+    offered = [
+        protocol.strip()
+        for header in request.headers.getall("Sec-WebSocket-Protocol", ())
+        for protocol in header.split(",")
+    ]
+    carried = [p for p in offered if p.startswith(SESSION_TOKEN_PROTOCOL_PREFIX)]
+    if not carried:
+        return request.query.get("token") or None
+    if SESSION_TOKEN_PROTOCOL not in offered:
+        raise web.HTTPBadRequest(text="Session token subprotocol offered without the selkies protocol")
+    encoded = carried[0][len(SESSION_TOKEN_PROTOCOL_PREFIX):]
+    try:
+        token = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True).decode("utf-8")
+    except ValueError:  # binascii.Error and UnicodeDecodeError both
+        raise web.HTTPBadRequest(text="Undecodable session token subprotocol") from None
+    return token or None
 
 FILE_INDEX_HEADER: str = """<!DOCTYPE html>
 <html lang="en">
@@ -1148,7 +1472,7 @@ class BaseStreamingService(metaclass=ABCMeta):
     @abstractmethod
     async def sessions(self) -> List[Dict[str, Any]]:
         """The pages connected to this transport: `id`, `transport`, `role`,
-        `slot`, `display`, `connected_at` and `rtt_ms`, the same keys on both."""
+        `slot`, `display`, `connected_at`, and `rtt_ms`, the same keys on both."""
 
     @abstractmethod
     async def disconnect_session(self, session_id: str) -> bool:
@@ -1226,7 +1550,7 @@ class CentralizedStreamServer:
             os.path.expanduser(self.settings.file_manager_path)
         ).resolve()
         self.print_spool = pathlib.Path(
-            os.path.expanduser(self.settings.print_spool_path)
+            printing.spool_path(self.settings.print_spool_path)
         ).resolve()
         self.print_watcher: Optional[printing.SpoolWatcher] = None
         self.print_queue: Optional[printing.PrintQueue] = None
@@ -1422,7 +1746,7 @@ class CentralizedStreamServer:
         """Return a self-signed certificate and key, writing one where none is usable.
 
         Turning HTTPS on is otherwise a two-step job — make a certificate, then
-        point at it — and browsers gate the clipboard, gamepads, pointer lock
+        point at it — and browsers gate the clipboard, gamepads, pointer lock,
         and the camera on a secure context, so the step is in everyone's way.
         The configured paths are used when their directory is writable, which
         for the default `ssl-cert-snakeoil` pair means running as root; a user
@@ -1679,11 +2003,12 @@ class CentralizedStreamServer:
     def _session_token_carriers(request: web.Request) -> List[Tuple[str, str]]:
         """The session-token carriers a request presents, most explicit first.
 
-        The Bearer header is what scripts send; the ``?token=`` query is what
-        URLs the client navigates to rather than fetches carry (the page itself,
-        the file-manager listing it opens); the cookie is the mirror the client
-        keeps for requests it can put neither on. The cookie value is tried as
-        sent and URL-decoded, since the client stores it encoded.
+        The Bearer header is what scripts send; the ``?token=`` query is what a
+        page opened with one carries on the URLs it navigates to rather than
+        fetches (the file-manager listing it opens), which a page holding its
+        token in the fragment leaves to the cookie; the cookie is the mirror the
+        client keeps for requests it can put neither on. The cookie value is
+        tried as sent and URL-decoded, since the client stores it encoded.
 
         Returns:
             ``(source, token)`` pairs, source being "header", "query" or "cookie".
@@ -1955,7 +2280,7 @@ class CentralizedStreamServer:
             return
         logger.error(
             "Basic authentication is enabled but no password was set. Set one with "
-            "--basic-auth-password, or the SELKIES_BASIC_AUTH_PASSWORD, PASSWORD or "
+            "--basic-auth-password, or the SELKIES_BASIC_AUTH_PASSWORD, PASSWORD, or "
             "PASSWD environment variable; or serve without a login by passing "
             "--enable-basic-auth=false."
         )
@@ -1983,11 +2308,9 @@ class CentralizedStreamServer:
         Serialized under the supervisor lock so two switches can never overlap;
         switching to the already-active mode is a no-op. The service reads
         the settings at start, so the encoder knob is brought in line with the
-        transport first (a websockets-only encoder such as jpeg or striped
-        h264enc cannot ride the WebRTC pipeline, and a switch back restores
-        the operator's menu and value) and only then does an unpinned
-        rate-control mode resolve, since its websockets default depends on
-        the resolved encoder, the same order as `_post_process_settings`.
+        transport before it starts (a websockets-only encoder such as jpeg or
+        striped h264enc cannot ride the WebRTC pipeline, and a switch back
+        restores the operator's menu and value).
 
         Args:
             mode_name: Registered service name ("websockets" or "webrtc").
@@ -2007,7 +2330,6 @@ class CentralizedStreamServer:
             logger.info(f"Starting service: {mode_name}")
             self.settings.mode = mode_name
             self.settings.apply_webrtc_encoder_filter()
-            self.settings.resolve_rate_control_default()
             service = self.services[mode_name]
             task = asyncio.create_task(service.start())
             self.active_task = task
@@ -2161,7 +2483,8 @@ class CentralizedStreamServer:
         return UplinkGauge(entries) if entries else None
 
     async def _stream_upload_body(self, request: web.Request, path: str, append: bool) -> int:
-        """Stream a request body to ``path`` with executor-thread writes.
+        """Stream a request body to ``path``, opening, writing, and closing it
+        on the executor.
 
         Creates/truncates the file when ``append`` is False, appends when True;
         O_NOFOLLOW blocks a planted symlink either way. Enforces the declared
@@ -2196,8 +2519,7 @@ class CentralizedStreamServer:
             if (declared or 0) >= TRANSFER_MIN_GAUGED_BYTES
             else None)
         flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else os.O_TRUNC)
-        fd = os.open(path, flags, 0o644)
-        fh = os.fdopen(fd, "wb")
+        fh = await loop.run_in_executor(None, lambda: os.fdopen(os.open(path, flags, 0o644), "wb"))
         written = 0
         try:
             while True:
@@ -2222,30 +2544,29 @@ class CentralizedStreamServer:
             await loop.run_in_executor(None, fh.close)
         except Exception:
             try:
-                fh.close()
+                await loop.run_in_executor(None, fh.close)
             except Exception:
                 pass
             raise
         return written
 
     def _discard_chunked_upload(self, dest: str, part_path: str) -> None:
-        """Drop a chunked transfer's tracking entry and its on-disk .part file."""
+        """Drop a chunked transfer's tracking entry and its on-disk .part file.
+
+        The entry and the file it names go together with nothing awaited
+        between, so a restart on the same path never has the .part it just
+        created removed under it; the removal blocks the loop the once a
+        discard costs, which a transfer's slices do not.
+        """
         self._chunked_uploads.pop(dest, None)
-        try:
-            os.remove(part_path)
-        except OSError:
-            pass
+        _remove_quietly(part_path)
 
     def _expire_stale_chunked_uploads(self) -> None:
         """Reap transfers idle past UPLOAD_PART_TTL_SECONDS (entry + .part file)."""
         now = time.monotonic()
         for key in [k for k, s in self._chunked_uploads.items()
                     if now - s["ts"] > UPLOAD_PART_TTL_SECONDS and not s["busy"]]:
-            stale = self._chunked_uploads.pop(key)
-            try:
-                os.remove(stale["part"])
-            except OSError:
-                pass
+            self._discard_chunked_upload(key, self._chunked_uploads[key]["part"])
             logger.debug(f"Expired stale chunked upload: {key}")
 
     async def handle_upload(self, request: web.Request) -> web.Response:
@@ -2254,10 +2575,17 @@ class CentralizedStreamServer:
         Available in every streaming mode and not bounded by the data-channel /
         WebSocket per-message size, so it saturates the link where the per-chunk
         SCTP path cannot. The destination path (relative to the file-manager
-        root) arrives URL-encoded in the X-Upload-Path header; the body streams
-        straight to disk on the executor, so the event loop keeps serving the
-        stream during the transfer. Path safety mirrors the data-channel path:
-        no traversal outside the root, and O_NOFOLLOW blocks a planted symlink.
+        root) arrives URL-encoded in the X-Upload-Path header. The body streams
+        to disk on the executor, and so do the directory creation, the staging
+        open, and the plain path's rename onto the destination, since a network
+        filesystem takes tens of milliseconds over each and a directory of
+        small files pays it once per file, which the event loop would otherwise
+        take from the stream it serves. The chunked path's staging is one file
+        per destination, so its finalize and its discards stay synchronous to
+        keep the rename and the removal atomic against a restart on the same
+        path; each is a once-per-transfer cost, not a per-slice one. Path safety
+        mirrors the data-channel path: no traversal outside the root, and
+        O_NOFOLLOW blocks a planted symlink.
 
         Two request shapes share the endpoint:
 
@@ -2308,8 +2636,8 @@ class CentralizedStreamServer:
             return failed("invalid upload path")
         dest = os.path.join(root, *parts)
         name = "/".join(parts)
-        real_root = os.path.realpath(root)
-        parent = os.path.realpath(os.path.dirname(dest))
+        real_root, parent = await asyncio.to_thread(
+            lambda: (os.path.realpath(root), os.path.realpath(os.path.dirname(dest))))
         try:
             within = os.path.commonpath([real_root, parent]) == real_root
         except ValueError:
@@ -2317,7 +2645,7 @@ class CentralizedStreamServer:
         if not within:
             return failed("path escape rejected")
         try:
-            os.makedirs(parent, exist_ok=True)
+            await asyncio.to_thread(os.makedirs, parent, exist_ok=True)
         except OSError as e:
             return failed(f"mkdir failed: {e}", 500)
 
@@ -2331,19 +2659,12 @@ class CentralizedStreamServer:
             try:
                 written = await self._stream_upload_body(request, staging, append=False)
             except Exception as e:
-                try:
-                    os.remove(staging)
-                except OSError:
-                    pass
+                await asyncio.to_thread(_remove_quietly, staging)
                 return failed(str(e))
-            _carry_destination_mode(staging, dest)
             try:
-                os.replace(staging, dest)
+                await asyncio.to_thread(_finalize_upload, staging, dest)
             except OSError as e:
-                try:
-                    os.remove(staging)
-                except OSError:
-                    pass
+                await asyncio.to_thread(_remove_quietly, staging)
                 return failed(f"finalize failed: {e}", 500)
             logger.info(f"HTTP upload finished: {dest} ({written} bytes)")
             audit.emit("file.upload.end", filename=name, size_bytes=written)
@@ -2387,6 +2708,8 @@ class CentralizedStreamServer:
                 self._discard_chunked_upload(dest, part_path)
                 return failed(f"chunk sequence mismatch at offset {offset}; transfer discarded", 409)
 
+        # Claimed before the body's awaits so a slice for this path that arrives
+        # meanwhile is refused, not interleaved onto the shared .part.
         state["busy"] = True
         try:
             written = await self._stream_upload_body(request, part_path, append=offset > 0)
@@ -2404,9 +2727,10 @@ class CentralizedStreamServer:
         if total >= 0 and received != total:
             self._discard_chunked_upload(dest, part_path)
             return failed(f"size mismatch: received {received}, expected {total}")
-        _carry_destination_mode(part_path, dest)
+        # Synchronous, like the removal: the staged path is one per destination,
+        # so the rename onto it stays atomic against a restart with no await between.
         try:
-            os.replace(part_path, dest)
+            _finalize_upload(part_path, dest)
         except OSError as e:
             self._discard_chunked_upload(dest, part_path)
             return failed(f"finalize failed: {e}", 500)
@@ -2450,7 +2774,7 @@ class CentralizedStreamServer:
         return web.Response(status=204)
 
     async def handle_recording(self, request: web.Request) -> web.Response:
-        """GET, POST and DELETE /api/recording: the MP4 recording pixelflux
+        """GET, POST, and DELETE /api/recording: the MP4 recording pixelflux
         makes of the session, H.264 with the session's audio as an Opus track
         when audio is on and pcmflux is installed. POST starts one into the
         file-manager directory unless the body names a path, DELETE stops it
@@ -2501,7 +2825,7 @@ class CentralizedStreamServer:
     def _recording_target(self, name: str) -> Optional[str]:
         """Where a requested recording name writes, or `None` when it leaves the
         file-manager directory. The name is a path relative to that directory:
-        an absolute path, a traversal segment and a symlinked parent pointing
+        an absolute path, a traversal segment, and a symlinked parent pointing
         outside are all refused, since the session token that reaches this
         endpoint carries no authority over the rest of the filesystem."""
         base = os.path.realpath(self.upload_dir)
@@ -2516,8 +2840,11 @@ class CentralizedStreamServer:
         """The Ogg Opus socket a recording's audio track is read from, served
         by a pcmflux capture of the session's sink that runs for the recorder
         alone with no Python callback, so no frame passes through Python.
-        Empty for a video-only recording: audio off, a pixelflux or pcmflux
-        without the socket, or a capture that does not start."""
+        Unlike the live streams' captures it encodes silence rather than
+        gating it, so the track spans the recording instead of stopping at
+        every silence. Empty for a video-only recording: audio off, a
+        pixelflux or pcmflux without the socket, or a capture that does not
+        start."""
         try:
             if not self.settings.audio_enabled[0] or \
                     "audio_socket" not in inspect.signature(pixelflux.start_recording).parameters:
@@ -2526,6 +2853,7 @@ class CentralizedStreamServer:
             from .audio_control import ensure_capture_sink, opus_capture_settings
             capture_settings = opus_capture_settings(self.settings.audio_device_name, self.settings.audio_channels,
                                                      int(self.settings.audio_bitrate), 20.0)
+            capture_settings.use_silence_gate = False
             runtime = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
             capture_settings.output_socket = os.path.join(runtime, f"selkies-record-audio-{os.getpid()}.sock")
         except (ImportError, AttributeError, ValueError):
@@ -2868,6 +3196,11 @@ class CentralizedStreamServer:
         self.app = web.Application(middlewares=[self._auth_middleware])
         self.app["supervisor"] = self
         self.app["settings"] = self.settings
+        frame_policy = _frame_ancestors_directive(self.settings.frame_ancestors)
+        if frame_policy:
+            async def _send_frame_policy(request: web.Request, response: web.StreamResponse) -> None:
+                response.headers["Content-Security-Policy"] = frame_policy
+            self.app.on_response_prepare.append(_send_frame_policy)
 
         api_prefix = self.settings.subfolder
         if api_prefix:
@@ -2902,10 +3235,30 @@ class CentralizedStreamServer:
                     raise web.HTTPFound(moved)
                 return web.FileResponse(os.path.join(self.static_fs_path, "index.html"))
 
-            self.app.router.add_get(f"{api_prefix}/", index_handler)
-            self.app.router.add_static(
+            index = self.app.router.add_get(f"{api_prefix}/", index_handler)
+            static = self.app.router.add_static(
                 f"{api_prefix}/", self.static_fs_path, name="static"
             )
+
+            async def _revalidate_fixed_names(request: web.Request, response: web.StreamResponse) -> None:
+                """Have a browser revalidate, on every load, the entry page and
+                every other file of the web client's code whose name does not
+                change with its content.
+
+                With validators alone a browser may reuse such a file by
+                heuristic freshness, so after an upgrade or a change of web
+                root it loads the old page, or the old core under a new page;
+                the validators keep each revalidation a 304. What the build
+                names by content hash, under `assets/`, is left to cache, and
+                so are icons and the manifest, which no page's behavior hangs
+                on and which Firefox would revalidate on every load.
+                """
+                resource = request.match_info.route.resource
+                name = request.match_info.get("filename", "")
+                if resource is index.resource or (
+                        resource is static and not name.startswith("assets/") and name.endswith(WEB_CODE)):
+                    response.headers.setdefault("Cache-Control", "no-cache")
+            self.app.on_response_prepare.append(_revalidate_fixed_names)
         else:
             logger.warning("Unable to find web content, skipping web routers handlers")
         return self.app

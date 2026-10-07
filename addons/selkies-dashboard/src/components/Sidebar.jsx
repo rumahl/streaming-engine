@@ -11,7 +11,7 @@
  * Renders a draggable toggle handle, the core action buttons (video, audio,
  * microphone, webcam, gamepad), the soft modifier keys and virtual keyboard
  * button for touch clients, the collapsible video, screen, audio, stats,
- * clipboard, files, apps, sharing, gamepads and shortcuts sections, the
+ * clipboard, files, apps, sharing, gamepads, and shortcuts sections, the
  * upload and clipboard notifications, the apps and files modals, and the
  * second-screen placement arrows.
  *
@@ -25,22 +25,27 @@
  * `audioDeviceSelected` (its own selection mirrored back, so the dropdowns
  * show what the core was told), `gamepadButtonUpdate` and
  * `gamepadAxisUpdate`, `fileUpload` (upload progress and every notification
- * the core raises), and `trackpadModeUpdate`.
+ * the core raises), `trackpadModeUpdate`, and `transportAdvice` (a notice
+ * offering WebSockets while WebRTC's media path keeps failing, with the
+ * switch where the mode menu would offer it).
  *
  * Messages it posts: `settings` (debounced), `pipelineControl`,
  * `gamepadControl`, `setManualResolution`, `resetResolutionToWindow`,
- * `setScaleLocally`, `setAntiAliasing`, `audioDeviceSelected`,
- * `clipboardUpdateFromUI`, `clipboardImageUpdate`, `requestFullscreen`,
+ * `setScaleLocally`, `setAntiAliasing`, `setTrackpadSpeed`, `setGamepadRumble`,
+ * `audioDeviceSelected`,
+ * `clipboardUpdateFromUI`, `clipboardImageUpdate`, `clipboardCopySecret`, `requestFullscreen`,
  * `requestGamingMode`, `mode`, `setSynth`, `sidebarVisibilityChanged`, `TOUCH_GAMEPAD_SETUP`,
- * `TOUCH_GAMEPAD_VISIBILITY`, `touchinput:trackpad` and `touchinput:touch`,
+ * `TOUCH_GAMEPAD_VISIBILITY`, `touchinput:trackpad`, and `touchinput:touch`,
  * plus whatever channel a conditional-settings spec propagates through; the
  * stats section (`StreamStats.jsx`) posts `statsOpen` and reads its own. The
  * soft keys dispatch synthetic `KeyboardEvent`s on `window`, and the files
  * section dispatches the `requestFileUpload` DOM event.
  *
- * `window` state it reads: `webrtcInput.gamingMode`,
- * `__SELKIES_STREAMING_MODE__` and `__SELKIES_DUAL_MODE__`; it sets
- * `__selkiesModeSwitching` around a transport switch.
+ * `window` state it reads: `webrtcInput.gamingMode`, `displayRefreshRate`
+ * (with the `displayRefresh` message, the display's measured refresh, which the
+ * frame-rate slider offers as a stop of its own),
+ * `__SELKIES_STREAMING_MODE__`, and `__SELKIES_DUAL_MODE__`; its transport
+ * switch (`switchStreamMode`) sets `__selkiesModeSwitching`.
  *
  * Persistence: every setting lives in `localStorage` under
  * `<storageAppName>_<key>`, the keys in `PER_DISPLAY_SETTINGS` gaining a
@@ -50,16 +55,26 @@
  * because it is a per-browser preference.
  * @module
  */
-import { useState, useEffect, useCallback, useId, useMemo, useRef } from "react";
-import { displayLabel, canPlayEncoder, decoderSupportReady, canDecodeFullColor, codecOfEncoder, codecCarriesFullColor, getRoutePrefix, getStorageAppName, isMobileClient, isMacDesktop } from "../../../selkies-web-core/lib/util.js";
-import { sessionAuthHeaders, withSessionToken } from "../../../selkies-web-core/lib/session-token.js";
+import { useState, useEffect, useCallback, useId, useMemo, useRef, useSyncExternalStore } from "react";
+import { displayLabel, canPlayEncoder, decoderSupportReady, canDecodeFullColor, canDecodeTenBit, tenBitFormat, codecOfEncoder, codecCarriesFullColor, codecCarriesTenBit, getStorageAppName, isMobileClient, isMacDesktop } from "../../../selkies-web-core/lib/util.js";
+import { withSessionToken } from "../../../selkies-web-core/lib/session-token.js";
+import { hardwareKeyboard } from "../../../selkies-web-core/lib/hardware-keyboard.js";
+import { switchStreamMode } from "../../../selkies-web-core/lib/mode-switch.js";
+import { fragmentWithSessionToken, shareablePageURL, urlFragmentKeyword } from "../../../selkies-web-core/lib/page-url.js";
+import { BITRATE_STOPS, CRF_STOPS, FRAMERATE_STOPS, framerateStopIndex, stopIndex, stopsWithin, withDisplayStop } from "../../../selkies-web-core/lib/slider-stops.js";
+import { FRAMERATE_DISPLAY, followsDisplay, framerateLabel, matchDisplay } from "../../../selkies-web-core/lib/display-refresh.js";
+import { PALETTE_CHORDS, PALETTE_KEYS, TRACKPAD_SPEEDS, TRACKPAD_SPEED_KEY, USER_CHORDS_KEY, chordEvents,
+  formatChord, parseChord, readUserChords, writeUserChords } from "../../../selkies-web-core/lib/touch-controls.js";
 import { resolveSpec, isSettingPinned, HIDPI_SPEC, RATE_CONTROL_SPEC,
-  USE_BROWSER_CURSORS_SPEC, VIDEO_FULLCOLOR_SPEC, VIDEO_STREAMING_MODE_SPEC,
+  USE_BROWSER_CURSORS_SPEC, VIDEO_FULLCOLOR_SPEC, VIDEO_10BIT_SPEC, VIDEO_STREAMING_MODE_SPEC,
   USE_PAINT_OVER_QUALITY_SPEC, USE_CPU_SPEC, FORCE_ALIGNED_RESOLUTION_SPEC, softwareChoiceAvailable,
+  tenBitStream,
   RAW_POINTER_MOTION_SPEC, MAC_CMD_AS_CTRL_SPEC } from "../../../selkies-web-core/lib/conditional-settings.js";
 import GamepadVisualizer from "./GamepadVisualizer";
 import PlayerGamepadButton from "./PlayerGamepadButton.jsx";
 import StreamStats from "./StreamStats.jsx";
+import StreamStrip from "./StreamStrip.jsx";
+import ConnectionIndicator from "./ConnectionIndicator.jsx";
 import { getTranslator } from "../translations";
 import {
   APP_COMMAND_STATE_EVENT,
@@ -74,7 +89,7 @@ import {
 } from "../../../selkies-web-core/lib/app-commands.js";
 import * as yaml from "js-yaml";
 
-const urlHash = window.location.hash;
+const urlHash = urlFragmentKeyword();
 const displayId = urlHash.startsWith('#display2') ? 'display2' : 'primary';
 
 /**
@@ -86,7 +101,7 @@ const displayId = urlHash.startsWith('#display2') ? 'display2' : 'primary';
  * write the primary's key.
  */
 const PER_DISPLAY_SETTINGS = [
-    'framerate', 'video_crf', 'video_fullcolor',
+    'framerate', 'video_crf', 'video_fullcolor', 'video_10bit',
     'video_streaming_mode', 'jpeg_quality', 'paint_over_jpeg_quality', 'use_cpu',
     'video_paintover_crf', 'video_paintover_burst_frames', 'use_paint_over_quality',
     'manual_resolution', 'manual_width', 'manual_height', 'encoder',
@@ -147,7 +162,7 @@ const dpiScalingOptions = [
   { label: "300%", value: 288 },
 ];
 /**
- * Browser language, resolved once: language, form factor and display density
+ * Browser language, resolved once: language, form factor, and display density
  * are fixed for the life of the document, so resolving them at module scope
  * makes them available to the first render and a phone gets the mobile layout
  * without a repaint.
@@ -155,7 +170,6 @@ const dpiScalingOptions = [
 const BROWSER_LANG_TAG =
   (typeof navigator !== "undefined" &&
     (navigator.language || navigator.userLanguage)) || "en";
-const BROWSER_PRIMARY_LANG = BROWSER_LANG_TAG.split("-")[0].toLowerCase();
 
 const DEFAULT_FRAMERATE = 60;
 const DEFAULT_JPEG_QUALITY = 40;
@@ -167,6 +181,8 @@ const DEFAULT_ENCODER = encoderOptions[0];
 const DEFAULT_VIDEO_CRF = 25;
 const DEFAULT_SCALE_LOCALLY = true;
 const DEFAULT_ENABLE_BINARY_CLIPBOARD = true;
+/** What the clipboard box shows for a secret, which the core never hands over. */
+const CLIPBOARD_SECRET_MASK = "\u2022".repeat(8);
 const REPO_BASE_URL =
   "https://raw.githubusercontent.com/linuxserver/proot-apps/master/metadata/";
 const METADATA_URL = `${REPO_BASE_URL}metadata.yml`;
@@ -176,6 +192,8 @@ const METADATA_FETCH_TIMEOUT_MS = 10000;
 const MAX_NOTIFICATIONS = 3;
 const NOTIFICATION_TIMEOUT_SUCCESS = 5000;
 const NOTIFICATION_TIMEOUT_ERROR = 8000;
+/** The one notice `transportAdvice` raises and withdraws. */
+const TRANSPORT_NOTICE_ID = "transport-advice";
 const NOTIFICATION_FADE_DURATION = 500;
 
 const TOUCH_GAMEPAD_HOST_DIV_ID = "touch-gamepad-host";
@@ -197,14 +215,6 @@ const DEFAULT_VIDEO_BITRATE = 8000;
 const RATE_CONTROL_CBR = "cbr";
 const RATE_CONTROL_CRF = "crf";
 
-/** Sub-Mbps CBR stops in kbps for constrained links, ahead of the 1000-kbps steps. */
-const SUB_MBPS_BITRATE_STEPS = [100, 250, 500, 750];
-/**
- * CBR stops above 100000 kbps: per-1000 granularity stops mattering there and
- * a 1000-position slider would be unusable.
- */
-const COARSE_MBPS_BITRATE_STEPS = [150000, 200000, 300000, 400000, 500000, 750000, 1000000];
-
 
 /** Parses a dimension and rounds it down to an even number; non-numbers become 0. */
 const roundDownToEven = (num) => {
@@ -214,18 +224,22 @@ const roundDownToEven = (num) => {
 };
 
 /**
- * Trailing debounce: only the last call within `delay` milliseconds runs.
- * @param {Function} func
+ * Trailing debounce of settings posts: a burst coalesces into one post
+ * carrying every setting changed in it, each at its last value, so a derived
+ * change never drops the one that caused it.
  * @param {number} delay
- * @returns {Function}
+ * @returns {(setting: object) => void}
  */
-function debounce(func, delay) {
+function settingsPoster(delay) {
+  let pending = {};
   let timeoutId;
-  return function (...args) {
-    const context = this;
+  return (setting) => {
+    Object.assign(pending, setting);
     clearTimeout(timeoutId);
     timeoutId = setTimeout(() => {
-      func.apply(context, args);
+      const settings = pending;
+      pending = {};
+      window.postMessage({ type: "settings", settings }, window.location.origin);
     }, delay);
   };
 }
@@ -255,6 +269,9 @@ const AppsIcon = () => (
 );
 /* Padded viewBox: the glyph inks its full box where its row neighbors ink
    about four fifths, and drawn as-is it reads as the larger tile. */
+/** The page's attached-keyboard verdict (lib/hardware-keyboard.js), listening from load. */
+const keyboardWatch = hardwareKeyboard();
+
 const KeyboardIcon = () => (
   <svg 
     xmlns="http://www.w3.org/2000/svg" 
@@ -410,7 +427,31 @@ const SelkiesLogo = ({ width = 30, height = 30, className, t, ...props }) => {
 let cachedAppData = null;
 
 /**
- * Catalog of proot-apps with install, remove, update and launch actions,
+ * The last `serverSettings` the core posted, kept from module load and read by
+ * the sidebar as an external store. The core connects before the sidebar
+ * renders, and a socket on the page (WebKit's above all) can deliver the
+ * settings before any effect of the sidebar's would listen.
+ */
+let latestServerSettings = null;
+const serverSettingsListeners = new Set();
+if (typeof window !== "undefined") {
+  window.addEventListener("message", (event) => {
+    if (event.origin === window.location.origin && event.data?.type === "serverSettings") {
+      console.log("Dashboard received server settings:", event.data.payload);
+      latestServerSettings = event.data.payload;
+      serverSettingsListeners.forEach((listener) => listener());
+    }
+  });
+}
+/** `useSyncExternalStore` subscription to `latestServerSettings`. */
+const subscribeServerSettings = (listener) => {
+  serverSettingsListeners.add(listener);
+  return () => serverSettingsListeners.delete(listener);
+};
+const readServerSettings = () => latestServerSettings;
+
+/**
+ * Catalog of proot-apps with install, remove, update, and launch actions,
  * posted as app commands through app-commands.js.
  * @param {object} props
  * @param {boolean} props.isOpen Renders nothing while false.
@@ -807,9 +848,9 @@ const manualResolution = (serverSettings) => {
 /**
  * Marker written beside a value the user chose explicitly. The cores persist
  * every value they are told to apply, so the stored key alone cannot tell a
- * user's pick from one the dashboard derived (HiDPI from the resolution mode,
- * rate control from the encoder); the settings that are also derived read
- * storage through `readExplicitStored`, so a derived write never pins them.
+ * user's pick from one the dashboard derived (HiDPI from the resolution mode)
+ * or applied from the server (paint-over); those settings read storage through
+ * `readExplicitStored`, so such a write never pins them.
  */
 const EXPLICIT_CHOICE_SUFFIX = "_explicit_choice";
 /**
@@ -827,7 +868,7 @@ const readPaintOverStored = readExplicitStored(USE_PAINT_OVER_QUALITY_SPEC);
 /**
  * Drives a conditional setting: lazy init, then a re-resolve whenever the
  * server settings or any dependency in `deps` changes, which covers the
- * server sync and the encoder or manual-resolution re-derivation uniformly.
+ * server sync and a dependency's re-derivation uniformly.
  * The resolver honors explicit choices, so a re-resolve never clobbers a
  * pinned value. A re-resolve writes state rather than deriving during render
  * because the caller edits the value afterwards; deriving would discard that.
@@ -889,14 +930,16 @@ function Sidebar() {
    * on this side, so the touch affordance for them is the gamepad toggle alone.
    */
   const [isViewerRole, setIsViewerRole] = useState(() => {
-    const h = (typeof window !== "undefined" ? window.location.hash : "").toLowerCase();
+    const h = (typeof window !== "undefined" ? urlFragmentKeyword() : "").toLowerCase();
     return h.startsWith("#shared") || /^#player[234]$/.test(h);
   });
   const toggleSidebar = () => {
     setIsOpen(!isOpen);
   };
   const isSecondaryDisplay = displayId === 'display2';
-  const translator = useMemo(() => getTranslator(BROWSER_PRIMARY_LANG), []);
+  // The full tag, since the translator picks the written form of Chinese by
+  // its region and script.
+  const translator = useMemo(() => getTranslator(BROWSER_LANG_TAG), []);
   // system-ui picks its face from the document language, and the script-aware
   // type rules key off it. Region included: zh-TW is not zh-CN.
   useEffect(() => {
@@ -934,32 +977,28 @@ function Sidebar() {
     Alt: false,
     Meta: false,
   });
+  const [isKeyPaletteOpen, setIsKeyPaletteOpen] = useState(false);
+  const [userChords, setUserChords] = useState(() =>
+    readUserChords(localStorage, getPrefixedKey(USER_CHORDS_KEY)));
+  const [chordDraft, setChordDraft] = useState("");
+  const [chordRefused, setChordRefused] = useState(false);
+  const [trackpadSpeed, setTrackpadSpeed] = useState(() => {
+    const stored = parseFloat(localStorage.getItem(getPrefixedKey(TRACKPAD_SPEED_KEY)));
+    return TRACKPAD_SPEEDS.includes(stored) ? stored : 1;
+  });
   const [isKeyboardButtonVisible, setIsKeyboardButtonVisible] = useState(true);
+  // A tablet's attached keyboard keeps the system's on-screen one down, so the
+  // button that pops it goes while one is in use (lib/hardware-keyboard.js).
+  const keyboardAttached = useSyncExternalStore(keyboardWatch.subscribe, keyboardWatch.attached);
   const [isTouchGamepadActive, setIsTouchGamepadActive] = useState(false);
   const [isTouchGamepadSetup, setIsTouchGamepadSetup] = useState(false);
   const [availablePlacements, setAvailablePlacements] = useState(null);
-  const [serverSettings, setServerSettings] = useState(null);
+  const serverSettings = useSyncExternalStore(subscribeServerSettings, readServerSettings);
   /** The derived default, marked in the picker so the two never disagree. */
   const currentDeviceDpi = deriveDpi(manualResolution(serverSettings));
 
   const [uiTitle, setUiTitle] = useState('Selkies');
   const [uiShowLogo, setUiShowLogo] = useState(true);
-
-  useEffect(() => {
-    const handleMessage = (event) => {
-      if (
-        event.origin === window.location.origin &&
-        event.data?.type === "serverSettings"
-      ) {
-        console.log("Dashboard received server settings:", event.data.payload);
-        setServerSettings(event.data.payload);
-      }
-    };
-    window.addEventListener("message", handleMessage);
-    return () => {
-      window.removeEventListener("message", handleMessage);
-    };
-  }, []);
 
   /**
    * Which sidebar controls the server's settings allow: a pure projection of
@@ -1011,6 +1050,7 @@ function Sidebar() {
     newRenderable.usePaintOverQuality = isRenderable('use_paint_over_quality');
     newRenderable.videoStreamingMode = isRenderable('video_streaming_mode');
     newRenderable.videoFullColor = isRenderable('video_fullcolor');
+    newRenderable.video10Bit = isRenderable('video_10bit');
     newRenderable.use_cpu = isRenderable('use_cpu');
     newRenderable.uiScaling = isRenderable('scaling_dpi');
     newRenderable.binaryClipboard = isRenderable('enable_binary_clipboard')
@@ -1071,7 +1111,7 @@ function Sidebar() {
    * @returns {boolean} Whether the window opened.
    */
   const launchWindow = (direction, screen = null) => {
-    const url = `${window.location.href.split('#')[0]}#display2-${direction}`;
+    const url = `${window.location.href.split('#')[0]}${fragmentWithSessionToken(`display2-${direction}`)}`;
     // Not `noopener` in the features: that makes window.open return null even
     // when it opened, leaving a refusal indistinguishable from success. The
     // opener is severed on the handle instead.
@@ -1169,10 +1209,24 @@ function Sidebar() {
       console.log("Dashboard: First touch detected. Enabling touch-specific features.");
       setHasDetectedTouch(true);
     };
-    window.addEventListener('touchstart', detectTouch, { once: true, passive: true });
+    // In the capture phase: in trackpad mode the stream's own handler stops
+    // the touch from bubbling, and the first touch is usually on the stream.
+    window.addEventListener('touchstart', detectTouch, { once: true, passive: true, capture: true });
     return () => {
-      window.removeEventListener('touchstart', detectTouch, { once: true, passive: true });
+      window.removeEventListener('touchstart', detectTouch, { capture: true });
     };
+  }, []);
+
+  useEffect(() => {
+    // A convertible whose keyboard is detached turns its primary pointer
+    // coarse and takes touch from then on, so it gets the touch controls at once.
+    const coarse = window.matchMedia?.('(pointer: coarse)');
+    if (!coarse) return undefined;
+    const onChange = (e) => {
+      if (e.matches) setHasDetectedTouch(true);
+    };
+    coarse.addEventListener('change', onChange);
+    return () => coarse.removeEventListener('change', onChange);
   }, []);
 
   useEffect(() => {
@@ -1198,6 +1252,7 @@ function Sidebar() {
       ctrlKey: modifierState.Control,
       altKey: modifierState.Alt,
       metaKey: modifierState.Meta,
+      shiftKey: !!modifierState.Shift,
       bubbles: true,
       cancelable: true,
     });
@@ -1236,7 +1291,58 @@ function Sidebar() {
       sendKeyEvent('keyup', key, code, heldKeys);
     }, 50);
   };
+  /**
+   * Plays a palette chord (`lib/touch-controls.js`) as the soft keys do, with
+   * synthetic mode on for its length unless a soft modifier already has it:
+   * its modifiers and key pressed, then after 50 ms released in reverse.
+   * A modifier held on a soft key stays held.
+   */
+  const playChord = (text) => {
+    const chord = parseChord(text);
+    if (!chord) return;
+    const holding = Object.values(heldKeys).some(Boolean);
+    if (!holding) window.postMessage({ type: 'setSynth', value: true }, window.location.origin);
+    const events = chordEvents(chord, heldKeys);
+    const firstUp = events.findIndex((e) => e.type === 'keyup');
+    events.slice(0, firstUp).forEach((e) => sendKeyEvent(e.type, e.key, e.code, e.state));
+    setTimeout(() => {
+      events.slice(firstUp).forEach((e) => sendKeyEvent(e.type, e.key, e.code, e.state));
+      if (!holding) window.postMessage({ type: 'setSynth', value: false }, window.location.origin);
+    }, 50);
+  };
+  /** Adds the chord typed into the palette to the user's own, kept per origin. */
+  const handleAddChord = (event) => {
+    event.preventDefault();
+    const chord = parseChord(chordDraft);
+    if (!chord) {
+      setChordRefused(true);
+      return;
+    }
+    const name = formatChord(chord);
+    const next = userChords.includes(name) ? userChords : [...userChords, name];
+    setUserChords(next);
+    writeUserChords(localStorage, getPrefixedKey(USER_CHORDS_KEY), next);
+    setChordDraft("");
+    setChordRefused(false);
+  };
+  /** The trackpad's speed is client-only; the core persists trackpad_speed itself. */
+  const handleTrackpadSpeed = (value) => {
+    setTrackpadSpeed(value);
+    window.postMessage({ type: "setTrackpadSpeed", value }, window.location.origin);
+  };
+  /** Forgets one of the user's own chords. */
+  const handleRemoveChord = (name) => {
+    const next = userChords.filter((c) => c !== name);
+    setUserChords(next);
+    writeUserChords(localStorage, getPrefixedKey(USER_CHORDS_KEY), next);
+  };
   const toggleKeyboardButtonVisibility = () => {
+    // Asked for back while a keyboard was assumed: the user knows better.
+    if (keyboardAttached) {
+      keyboardWatch.reset();
+      setIsKeyboardButtonVisible(true);
+      return;
+    }
     setIsKeyboardButtonVisible(prev => !prev);
   };
 
@@ -1259,9 +1365,13 @@ function Sidebar() {
     localStorage.getItem(getPrefixedKey("webcam_encoder"))
   );
   const [framerate, setFramerate] = useState(
-    parseInt(localStorage.getItem(getPrefixedKey("framerate")), 10) ||
+    parseFloat(localStorage.getItem(getPrefixedKey("framerate"))) ||
       DEFAULT_FRAMERATE
   );
+  /** The stored frame-rate choice: a rate, `FRAMERATE_DISPLAY`, or null for none. */
+  const [framerateChoice, setFramerateChoice] = useState(() => readStored("framerate"));
+  /** The display's refresh the core measured, null until it has. */
+  const [displayRate, setDisplayRate] = useState(() => window.displayRefreshRate ?? null);
   const [video_crf, setVideoCRF] = useState(
     parseInt(localStorage.getItem(getPrefixedKey("video_crf")), 10) ||
       DEFAULT_VIDEO_CRF
@@ -1293,23 +1403,23 @@ function Sidebar() {
   /**
    * State the conditional settings read; rebuilt each render so the hooks
    * below re-resolve against current values when their deps change.
-   * `activeEncoder` is the one encoder knob for both transports, read from
-   * storage first: an out-of-set stored value is ignored by the server's own
-   * fallback and re-seated by the `serverSettings` sync. `softwareEncoders`
-   * and `useCpu` (the client's choice, else the server's) feed the
-   * rate-control default; `encoderBackends` decides whether the software
-   * encoding switch is shown.
+   * `encoderBackends` decides whether the software encoding switch is shown.
    */
   const conditionalCtx = {
     manualActive: !!readStored("manual_width") || serverSettings?.manual_resolution?.value === true,
-    streamMode,
-    activeEncoder: readStored("encoder") || encoder,
-    softwareEncoders: serverSettings?.software_encoders?.value,
     encoderBackends: serverSettings?.encoder_backends?.value,
-    useCpu: readStored("use_cpu") !== null
-      ? readStored("use_cpu") === "true" : !!serverSettings?.use_cpu?.value,
     allowedRateControl: serverSettings?.rate_control_mode?.allowed || rateControlOptions,
     macDesktop: isMacDesktop(),
+  };
+  /**
+   * Paint-over also reads the encoder and Turbo, Turbo resolved here rather
+   * than taken from its state, which trails the `serverSettings` sync by a
+   * render.
+   */
+  const paintOverCtx = {
+    ...conditionalCtx,
+    encoder,
+    videoStreamingMode: resolveSpec(VIDEO_STREAMING_MODE_SPEC, serverSettings, conditionalCtx, readStored),
   };
   /**
    * Each conditional setting is one hook call over a shared spec. The hook
@@ -1320,11 +1430,9 @@ function Sidebar() {
   const [hidpiEnabled, setHidpiEnabled] = useConditionalSetting(
     HIDPI_SPEC, serverSettings, conditionalCtx, [serverSettings], readHidpiStored);
   const [rateControlMode, setRateControlMode] = useConditionalSetting(
-    RATE_CONTROL_SPEC, serverSettings, conditionalCtx, [serverSettings, streamMode], readRateControlStored);
-  /** Paint-over's default tracks rate control, so its context carries the mode just settled on. */
-  const paintOverCtx = { ...conditionalCtx, rateControlMode };
+    RATE_CONTROL_SPEC, serverSettings, conditionalCtx, [serverSettings], readRateControlStored);
   const [usePaintOverQuality, setUsePaintOverQuality] = useConditionalSetting(
-    USE_PAINT_OVER_QUALITY_SPEC, serverSettings, paintOverCtx, [serverSettings, rateControlMode], readPaintOverStored);
+    USE_PAINT_OVER_QUALITY_SPEC, serverSettings, paintOverCtx, [serverSettings], readPaintOverStored);
   const [videoFullColor, setVideoFullColor] = useConditionalSetting(
     VIDEO_FULLCOLOR_SPEC, serverSettings, conditionalCtx, [serverSettings]);
   // Full color is 4:4:4 H.264; where the decoder has no such profile the core
@@ -1339,6 +1447,21 @@ function Sidebar() {
   }, [fullColorCodec]);
   const [use_cpu, setUseCpu] = useConditionalSetting(
     USE_CPU_SPEC, serverSettings, conditionalCtx, [serverSettings]);
+  const [video10Bit, setVideo10Bit] = useConditionalSetting(
+    VIDEO_10BIT_SPEC, serverSettings, conditionalCtx, [serverSettings]);
+  /** 10-bit is offered only where this engine shows a 10-bit picture of the stream's format. */
+  const [tenBitAnswer, setTenBitAnswer] = useState({ format: "", ok: false });
+  const tenBitOffered = tenBitStream(encoder, conditionalCtx.encoderBackends, use_cpu, videoFullColor);
+  const tenBitFullColor = !!tenBitOffered && tenBitOffered.fullcolor;
+  const tenBitAsked = tenBitFormat(fullColorCodec, tenBitFullColor);
+  useEffect(() => {
+    let live = true;
+    canDecodeTenBit(fullColorCodec, tenBitFullColor).then((ok) => {
+      if (live) setTenBitAnswer({ format: tenBitFormat(fullColorCodec, tenBitFullColor), ok });
+    });
+    return () => { live = false; };
+  }, [fullColorCodec, tenBitFullColor]);
+  const tenBitDecodable = tenBitAnswer.ok && tenBitAnswer.format === tenBitAsked;
   const [videoStreamingMode, setVideoStreamingMode] = useConditionalSetting(
     VIDEO_STREAMING_MODE_SPEC, serverSettings, conditionalCtx, [serverSettings]);
   const [forceAlignedResolution, setForceAlignedResolution] = useConditionalSetting(
@@ -1370,6 +1493,7 @@ function Sidebar() {
   const [clipboardUp, setClipboardUp] = useState(() => storedBool("clipboard_in_enabled", true));
   const [clipboardDown, setClipboardDown] = useState(() => storedBool("clipboard_out_enabled", true));
   const [clipboardSeamless, setClipboardSeamless] = useState(() => storedBool("clipboard_seamless", true));
+  const [gamepadRumble, setGamepadRumble] = useState(() => storedBool("gamepad_rumble", true));
   const [keyboardShortcuts, setKeyboardShortcuts] = useState(() => storedBool("keyboard_shortcuts", true));
   const [printAuto, setPrintAuto] = useState(() => storedBool("print_auto", true));
   const [printJobs, setPrintJobs] = useState([]);
@@ -1388,6 +1512,12 @@ function Sidebar() {
    */
   const [dashboardClipboardTruncated, setDashboardClipboardTruncated] =
     useState(false);
+  /**
+   * The session's clipboard holds text its owner marked secret: the box
+   * shows it masked and read-only, with a button that has the core copy it.
+   */
+  const [dashboardClipboardSecret, setDashboardClipboardSecret] =
+    useState(false);
   const [audioInputDevices, setAudioInputDevices] = useState([]);
   const [audioOutputDevices, setAudioOutputDevices] = useState([]);
   const [selectedInputDeviceId, setSelectedInputDeviceId] = useState("default");
@@ -1399,6 +1529,12 @@ function Sidebar() {
   const [isLoadingAudioDevices, setIsLoadingAudioDevices] = useState(false);
   const [gamepadStates, setGamepadStates] = useState({});
   const [hasReceivedGamepadData, setHasReceivedGamepadData] = useState(false);
+  // The stats strip over the stream, which the stats section's switch keeps on.
+  const [statsStrip, setStatsStrip] = useState(() => readStored("stats_strip") === "true");
+  const handleStatsStripToggle = () => {
+    localStorage.setItem(getPrefixedKey("stats_strip"), String(!statsStrip));
+    setStatsStrip(!statsStrip);
+  };
   const [sectionsOpen, setSectionsOpen] = useState({
     settings: false,
     audioSettings: false,
@@ -1470,16 +1606,8 @@ function Sidebar() {
 
   const DEBOUNCE_DELAY = 500;
 
-  /** One debounced poster for the component's lifetime, so a burst of slider moves coalesces into a single post. */
-  const debouncedPostSetting = useMemo(
-    () => debounce((setting) => {
-      window.postMessage(
-        { type: "settings", settings: setting },
-        window.location.origin
-      );
-    }, DEBOUNCE_DELAY),
-    []
-  );
+  /** One settings poster for the component's lifetime, so a burst coalesces into a single post. */
+  const debouncedPostSetting = useMemo(() => settingsPoster(DEBOUNCE_DELAY), []);
 
   /** The two push channels a spec can propagate through; each spec decides which. */
   const conditionalIo = {
@@ -1536,7 +1664,7 @@ function Sidebar() {
     }
     const s_framerate = serverSettings.framerate;
     if (s_framerate) {
-      const stored = getStoredInt("framerate");
+      const stored = parseFloat(localStorage.getItem(getPrefixedKey("framerate")));
       const final = !isNaN(stored)
         ? Math.max(s_framerate.min, Math.min(s_framerate.max, stored))
         : s_framerate.default;
@@ -1641,15 +1769,12 @@ function Sidebar() {
   /* eslint-enable react-hooks/set-state-in-effect */
 
   /**
-   * Rate control: the hook only sets local state, so when the resolved
-   * default diverges from what the server is applying (a transport switch
-   * seeds the session with the previous mode's value) this pushes it so the
-   * encoder follows. Pinned, locked or operator-overridden values resolve to
-   * the server's value and post nothing. The core persists every mode it is
-   * told to apply and resends it on the next connect, so without an explicit
-   * pick the stored value is an echo, not a choice: it is dropped once it
-   * stops matching what the ladder resolves, or it would outlive the
-   * derivation, and an operator override with it.
+   * Rate control: the core persists every mode it is told to apply and
+   * resends it on the next connect, so a stored mode without an explicit pick
+   * is an echo of a value a dashboard derived, not a choice. It is dropped
+   * once it stops matching what the ladder resolves, which is the server's own
+   * value; kept, it would hold the session to it and outlive an operator
+   * override.
    */
   useEffect(() => {
     if (!serverSettings) return;
@@ -1661,11 +1786,6 @@ function Sidebar() {
       && readStored(rcKey) !== null && readStored(rcKey) !== resolved) {
       localStorage.removeItem(getPrefixedKey(rcKey));
     }
-    if (isSettingPinned(RATE_CONTROL_SPEC, serverSettings, readRateControlStored)) return;
-    const serverValue = serverSettings[RATE_CONTROL_SPEC.serverKey]?.value;
-    if (resolved && serverValue !== undefined && resolved !== serverValue) {
-      writeConditional(RATE_CONTROL_SPEC, resolved, setRateControlMode, { persist: false });
-    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverSettings]);
 
@@ -1674,8 +1794,8 @@ function Sidebar() {
    * says, since the hook only sets local state and the core otherwise starts
    * from its own stored default -- a deployment that configures a resolution
    * would stream pixel-perfect on every load with the toggle reading off. And
-   * drops the unmarked stored echo once the ladder moves on, the same shape as
-   * the rate-control derivation.
+   * drops the unmarked stored echo once the ladder moves on, as rate control
+   * does.
    */
   useEffect(() => {
     if (!serverSettings) return;
@@ -1697,15 +1817,13 @@ function Sidebar() {
   }, [serverSettings]);
 
   /**
-   * Paint-over: pushes the default the resolved rate control implies so the
-   * encoder agrees, and drops the unmarked stored echo once the ladder moves
-   * on, the same shape as the rate-control derivation.
+   * Paint-over: pushes the resolved value so the encoder agrees, and drops
+   * the unmarked stored echo once the ladder moves on, as rate control does.
    */
   useEffect(() => {
     if (!serverSettings) return;
     const key = USE_PAINT_OVER_QUALITY_SPEC.storageKey;
-    const resolved = resolveSpec(
-      USE_PAINT_OVER_QUALITY_SPEC, serverSettings, { ...conditionalCtx, rateControlMode }, readPaintOverStored);
+    const resolved = resolveSpec(USE_PAINT_OVER_QUALITY_SPEC, serverSettings, paintOverCtx, readPaintOverStored);
     if (!isExplicitChoice(USE_PAINT_OVER_QUALITY_SPEC)
       && readStored(key) !== null
       && readStored(key) !== String(resolved)) {
@@ -1717,7 +1835,17 @@ function Sidebar() {
       writeConditional(USE_PAINT_OVER_QUALITY_SPEC, resolved, setUsePaintOverQuality, { persist: false });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverSettings, rateControlMode]);
+  }, [serverSettings]);
+
+  /** A later encoder or Turbo change re-derives paint-over where nothing pins it. */
+  useEffect(() => {
+    if (!serverSettings || isSettingPinned(USE_PAINT_OVER_QUALITY_SPEC, serverSettings, readPaintOverStored)) return;
+    const resolved = resolveSpec(USE_PAINT_OVER_QUALITY_SPEC, serverSettings, paintOverCtx, readPaintOverStored);
+    if (resolved !== usePaintOverQuality) {
+      writeConditional(USE_PAINT_OVER_QUALITY_SPEC, resolved, setUsePaintOverQuality, { persist: false });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [encoder, videoStreamingMode]);
 
   /** UI scaling pick: persisted, so it pins across reloads and stops the startup derived-default post. */
   const handleDpiScalingChange = (event) => {
@@ -1890,7 +2018,8 @@ function Sidebar() {
    * microphone permission so labels are readable. Output routing goes through
    * whatever the active core plays on: the WebRTC core's `<video>` element
    * (`HTMLMediaElement.setSinkId`) or the WebSocket core's AudioContext
-   * (`AudioContext.setSinkId`, which Firefox lacks), so the one in use is
+   * (`AudioContext.setSinkId`, or where that is missing, as in Firefox, a
+   * media element the core plays the context through), so the one in use is
    * probed or the output picker would render and do nothing. The selections
    * are left alone: the core keeps the devices this dashboard picked for the
    * life of the page, so a reopened section shows them rather than defaulting.
@@ -1901,9 +2030,8 @@ function Sidebar() {
     setAudioDeviceError(null);
     setAudioInputDevices([]);
     setAudioOutputDevices([]);
-    const supportsSinkId = isWebrtc
-      ? "setSinkId" in HTMLMediaElement.prototype
-      : typeof AudioContext !== "undefined" && "setSinkId" in AudioContext.prototype;
+    const supportsSinkId = "setSinkId" in HTMLMediaElement.prototype
+      || (!isWebrtc && typeof AudioContext !== "undefined" && "setSinkId" in AudioContext.prototype);
     setIsOutputSelectionSupported(supportsSinkId);
     console.log(
       "Dashboard: Output device selection supported:",
@@ -1979,7 +2107,7 @@ function Sidebar() {
     },
     [sectionsOpen, populateAudioDevices]
   );
-  const baseUrl = typeof window !== 'undefined' ? window.location.href.split('#')[0] : '';
+  const baseUrl = typeof window !== 'undefined' ? shareablePageURL() : '';
   const sharingLinks = [
     {
       id: "shared",
@@ -2035,34 +2163,14 @@ function Sidebar() {
     }
   };
   /**
-   * Re-derives rate control after an encoder or software-encoding change.
-   * Rate control follows those unless pinned by an explicit client or server
-   * choice, and a derived change is not persisted, so it keeps following.
-   * @param {object} ctxOverrides The value just chosen, ahead of the re-render that would put it in `conditionalCtx`.
-   */
-  const rederiveRateControl = (ctxOverrides) => {
-    if (!rateControlEnabled
-      || isSettingPinned(RATE_CONTROL_SPEC, serverSettings, readRateControlStored)) return;
-    const rcResolved = resolveSpec(
-      RATE_CONTROL_SPEC, serverSettings,
-      { ...conditionalCtx, ...ctxOverrides }, readRateControlStored);
-    if (rcResolved !== rateControlMode) {
-      writeConditional(RATE_CONTROL_SPEC, rcResolved, setRateControlMode, { persist: false });
-    }
-  };
-  /**
    * Encoder pick, one knob for both transports; the server switches the
-   * pipeline encoder on it. The choice is persisted immediately so
-   * `conditionalCtx.activeEncoder`, which reads localStorage, does not lag
-   * during the post debounce and let a `serverSettings` sync re-derive rate
-   * control off the stale encoder.
+   * pipeline encoder on it, and the choice is persisted at once.
    */
   const handleEncoderChange = (event) => {
     const selectedEncoder = event.target.value;
     setEncoder(selectedEncoder);
     localStorage.setItem(getPrefixedKey("encoder"), selectedEncoder);
     debouncedPostSetting({ encoder: selectedEncoder });
-    rederiveRateControl({ activeEncoder: selectedEncoder });
   };
   const handleWebcamEncoderChange = (event) => {
     const preference = event.target.value;
@@ -2076,12 +2184,19 @@ function Sidebar() {
   const wceServerValue = webcamEncoderOptions.includes(wceServer?.value) ? wceServer.value : null;
   const wceChoice = webcamEncoderOptions.includes(webcamEncoderChoice) ? webcamEncoderChoice : null;
   const webcamEncoder = (wceServer?.locked && wceServerValue) || wceChoice || wceServerValue || "auto";
+  /**
+   * The frame rate, bitrate, and CRF sliders carry an index into their stops;
+   * the display's own stop asks for the display's refresh wherever it moves.
+   */
   const handleFramerateChange = (event) => {
-    const selectedFramerate = parseInt(event.target.value, 10);
+    const index = parseInt(event.target.value, 10);
+    const selectedFramerate = framerateOptions.stops[index];
+    if (selectedFramerate === undefined) return;
+    const choice = index === framerateOptions.display ? FRAMERATE_DISPLAY : selectedFramerate;
     setFramerate(selectedFramerate);
-    debouncedPostSetting({ framerate: selectedFramerate });
+    setFramerateChoice(String(choice));
+    debouncedPostSetting({ framerate: choice });
   };
-  /** Video bitrate slider: its value is an index into `videoBitrateOptions`. */
   const handleVideoBitrateChange = (event) => {
     const index = parseInt(event.target.value, 10);
     const selectedVideoBitrate = videoBitrateOptions[index];
@@ -2105,12 +2220,14 @@ function Sidebar() {
     debouncedPostSetting({ paint_over_jpeg_quality: selectedQuality });
   };
   const handleVideoCRFChange = (event) => {
-    const selectedCRF = parseInt(event.target.value, 10);
+    const selectedCRF = videoCRFOptions[parseInt(event.target.value, 10)];
+    if (selectedCRF === undefined) return;
     setVideoCRF(selectedCRF);
     debouncedPostSetting({ video_crf: selectedCRF });
   };
   const handleH264PaintoverCRFChange = (event) => {
-    const selectedCRF = parseInt(event.target.value, 10);
+    const selectedCRF = videoPaintoverCRFOptions[parseInt(event.target.value, 10)];
+    if (selectedCRF === undefined) return;
     setVideoPaintoverCRF(selectedCRF);
     debouncedPostSetting({ video_paintover_crf: selectedCRF });
   };
@@ -2122,17 +2239,19 @@ function Sidebar() {
   const handleH264FullColorToggle = () => {
     writeConditional(VIDEO_FULLCOLOR_SPEC, !videoFullColor, setVideoFullColor, { persist: true });
   };
+  const handle10BitToggle = () => {
+    writeConditional(VIDEO_10BIT_SPEC, !video10Bit, setVideo10Bit, { persist: true });
+  };
   const handleUsePaintOverQualityToggle = () => {
     writeConditional(USE_PAINT_OVER_QUALITY_SPEC, !usePaintOverQuality, setUsePaintOverQuality, { persist: true });
   };
   const handleUseCpuToggle = () => {
     writeConditional(USE_CPU_SPEC, !use_cpu, setUseCpu, { persist: true });
-    rederiveRateControl({ useCpu: !use_cpu });
   };
   const handleH264StreamingModeToggle = () => {
     writeConditional(VIDEO_STREAMING_MODE_SPEC, !videoStreamingMode, setVideoStreamingMode, { persist: true });
   };
-  /** Rate control pick: an explicit choice, persisted so encoder changes stop overriding it. */
+  /** Rate control pick: an explicit choice, persisted so it outranks the server's default. */
   const handleRateControlChange = (event) => {
     writeConditional(RATE_CONTROL_SPEC, event.target.value, setRateControlMode, { persist: true });
   };
@@ -2273,6 +2392,15 @@ function Sidebar() {
     setAntiAliasing(newState);
     window.postMessage(
       { type: "setAntiAliasing", value: newState },
+      window.location.origin
+    );
+  };
+  /** Rumble on this client's pads is client-only; the core persists gamepad_rumble itself. */
+  const handleGamepadRumbleToggle = () => {
+    const newState = !gamepadRumble;
+    setGamepadRumble(newState);
+    window.postMessage(
+      { type: "setGamepadRumble", value: newState },
       window.location.origin
     );
   };
@@ -2425,76 +2553,29 @@ function Sidebar() {
     // Cleared so the same file can be picked again.
     event.target.value = "";
   };
-  /** Pushes the edited clipboard text to the server on blur, never a truncated preview. */
+  /** Pushes the edited clipboard text to the server on blur, never a truncated preview or a mask. */
   const handleClipboardBlur = (event) => {
-    if (dashboardClipboardTruncated) return;
+    if (dashboardClipboardTruncated || dashboardClipboardSecret) return;
     window.postMessage(
       { type: "clipboardUpdateFromUI", text: event.target.value },
       window.location.origin
     );
   };
+  /** Has the core write the masked secret to this device's clipboard, inside this click. */
+  const handleCopyClipboardSecret = () =>
+    window.postMessage({ type: "clipboardCopySecret" }, window.location.origin);
   const toggleTheme = () => {
     const newTheme = theme === "dark" ? "light" : "dark";
     setTheme(newTheme);
     localStorage.setItem("theme", newTheme);
   };
-  /**
-   * Switches the transport through `/api/switch`, then posts `mode` so the
-   * core reloads into it. `window.__selkiesModeSwitching` is set before the
-   * request because the server tears down the old peer (WebSocket close code
-   * 4000) before it responds, and without the flag the active core would
-   * surface a spurious "Server disconnected" alert. The request carries this
-   * client's own session token, which a controller's is enough for; a stored
-   * master token overrides it, and where neither is accepted a 401 prompts for
-   * the master token once, keeps it in sessionStorage and retries, dropping one
-   * the server rejects so the next attempt re-prompts. A viewer is refused 403
-   * and is not asked for anything. A failed switch clears the flag again, since
-   * no reload follows and a kept flag would hide a real disconnect.
-   */
+  /** Switches the transport (`switchStreamMode`); the core reloads into it. */
   const handleStreamModeChange = async (event) => {
     const newMode = event.target.value;
     console.log("Change of stream mode requested:", newMode);
-    window.__selkiesModeSwitching = true;
-    try {
-      const MASTER_TOKEN_KEY = "selkies_master_token";
-      const doSwitch = () => {
-        const headers = sessionAuthHeaders({ "Content-Type": "application/json" });
-        let storedToken = null;
-        try { storedToken = sessionStorage.getItem(MASTER_TOKEN_KEY); } catch { /* sessionStorage unavailable */ }
-        if (storedToken) headers["Authorization"] = `Bearer ${storedToken}`;
-        return fetch(`${getRoutePrefix()}/api/switch`, {
-          method: "POST",
-          headers,
-          credentials: "same-origin",
-          body: JSON.stringify({ mode: newMode }),
-        });
-      };
-      let response = await doSwitch();
-      if (response.status === 401) {
-        const entered = (typeof window !== "undefined" && window.prompt)
-          ? window.prompt("Switching the stream mode requires the Selkies master token:")
-          : null;
-        if (entered && entered.trim()) {
-          try { sessionStorage.setItem(MASTER_TOKEN_KEY, entered.trim()); } catch { /* sessionStorage unavailable */ }
-          response = await doSwitch();
-        }
-      }
-
-      if (!response.ok) {
-        if (response.status === 401) { try { sessionStorage.removeItem(MASTER_TOKEN_KEY); } catch { /* sessionStorage unavailable */ } }
-        throw new Error(`Request failed with status ${response.status}`);
-      }
-      await response.json();
-      setStreamMode(newMode);
-      window.postMessage(
-        { type: "mode", mode: newMode },
-        window.location.origin
-      );
-    } catch (error) {
-        window.__selkiesModeSwitching = false;
-        console.error("Error switching stream mode:", error);
-    }
-  }
+    if (await switchStreamMode(newMode)) setStreamMode(newMode);
+  };
+  const canSwitchMode = ((renderableSettings.enableDualMode ?? window.__SELKIES_DUAL_MODE__) ?? false) && !isViewerRole;
   /** Touch gamepad toggle: `TOUCH_GAMEPAD_SETUP` on first activation, `TOUCH_GAMEPAD_VISIBILITY` afterwards. */
   const handleToggleTouchGamepad = useCallback(() => {
     const newActiveState = !isTouchGamepadActive;
@@ -2616,6 +2697,7 @@ function Sidebar() {
           if (typeof message.text === "string") {
             setDashboardClipboardContent(message.text);
             setDashboardClipboardTruncated(message.truncated === true);
+            setDashboardClipboardSecret(message.secret === true);
           }
         } else if (message.type === "audioDeviceSelected") {
           if (message.deviceId) {
@@ -2783,11 +2865,21 @@ function Sidebar() {
           if (typeof message.enabled === 'boolean') {
             setIsTrackpadModeActive(message.enabled);
           }
+        } else if (message.type === "displayRefresh") {
+          if (Number.isFinite(message.rate)) setDisplayRate(message.rate);
         } else if (message.type === "scalingDpiFollowed") {
           // The core's derived pick; a stored pick is the user's and stays.
           if (Number.isFinite(message.value) && readStored("scaling_dpi") === null) {
             setSelectedDpi(message.value);
           }
+        } else if (message.type === "transportAdvice") {
+          setNotifications((prev) => {
+            const rest = prev.filter((n) => n.id !== TRANSPORT_NOTICE_ID);
+            return message.offer === "websockets"
+              ? [...rest, { id: TRANSPORT_NOTICE_ID, fileName: t("notifications.webrtcFailedTitle"),
+                            status: "transport", message: null, timestamp: Date.now(), fadingOut: false }]
+              : rest;
+          });
         }
       }
     };
@@ -2825,14 +2917,11 @@ function Sidebar() {
   /** One encoder knob serves both transports; CBR/CRF applies to every H.264 encoder on both. */
   const activeEncoder = encoder;
   const VIDEO_ENCODERS = ["h264enc", "h265enc", "vp8enc", "vp9enc", "av1enc", "h264enc-striped"];
-  const showFPS = [
-    "jpeg",
-    "h264enc-striped",
-    "h264enc",
-  ].includes(encoder);
   const showCRF = VIDEO_ENCODERS.includes(activeEncoder);
   const showH264Options = VIDEO_ENCODERS.includes(activeEncoder);
   const showFullColor = showH264Options && codecCarriesFullColor(codecOfEncoder(activeEncoder));
+  const show10Bit = showH264Options && codecCarriesTenBit(codecOfEncoder(activeEncoder))
+    && !!tenBitOffered;
   const showJpegOptions = encoder === 'jpeg';
   const showPaintOverQualityToggle = showH264Options || showJpegOptions;
   /**
@@ -2844,26 +2933,27 @@ function Sidebar() {
     : (serverSettings?.rate_control_mode?.value ?? rateControlMode);
 
   /**
-   * CBR slider stops within the server's range: the sub-Mbps steps, 1000-kbps
-   * steps to 100000, then the coarse steps to 1000000.
+   * The slider stops inside the server's ranges; a stored value between stops
+   * (a server default, a clamp) shows at the nearest one.
    */
-  const videoBitrateOptions = (() => {
-    const min = serverSettings?.video_bitrate?.min ?? 100;
-    const max = serverSettings?.video_bitrate?.max ?? 1000000;
-    const stops = SUB_MBPS_BITRATE_STEPS.filter((v) => v >= min && v <= max);
-    for (let v = Math.max(1000, Math.ceil(min / 1000) * 1000); v <= Math.min(100000, Math.floor(max / 1000) * 1000); v += 1000) stops.push(v);
-    stops.push(...COARSE_MBPS_BITRATE_STEPS.filter((v) => v >= min && v <= max));
-    return stops.length ? stops : [min];
-  })();
-  const bitrateSliderIndex = (() => {
-    const exact = videoBitrateOptions.indexOf(videoBitrate);
-    if (exact >= 0) return exact;
-    const above = videoBitrateOptions.findIndex((v) => v >= videoBitrate);
-    return above >= 0 ? above : videoBitrateOptions.length - 1;
-  })();
+  const videoBitrateOptions = stopsWithin(BITRATE_STOPS, serverSettings?.video_bitrate?.min ?? 100, serverSettings?.video_bitrate?.max ?? 1000000);
+  const bitrateSliderIndex = stopIndex(videoBitrateOptions, videoBitrate);
+  const framerateSpan = serverSettings?.framerate
+    ? { min: serverSettings.framerate.min, max: serverSettings.framerate.max }
+    : null;
+  const displayFramerate = displayRate ? matchDisplay(displayRate, framerateSpan?.min ?? 8, framerateSpan?.max ?? 240) : null;
+  const framerateOptions = withDisplayStop(stopsWithin(FRAMERATE_STOPS, framerateSpan?.min ?? 8, framerateSpan?.max ?? 240), displayFramerate);
+  const framerateFollows = followsDisplay(framerateChoice, framerateSpan) && displayFramerate !== null;
+  const effectiveFramerate = framerateFollows ? displayFramerate : framerate;
+  const videoCRFOptions = stopsWithin(CRF_STOPS, serverSettings?.video_crf?.min ?? 5, serverSettings?.video_crf?.max ?? 50);
+  const videoPaintoverCRFOptions = stopsWithin(CRF_STOPS, serverSettings?.video_paintover_crf?.min ?? 5, serverSettings?.video_paintover_crf?.max ?? 50);
   const formatBitrate = (v) => `${v / 1000} Mbps`;
+  // The poor-connection mark is about the stream, not the sidebar, so it stays
+  // when the sidebar is hidden; it has its own setting.
+  const connectionMark = serverSettings?.ui_show_connection_indicator?.value === false
+    ? null : <ConnectionIndicator t={t} />;
   if (serverSettings && serverSettings.ui_show_sidebar?.value === false) {
-    return null;
+    return connectionMark;
   }
   const sidebarClasses = `sidebar ${isOpen ? "is-open" : ""} theme-${theme}`;
   const showCoreButtons = !isSecondaryDisplay && (renderableSettings.coreButtons ?? true);
@@ -3048,7 +3138,7 @@ function Sidebar() {
             )}
             {showKeyboardTile && (
               <button
-                className={`action-button keyboard-toggle-button ${isKeyboardButtonVisible ? "active" : ""}`}
+                className={`action-button keyboard-toggle-button ${isKeyboardButtonVisible && !keyboardAttached ? "active" : ""}`}
                 onClick={toggleKeyboardButtonVisibility}
                 title={t("keyboardButtonToggleTitle", "Keyboard Button")}
               >
@@ -3107,6 +3197,106 @@ function Sidebar() {
             </div>
         )}
 
+        {(isMobile || hasDetectedTouch) && (renderableSettings.softButtons ?? true) && (
+          <div className="key-palette">
+            <button
+              className={`key-palette-toggle ${isKeyPaletteOpen ? "active" : ""}`}
+              aria-expanded={isKeyPaletteOpen}
+              onClick={() => setIsKeyPaletteOpen((open) => !open)}
+              onMouseDown={(e) => e.preventDefault()}
+            >
+              {isKeyPaletteOpen ? t("keyPalette.less", "Fewer keys") : t("keyPalette.more", "More keys")}
+            </button>
+            {isKeyPaletteOpen && (
+              <>
+                <div className="key-palette-grid">
+                  {PALETTE_KEYS.map(([label, key, code]) => (
+                    <button
+                      key={code}
+                      className="mobile-key-button"
+                      data-code={code}
+                      onClick={() => handleOnceKeyClick(key, code)}
+                      onMouseDown={(e) => e.preventDefault()}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div className="key-palette-chords">
+                  {PALETTE_CHORDS.map((chord) => (
+                    <button
+                      key={chord}
+                      className="mobile-key-button"
+                      data-chord={chord}
+                      onClick={() => playChord(chord)}
+                      onMouseDown={(e) => e.preventDefault()}
+                    >
+                      {chord}
+                    </button>
+                  ))}
+                  {userChords.map((chord) => (
+                    <span key={chord} className="key-palette-user-chord">
+                      <button
+                        className="mobile-key-button"
+                        data-chord={chord}
+                        onClick={() => playChord(chord)}
+                        onMouseDown={(e) => e.preventDefault()}
+                      >
+                        {chord}
+                      </button>
+                      <button
+                        className="key-palette-remove"
+                        aria-label={t("keyPalette.remove", { chord })}
+                        title={t("keyPalette.remove", { chord })}
+                        onClick={() => handleRemoveChord(chord)}
+                        onMouseDown={(e) => e.preventDefault()}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+                <form className="key-palette-add" onSubmit={handleAddChord}>
+                  <input
+                    type="text"
+                    className="key-palette-input allow-native-input"
+                    value={chordDraft}
+                    onChange={(e) => { setChordDraft(e.target.value); setChordRefused(false); }}
+                    placeholder={t("keyPalette.addPlaceholder", "A chord, like Ctrl+Shift+T")}
+                    aria-label={t("keyPalette.addPlaceholder", "A chord, like Ctrl+Shift+T")}
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    spellCheck={false}
+                  />
+                  <button type="submit" className="mobile-key-button">
+                    {t("keyPalette.add", "Add")}
+                  </button>
+                </form>
+                {chordRefused && (
+                  <p className="key-palette-refused">
+                    {t("keyPalette.refused", "Write a chord as modifiers and one key joined by +, like Ctrl+Shift+T.")}
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
+        {(isMobile || hasDetectedTouch) && isTrackpadModeActive && (renderableSettings.trackpad ?? true) && (
+          <div className="trackpad-speed">
+            <label htmlFor="trackpadSpeedSelect">{t("trackpadSpeedLabel", "Trackpad speed")}</label>
+            <select
+              id="trackpadSpeedSelect"
+              value={trackpadSpeed}
+              onChange={(e) => handleTrackpadSpeed(Number(e.target.value))}
+            >
+              {TRACKPAD_SPEEDS.map((v) => (
+                <option key={v} value={v}>{`${v}\u00d7`}</option>
+              ))}
+            </select>
+          </div>
+        )}
+
         {/* Viewers can't apply stream settings (the server ignores their
             SETTINGS payloads); hide the posting sections instead of rendering
             controls that silently do nothing. */}
@@ -3130,7 +3320,7 @@ function Sidebar() {
             </div>
             {sectionsOpen.settings && (
                 <div className="sidebar-section-content" id="settings-content">
-                  {((renderableSettings.enableDualMode ?? window.__SELKIES_DUAL_MODE__) ?? false) && !isViewerRole && (
+                  {canSwitchMode && (
                     <div className="dev-setting-item">
                       {" "}
                       <label htmlFor="streamModeSelect">
@@ -3209,20 +3399,20 @@ function Sidebar() {
                     </select>
                   </div>
                 )}
-                {(isWebrtc || showFPS) && (renderableSettings.framerate ?? true) && (
+                {(renderableSettings.framerate ?? true) && (
                   <div className="dev-setting-item">
                     <label htmlFor="framerateSlider">
-                      {t("sections.video.framerateLabel", {
-                        framerate: framerate,
+                      {t(framerateFollows ? "sections.video.framerateDisplayLabel" : "sections.video.framerateLabel", {
+                        framerate: framerateLabel(effectiveFramerate),
                       })}
                     </label>
                     <input
                       type="range"
                       id="framerateSlider"
-                      min={serverSettings?.framerate?.min || 8}
-                      max={serverSettings?.framerate?.max || 240}
+                      min={0}
+                      max={framerateOptions.stops.length - 1}
                       step="1"
-                      value={framerate}
+                      value={framerateStopIndex(framerateOptions, framerate, framerateFollows)}
                       onChange={handleFramerateChange}
                       disabled={!serverSettings || serverSettings.framerate?.min === serverSettings.framerate?.max}
                     />
@@ -3278,13 +3468,12 @@ function Sidebar() {
                     <input
                       type="range"
                       id="videoCRFSlider"
-                      min={serverSettings?.video_crf?.min || 5}
-                      max={serverSettings?.video_crf?.max || 50}
+                      min={0}
+                      max={videoCRFOptions.length - 1}
                       step="1"
-                      value={video_crf}
+                      value={stopIndex(videoCRFOptions, video_crf)}
                       onChange={handleVideoCRFChange}
                       disabled={!serverSettings || serverSettings.video_crf?.min === serverSettings.video_crf?.max}
-                      style={{ direction: 'rtl' }}
                     />
                   </div>
                 )}
@@ -3313,13 +3502,12 @@ function Sidebar() {
                     <input
                       type="range"
                       id="videoPaintoverCRFSlider"
-                      min={serverSettings?.video_paintover_crf?.min || 5}
-                      max={serverSettings?.video_paintover_crf?.max || 50}
+                      min={0}
+                      max={videoPaintoverCRFOptions.length - 1}
                       step="1"
-                      value={videoPaintoverCRF}
+                      value={stopIndex(videoPaintoverCRFOptions, videoPaintoverCRF)}
                       onChange={handleH264PaintoverCRFChange}
                       disabled={!serverSettings || serverSettings.video_paintover_crf?.min === serverSettings.video_paintover_crf?.max}
-                      style={{ direction: 'rtl' }}
                     />
                   </div>
                 )}
@@ -3391,6 +3579,23 @@ function Sidebar() {
                       aria-pressed={videoFullColor}
                       disabled={!serverSettings || serverSettings.video_fullcolor?.locked}
                       title={t(videoFullColor ? "buttons.videoFullColorDisableTitle" : "buttons.videoFullColorEnableTitle")}
+                    >
+                      <span className="toggle-button-sidebar-knob"></span>
+                    </button>
+                  </div>
+                )}
+                {show10Bit && (renderableSettings.video10Bit ?? true) && tenBitDecodable && (
+                  <div className="dev-setting-item toggle-item">
+                    <label htmlFor="video10BitToggle">
+                      {t("sections.video.tenBitLabel", "10-bit Color")}
+                    </label>
+                    <button
+                      id="video10BitToggle"
+                      className={`toggle-button-sidebar ${video10Bit ? "active" : ""}`}
+                      onClick={handle10BitToggle}
+                      aria-pressed={video10Bit}
+                      disabled={!serverSettings || serverSettings.video_10bit?.locked}
+                      title={t(video10Bit ? "buttons.video10BitDisableTitle" : "buttons.video10BitEnableTitle")}
                     >
                       <span className="toggle-button-sidebar-knob"></span>
                     </button>
@@ -3595,7 +3800,8 @@ function Sidebar() {
                     )}
                   </>
                 )}
-                {(!serverSettings?.manual_resolution?.locked) && (
+                {!serverSettings?.manual_resolution?.locked
+                  && (isSecondaryDisplay || serverSettings?.enable_resize?.value !== false) && (
                   <>
                     <div className="dev-setting-item">
                       <label htmlFor="resolutionPresetSelect">
@@ -3804,7 +4010,18 @@ function Sidebar() {
                 </div>
                 {sectionsOpen.stats && (
                   <div className="sidebar-section-content" id="stats-content">
-                    <StreamStats t={t} active={isOpen && sectionsOpen.stats} framerate={framerate} />
+                    <div className="dev-setting-item toggle-item">
+                      <label htmlFor="statsStripToggle">{t("sections.stats.stripLabel")}</label>
+                      <button
+                        id="statsStripToggle"
+                        className={`toggle-button-sidebar ${statsStrip ? "active" : ""}`}
+                        onClick={handleStatsStripToggle}
+                        aria-pressed={statsStrip}
+                      >
+                        <span className="toggle-button-sidebar-knob"></span>
+                      </button>
+                    </div>
+                    <StreamStats t={t} active={isOpen && sectionsOpen.stats} framerate={effectiveFramerate} />
                   </div>
                 )}
               </div>
@@ -3914,13 +4131,26 @@ function Sidebar() {
                       <textarea
                         className="allow-native-input"
                         id="dashboardClipboardTextarea"
-                        value={dashboardClipboardContent}
+                        value={dashboardClipboardSecret ? CLIPBOARD_SECRET_MASK : dashboardClipboardContent}
                         onChange={handleClipboardChange}
                         onBlur={handleClipboardBlur}
-                        readOnly={dashboardClipboardTruncated}
+                        readOnly={dashboardClipboardTruncated || dashboardClipboardSecret}
                         rows="5"
                         placeholder={t("sections.clipboard.placeholder")}
                       />
+                      {dashboardClipboardSecret && (
+                        <>
+                          <span className="dashboard-clipboard-note">
+                            {t("sections.clipboard.secretHidden")}
+                          </span>
+                          <button
+                            className="app-action-button install"
+                            onClick={handleCopyClipboardSecret}
+                          >
+                            {t("sections.clipboard.copySecret")}
+                          </button>
+                        </>
+                      )}
                     </div>
                     {(renderableSettings.binaryClipboard ?? true) &&
                       enableBinaryClipboard && (
@@ -4211,6 +4441,32 @@ function Sidebar() {
                         </span>
                       </button>
                     </div>
+                    <div
+                      className="dev-setting-item"
+                      style={{ marginBottom: "10px" }}
+                    >
+                      <button
+                        id="gamepadRumbleToggle"
+                        className={`resolution-button toggle-button ${
+                          gamepadRumble ? "active" : ""
+                        }`}
+                        onClick={handleGamepadRumbleToggle}
+                        title={t(
+                          "sections.gamepads.rumbleTitle",
+                          "Vibrate your controller when a game rumbles"
+                        )}
+                      >
+                        <GamepadIcon />
+                        <span style={{ marginLeft: "8px" }}>
+                          {t(
+                            gamepadRumble
+                              ? "sections.gamepads.rumbleActiveLabel"
+                              : "sections.gamepads.rumbleInactiveLabel",
+                            gamepadRumble ? "Rumble: ON" : "Rumble: OFF"
+                          )}
+                        </span>
+                      </button>
+                    </div>
 
                     {isMobile && isTouchGamepadActive ? (
                       <p>
@@ -4427,6 +4683,24 @@ function Sidebar() {
                   </span>{" "}
                 </>
               )}
+              {n.status === "transport" && (
+                <>
+                  <span className="notification-status-text">
+                    {canSwitchMode ? t("notifications.webrtcFailedSwitch") : t("notifications.webrtcFailedNoSwitch")}
+                  </span>
+                  {canSwitchMode && (
+                    <button
+                      className="resolution-button notification-action notification-transport-switch"
+                      onClick={() => {
+                        removeNotification(n.id);
+                        handleStreamModeChange({ target: { value: "websockets" } });
+                      }}
+                    >
+                      {t("notifications.switchToWebsockets")}
+                    </button>
+                  )}
+                </>
+              )}
               {n.status === "print" && (
                 <div className="notification-print-row">
                   <a
@@ -4481,7 +4755,7 @@ function Sidebar() {
       {isViewerRole && (
         <PlayerGamepadButton touchOnly isActive={isTouchGamepadActive} onToggle={handleToggleTouchGamepad} />
       )}
-      {!isViewerRole && (isMobile || hasDetectedTouch) && isKeyboardButtonVisible && (renderableSettings.keyboardButton ?? true) && (
+      {!isViewerRole && (isMobile || hasDetectedTouch) && isKeyboardButtonVisible && !keyboardAttached && (renderableSettings.keyboardButton ?? true) && (
         <button
           className={`virtual-keyboard-button theme-${theme} allow-native-input`}
           onClick={onKeyboardButtonClick}
@@ -4501,6 +4775,8 @@ function Sidebar() {
           <KeyboardIcon />
         </button>
       )}
+      {statsStrip && !isViewerRole && (renderableSettings.stats ?? true) && <StreamStrip t={t} />}
+      {connectionMark}
     </>
   );
 }

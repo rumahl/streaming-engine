@@ -30,6 +30,7 @@ FamilyChaos = X.FamilyChaos
 FamilyServerInterpreted = X.FamilyServerInterpreted
 FamilyInternetV6 = X.FamilyInternetV6
 FamilyLocal = 256
+FamilyWild = 65535
 
 class Xauthority(object):
     def __init__(self, filename = None):
@@ -104,7 +105,7 @@ class Xauthority(object):
     def get_best_auth(self, family, address, dispno,
                       types = ( b"MIT-MAGIC-COOKIE-1", )):
 
-        """Find an authentication entry matching FAMILY, ADDRESS and
+        """Find an authentication entry matching FAMILY, ADDRESS, and
         DISPNO.
 
         The name of the auth scheme must match one of the names in
@@ -122,7 +123,7 @@ class Xauthority(object):
         for efam, eaddr, enum, ename, edata in self.entries:
             if enum == b'' and ename not in matches:
                 enum = num
-            if efam == family and eaddr == address and num == enum:
+            if (efam == FamilyWild or (efam == family and eaddr == address)) and num == enum:
                 matches[ename] = edata
 
         for t in types:

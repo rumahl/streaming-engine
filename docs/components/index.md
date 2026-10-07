@@ -11,7 +11,7 @@ At runtime Selkies is a **single Python application**, the `selkies` wheel. The 
 
 | Component | What it does | Documented at |
 | --- | --- | --- |
-| Python application (`selkies`) | Serves the web client and every endpoint on one port, drives the display's input, clipboard, files and printing, and streams over WebSockets or WebRTC | [Usage](../usage.md), [Settings Reference](../settings.md), the [Developer Reference](../development.md#developer-reference) |
+| Python application (`selkies`) | Serves the web client and every endpoint on one port, drives the display's input, clipboard, files, and printing, and streams over WebSockets or WebRTC | [Usage](../usage.md), [Settings Reference](../settings.md), the [Developer Reference](../development.md#developer-reference) |
 | Web client and dashboards | The bundled `selkies-web-core` client and the reference dashboards built on it | [Web Client and Dashboards](web-client.md) |
 | `pixelflux` | Screen capture on X11 and Wayland and video encoding, on the GPU where it carries the codec and in software where it does not | [pixelflux](pixelflux.md), the Rust reference at <https://pixelflux.selkies.io> |
 | `pcmflux` | Audio capture from PulseAudio or PipeWire-Pulse, Opus encoding, and the microphone and recording paths | [pcmflux](pcmflux.md), the Rust reference at <https://pcmflux.selkies.io> |
@@ -20,7 +20,7 @@ At runtime Selkies is a **single Python application**, the `selkies` wheel. The 
 
 | Component | What it is for | Documented at |
 | --- | --- | --- |
-| Base Container | The whole session with no desktop in it: display servers, audio, GPU wiring, s6, coTURN and Selkies, to build a desktop on | [Base Container](base-image.md) |
+| Base Container | The whole session with no desktop in it: display servers, audio, GPU wiring, s6, coTURN, and Selkies, to build a desktop on | [Base Container](base-image.md) |
 | Desktop Container | The reference LXQt desktop on the base, the quickest way to try Selkies | [Desktop Container](desktop-image.md) |
 | KDE Plasma desktops | `docker-selkies-egl-desktop` and `docker-selkies-glx-desktop`, full desktops with hardware acceleration in separate repositories | [KDE Plasma Desktops](kde-images.md) |
 | Input Interposer and fake-udev | Gamepads for a container's applications without kernel devices, and kernel gamepads where `/dev/uinput` is writable | [Gamepads](input-interposer.md) |
@@ -28,7 +28,7 @@ At runtime Selkies is a **single Python application**, the `selkies` wheel. The 
 | coTURN and TURN-REST | A TURN server and a credential service for the WebRTC transport behind restrictive networks | [TURN](turn.md) |
 | Universal Touch Gamepad | An on-screen gamepad for touch devices, part of the web client | [Web Client and Dashboards](web-client.md#universal-touch-gamepad) |
 
-[Sealskin](https://github.com/selkies-project/sealskin) is a separate project of the same organization, an example of orchestrating these images one desktop container per user on a single server, with its own web, mobile and browser-extension clients; its documentation is at <https://sealskin.selkies.io>.
+[Sealskin](https://github.com/selkies-project/sealskin) is a separate project of the same organization, an example of orchestrating these images one desktop container per user on a single server, with its own web, mobile, and browser-extension clients; its documentation is at <https://sealskin.selkies.io>.
 
 ## Container Images
 
@@ -52,7 +52,7 @@ Every image is multi-architecture (`x86_64` and `aarch64`). When instructed to i
 docker run --rm --privileged tonistiigi/binfmt:latest --install all
 ```
 
-Each release attaches, per flavor and architecture, the digest of every image, the digest of the distribution image it was built from, and the list of packages it holds, which is what a downstream qualification build pins.
+The run that builds each release records, per flavor and architecture, the digest of every image, the digest of the distribution image it was built from, and the list of packages it holds as its artifact `images-<flavor>-<architecture>`, which is what a downstream qualification build pins. GitHub deletes a run's artifacts 90 days after the run, the most this repository can keep them, so a build that pins one copies it before then; the published images carry the same facts afterwards, the distribution image in their build provenance and the packages in their own package database.
 
 ## Encoders and Interfaces
 
@@ -78,9 +78,11 @@ When a codec cannot be served as asked, whether the host has no encoder for it o
 
 **WebSocket mode (default)** — every encoder above is available. The full-frame encoders are decoded by WebCodecs in the browser; the striped encoders are decoded per stripe, `jpeg` without WebCodecs at all.
 
-**WebRTC mode (`--mode=webrtc`)** — the same allowed set and dashboard choice drive both transports. WebRTC carries the full-frame encoders (`h264enc`, `h265enc`, `vp8enc`, `vp9enc`, `av1enc`), packetized by the vendored RTP stack (RFC 6184, RFC 7798, RFC 7741, RFC 9628 and the AV1 RTP payload format); the striped framings of `h264enc-striped` and `jpeg` are WebSocket-only, so in this mode the published menu is filtered to the five and either of those two falls back to the default with a logged warning; switching back to WebSockets restores the configured menu and value. The offer puts the display's codec first and the rest of the menu behind it down the ladder: a browser that declines the codec answers with the next one it decodes and the display moves to that encoder for every viewer, logged as a warning, unless the operator's menu holds the encoder, in which case that peer gets no video rather than another codec's bitstream; a live encoder change switches each peer's payload type to the codec it already negotiated, with no renegotiation. Which codecs a browser takes over WebRTC is the browser's own RTP receiver's business (its `RTCRtpReceiver.getCapabilities`, which the dashboards filter the menu by), not WebCodecs': Chromium and Firefox take VP8, VP9 and AV1 everywhere and H.265 only where the platform decodes it, Safari takes H.265 as well.
+**WebRTC mode (`--mode=webrtc`)** — the same allowed set and dashboard choice drive both transports. WebRTC carries the full-frame encoders (`h264enc`, `h265enc`, `vp8enc`, `vp9enc`, `av1enc`), packetized by the vendored RTP stack (RFC 6184, RFC 7798, RFC 7741, RFC 9628, and the AV1 RTP payload format); the striped framings of `h264enc-striped` and `jpeg` are WebSocket-only, so in this mode the published menu is filtered to the five and either of those two falls back to the default with a logged warning; switching back to WebSockets restores the configured menu and value. The offer puts the display's codec first and the rest of the menu behind it down the ladder: a browser that declines the codec answers with the next one it decodes and the display moves to that encoder for every viewer, logged as a warning, unless the operator's menu holds the encoder, in which case that peer gets no video rather than another codec's bitstream; a live encoder change switches each peer's payload type to the codec it already negotiated, with no renegotiation. Which codecs a browser takes over WebRTC is the browser's own RTP receiver's business (its `RTCRtpReceiver.getCapabilities`, which the dashboards filter the menu by), not WebCodecs': Chromium and Firefox take VP8, VP9, and AV1 everywhere and H.265 only where the platform decodes it, Safari takes H.265 as well.
 
-Full color (4:4:4 chroma, `--video-fullcolor`) is carried by H.264 and H.265 on NVENC, VA-API, x264 and x265, and by VP9 profile 1 on VA-API and libvpx. The server learns from `pixelflux` which of its encoders carry it on the host, and the browser tells the server which 4:4:4 profiles its decoder takes, so a full-color stream is only ever sent where both ends carry it; elsewhere the session streams 4:2:0 and says so.
+Full color (4:4:4 chroma, `--video-fullcolor`) is carried by H.264 and H.265 on NVENC, VA-API, x264, and x265, and by VP9 profile 1 on VA-API and libvpx. The server learns from `pixelflux` which of its encoders carry it on the host, and the browser tells the server which 4:4:4 profiles its decoder takes, so a full-color stream is only ever sent where both ends carry it; elsewhere the session streams 4:2:0 and says so.
+
+10-bit samples (`--video-10bit`) are carried by H.264 on x264, and by H.265 (Main 10, and Main 4:4:4 10 with full color), VP9 (profiles 2 and 3), and AV1 on VA-API, x265, libvpx, and SVT-AV1, and by H.265 and AV1 on NVENC; H.264 on NVENC, OpenH264, kvazaar, VP8, and JPEG stay 8-bit. The server learns from `pixelflux.hardware_formats()` and `pixelflux.SOFTWARE_FORMATS` which formats the encode node and the software encoders carry, and a format the GPU does not encode runs on the software encoder, as a 4:4:4 it lacks does, which the stream statistics show. A client offers the setting only where its own decoder gives back a picture of a 10-bit key frame of that format, since engines accept 10-bit decoder configurations they then fail to decode. A client that shows none turns the setting off for itself, and a WebRTC client names the 10-bit formats it decodes in its hello, so the first offer already fits it. The capture is an 8-bit desktop, so 10 bits add precision to the conversion rather than new shades, and a software encoder pays for them in CPU: every frame is converted to 10-bit samples and coded at high bit depth. The setting is recommended only together with 4:4:4 full color, where that precision shows.
 
 ### Display Capture
 
@@ -110,13 +112,13 @@ Both are off by default and need a secure context in the browser; see [Usage](..
 | Uplink | Selected with | Codec | Delivered to the session as |
 |---|---|---|---|
 | Microphone | `--microphone-enabled` | Opus (WebRTC) or Opus over the WebSocket | a PulseAudio source, through the same sound server the capture reads |
-| Webcam | `--webcam-enabled` | H.264, VP8, VP9, AV1, H.265 or MJPEG, chosen by `--webcam-encoder` (`auto` measures the client) | a V4L2 device: the [V4L2 Interposer](v4l2-interposer.md) socket, a v4l2loopback device, or a PipeWire `Video/Source` node |
+| Webcam | `--webcam-enabled` | H.264, VP8, VP9, AV1, H.265, or MJPEG, chosen by `--webcam-encoder` (`auto` measures the client) | a V4L2 device: the [V4L2 Interposer](v4l2-interposer.md) socket, a v4l2loopback device, or a PipeWire `Video/Source` node |
 
 ### Transport Protocols
 
 | Transport | Selected with | Ports | Notes |
 |---|---|---|---|
 | WebSockets (default) | `--mode=websockets` | single TCP port (default `8080`) | WebCodecs-based client decode (striped JPEG without WebCodecs); no STUN/TURN required |
-| WebRTC (opt-in) | `--mode=webrtc` | signaling over the same port; media over UDP (or TCP) with ICE: ephemeral ports, a port range, or one shared UDP and/or TCP port | Uses a vendored [`aiortc`](https://github.com/aiortc/aiortc) fork; may need STUN/TURN, and offers a port range, UDP/TCP mux and ICE-lite, see [WebRTC and Firewall Issues](../firewall.md#restricting-the-ports-port-range-udp-mux-tcp-mux-and-ice-lite) |
+| WebRTC (opt-in) | `--mode=webrtc` | signaling over the same port; media over UDP (or TCP) with ICE: ephemeral ports, a port range, or one shared UDP and/or TCP port | Uses a vendored [`aiortc`](https://github.com/aiortc/aiortc) fork; may need STUN/TURN, and offers a port range, UDP/TCP mux, and ICE-lite, see [WebRTC and Firewall Issues](../firewall.md#restricting-the-ports-port-range-udp-mux-tcp-mux-and-ice-lite) |
 
 Use `--enable-dual-mode=true` to let the client switch between the WebSocket and WebRTC transports from the UI.

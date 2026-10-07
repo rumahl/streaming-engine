@@ -2,10 +2,19 @@
 """D4 empirical: connect a primary, set framerate via SETTINGS (streaming
 customizes it), then open a display2 that does NOT carry framerate (browser
 without stored per-display param). Its capture must inherit 33fps, not the
-server-default 60fps. Reads the server log's "FPS:" line for display2."""
+server-default 60fps. Reads the server log's "FPS:" line for display2.
+
+Then the primary's rate changes live, through SETTINGS and the `_arg_fps` verb:
+the X server's output must follow to a mode at the new rate (read from xrandr)
+without a capture restarting. A display refreshing at an NTSC rate is asked for
+as the fraction it names (60000/1001), which both paths carry whole: a display
+opening at it states 59.94 fps, and the verb applies it rather than refusing
+a rate that is no whole number."""
 import asyncio
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 
@@ -69,6 +78,14 @@ async def read_ws(ws, seconds: float) -> None:
             return
 
 
+def output_refresh() -> float:
+    """The refresh of the mode the test X server's output shows, 0 if none."""
+    out = subprocess.run(["xrandr"], env={**os.environ, "DISPLAY": H.TEST_DISPLAY},
+                         capture_output=True, text=True, timeout=10).stdout
+    rate = re.search(r"(\d+\.\d+)\*", out)
+    return float(rate.group(1)) if rate else 0.0
+
+
 def main() -> "H.Results":
     """Declare 33fps on the primary, then check a bare display2 inherits it."""
     H.server_start(mode="websockets", wayland=False)
@@ -106,7 +123,29 @@ def main() -> "H.Results":
                     res.skip("display2 capture carries client bitrate",
                              "the capture module omits bitrate from its status line")
                 await asyncio.sleep(0.5)
-            await read_ws(p1, 1)
+            await read_ws(p1, 3)
+            for fps, send in ((144, "SETTINGS," + json.dumps(_settings("primary", framerate=144))),
+                              (90, "_arg_fps,90")):
+                mark = loglen()
+                await p1.send(send)
+                await read_ws(p1, 3)
+                rate = output_refresh()
+                res.check(f"output refresh follows a live {fps} fps", abs(rate - fps) <= fps * 0.01,
+                          f"{rate:.2f} Hz")
+                res.check(f"no capture restarts for {fps} fps",
+                          "Capture started for" not in H.server_log()[mark:])
+            mark = loglen()
+            await p1.send(f"_arg_fps,{60000 / 1001!r}")
+            res.check("the verb applies an NTSC rate whole",
+                      wait_contains(mark, "Applied framerate live via '_arg_fps': 59.94 fps"),
+                      [ln for ln in H.server_log()[mark:].splitlines() if "fps" in ln][:2])
+            mark3 = loglen()
+            async with websockets.connect(uri, max_size=None) as p3:
+                await asyncio.wait_for(p3.recv(), timeout=10)
+                await p3.send("SETTINGS," + json.dumps(_settings("display2", framerate=60000 / 1001)))
+                res.check("a display opening at an NTSC rate states it whole",
+                          wait_contains(mark3, "59.94 fps."),
+                          [ln for ln in H.server_log()[mark3:].splitlines() if "settings applied" in ln][:1])
 
     asyncio.new_event_loop().run_until_complete(drive())
     res.summary()

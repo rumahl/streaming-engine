@@ -14,7 +14,7 @@
 .theme-dark {
     /* Core tokens.
        Text colors are picked against the surface they land on rather than
-       against the page: the sidebar, the section panel and a hovered row are
+       against the page: the sidebar, the section panel, and a hovered row are
        three different backgrounds, and the accent-tinted ones (an active
        toggle, an error row) are lighter again. Accent as text is therefore a
        separate, lighter tint of the same hue — the fill color is too dark
@@ -460,13 +460,19 @@
     background-color: var(--item-bg-hover);
 }
 
+/* A long title (German runs to one word of 23 letters) wraps rather than
+   pushing the caret past the section's edge. */
 .sidebar-section-header h3 {
     margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    hyphens: auto;
 }
 
 /* Toggle icon (caret) for collapsible sections. */
 .section-toggle-icon {
     display: flex;
+    flex-shrink: 0;
     align-items: center;
     color: var(--text-muted);
     margin-left: 10px;
@@ -523,6 +529,11 @@
 .dev-setting-item.toggle-item label {
   text-align: left;
   margin-right: 10px;
+  /* A single long word, as Dutch "Afbeeldingsondersteuning", otherwise pushes the switch past the
+     sidebar's edge in a wider font. */
+  min-width: 0;
+  overflow-wrap: anywhere;
+  hyphens: auto;
 }
 
 /* One printed document: its name, then its print and save buttons. */
@@ -664,6 +675,25 @@
      box-shadow: 0 0 0 4px var(--accent-soft);
 }
 
+/* A finger lands less precisely than a mouse and hides what it touches: under
+   a coarse pointer the slider's row is taller and its thumb wider, and a touch
+   that starts on the slider stays with it instead of scrolling the sidebar. */
+@media (pointer: coarse) {
+    .dev-setting-item input[type="range"] {
+        height: 36px;
+        touch-action: none;
+    }
+    .dev-setting-item input[type="range"]::-webkit-slider-thumb {
+        width: 24px;
+        height: 24px;
+        margin-top: -9px;
+    }
+    .dev-setting-item input[type="range"]::-moz-range-thumb {
+        width: 20px;
+        height: 20px;
+    }
+}
+
 /* --- Stream stats --- */
 /* The two series colors are a validated pair for each surface (dataviz
    validator: lightness band, chroma floor, CVD and normal-vision separation,
@@ -707,7 +737,7 @@
 .stream-status-icon.good { fill: var(--stat-good); }
 .stream-status-icon.warn { fill: var(--stat-warn); }
 .stream-row-label {
-    margin-right: 6px;
+    margin-right: 3px;
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.04em;
@@ -838,6 +868,71 @@
     color: var(--text-muted);
     font-size: 11px;
 }
+.stream-tile-detail {
+    color: var(--text-muted);
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+}
+.stream-tile.warn { border-color: var(--stat-warn); }
+.stream-tile.warn .stream-status-icon,
+.stream-strip-figure.warn .stream-status-icon {
+    vertical-align: -2px;
+    margin-right: 3px;
+}
+
+/* The strip over the stream: never in the way of the pointer, and quiet enough
+   to read through. Its ground is dark whatever the theme, so it takes the dark
+   theme's marks. */
+.stream-strip {
+    --stat-good: #0ca30c;
+    --stat-warn: #fab219;
+    position: fixed;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 900;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: center;
+    gap: 4px 12px;
+    max-width: calc(100vw - 16px);
+    box-sizing: border-box;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+    user-select: none;
+}
+.stream-strip-marks { display: flex; gap: 2px; }
+
+/* The poor-connection mark: clear of the strip, the notifications and the
+   keyboard button, and of the pointer. */
+.connection-indicator {
+    --stat-warn: #fab219;
+    position: fixed;
+    bottom: 20px;
+    left: 20px;
+    z-index: 900;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: var(--radius-sm);
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    font-size: 12px;
+    pointer-events: none;
+    user-select: none;
+}
+.connection-indicator .stream-status-icon { margin-top: 0; }
+.stream-strip-figure { display: flex; flex-direction: column; line-height: 1.15; }
+.stream-strip-figure b { font-size: 13px; white-space: nowrap; }
+.stream-strip-figure small { font-size: 10px; opacity: 0.75; white-space: nowrap; }
+.stream-strip-figure.warn b { color: var(--stat-warn); }
 
 .stream-meters {
     display: flex;
@@ -872,10 +967,11 @@
 }
 .stream-meter-fill {
     display: block;
+    width: 100%;
     height: 100%;
     border-radius: 3px;
     background: var(--accent);
-    transition: width 0.4s ease;
+    transition: transform 0.4s ease;
 }
 .stream-meter-text {
     color: var(--text-muted);
@@ -998,6 +1094,11 @@ body {
 .dashboard-clipboard-item textarea::placeholder {
     color: var(--text-muted);
     opacity: 0.8;
+}
+
+.dashboard-clipboard-note {
+    font-size: 12px;
+    color: var(--text-muted);
 }
 
 /* --- Gamepad Visualizer Styles --- */
@@ -1143,6 +1244,7 @@ body {
 /* Container for resolution action buttons (Set/Reset). */
 .resolution-action-buttons {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-top: 5px;
 }
@@ -1219,7 +1321,7 @@ body {
     border-color: var(--accent-border);
 }
 
-/* Active state (e.g., muted): soft accent fill, accent border and text. */
+/* Active state (e.g., muted): soft accent fill, accent border, and text. */
 .toggle-button.active {
     background-color: var(--accent-soft);
     color: var(--accent-text);
@@ -1365,6 +1467,10 @@ body {
     width: auto;
     padding: 6px 12px;
     text-decoration: none;
+}
+
+.notification-transport-switch {
+    align-self: flex-start;
 }
 
 .notification-print-icon {
@@ -2035,5 +2141,120 @@ a.cite-link:active {
 .mobile-key-button.active:hover {
     color: var(--accent-text-strong);
     border-color: var(--accent);
+}
+
+/* --- Special-key palette, under the soft keys --- */
+.key-palette {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-bottom: 16px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--sidebar-border);
+}
+
+.key-palette-toggle {
+    padding: 6px 8px;
+    border: 1px solid var(--item-border);
+    border-radius: var(--radius-sm);
+    background-color: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+}
+
+.key-palette-toggle.active {
+    border-color: var(--accent-border);
+}
+
+/* Rows that wrap at each key's own width: six fixed columns of a 280px sidebar are narrower than a
+   bold "Home" or "PgUp" in wider fonts (Windows' Korean UI), and the last column spilled past the edge. */
+.key-palette-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.key-palette-grid .mobile-key-button {
+    flex: 1 0 auto;
+    min-width: 2.75em;
+}
+
+.key-palette-chords {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.key-palette-chords .mobile-key-button {
+    flex: 1 1 auto;
+    padding: 8px 10px;
+}
+
+.key-palette-user-chord {
+    display: flex;
+    flex: 1 1 auto;
+    gap: 2px;
+}
+
+.key-palette-remove {
+    padding: 0 8px;
+    border: 1px solid var(--item-border);
+    border-radius: var(--radius-sm);
+    background-color: var(--surface-alt);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+}
+
+.key-palette-add {
+    display: flex;
+    gap: 6px;
+}
+
+.key-palette-input {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 8px;
+    border: 1px solid var(--item-border);
+    border-radius: var(--radius-sm);
+    background-color: var(--surface-alt);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+}
+
+.key-palette-add .mobile-key-button {
+    flex: 0 0 auto;
+    padding: 6px 12px;
+}
+
+.trackpad-speed {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding-bottom: 16px;
+    margin-bottom: 16px;
+    border-bottom: 1px solid var(--sidebar-border);
+    font-size: 13px;
+}
+
+.trackpad-speed select {
+    padding: 4px 8px;
+    border: 1px solid var(--item-border);
+    border-radius: var(--radius-sm);
+    background-color: var(--surface-alt);
+    color: var(--text);
+    font: inherit;
+}
+
+.key-palette-refused {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-muted, var(--text));
 }
 

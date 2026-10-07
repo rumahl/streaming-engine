@@ -14,14 +14,15 @@ it. Put rationale in the docblock of the function or module it explains, and pre
 helper over a comment. An inline comment is for the line that stays surprising after that — a workaround for a
 specific bug, an ordering or value that looks wrong but is required — and says why the line is that way, not what
 it does. Comments are terse and current: no PR summaries, no issue or task numbers, no narration of what the code
-used to do. Everything is written in American English -- color, behavior, center, initialize, canceled -- except a
-name something upstream owns, such as GitHub Actions' `cancelled()`, a Wayland `Cancelled` event, Python's
-`CancelledError`, the Web Audio `AnalyserNode` or an NVENC `colourMatrix` field. The prose under `docs/` follows the same rule: it describes what the tree does now, not what an
+used to do. Everything is written in American English -- color, behavior, center, initialize, canceled, and the
+serial comma in a list of three or more -- except a name something upstream owns, such as GitHub Actions'
+`cancelled()`, a Wayland `Cancelled` event, Python's `CancelledError`, the Web Audio `AnalyserNode`, or an NVENC
+`colourMatrix` field. The prose under `docs/` follows the same rule: it describes what the tree does now, not what an
 earlier revision did or what a change replaced.
 
 Every language follows one shape: a Google-style docblock on the module, on every class, and on every function
 that is not trivially self-describing, with the types on the signature. A docblock opens with a summary line, then
-parameters, return value and exceptions only where non-obvious; never pad trivial helpers. Contrasting with a
+parameters, return value, and exceptions only where non-obvious; never pad trivial helpers. Contrasting with a
 rejected design alternative is good rationale; narrating past revisions is forbidden. A module's docblock carries
 the mechanism the module implements — a fallback ladder, a wire framing, the `window` contract a streaming core
 publishes for the dashboards. Docblocks render as Markdown, so keep anything shaped like `<name>` or containing
@@ -43,7 +44,7 @@ braces inside backticks.
   published, exported or not, so a closure's docblock is reference material, not a private note.
 
 Vendored code keeps upstream documentation style and is excluded from the reference: the Python forks
-`src/selkies/Xlib`, `src/selkies/webrtc` and `src/selkies/ice`, and the shadcn/ui primitives under
+`src/selkies/Xlib`, `src/selkies/webrtc`, and `src/selkies/ice`, and the shadcn/ui primitives under
 `addons/selkies-dashboard-wish/src/components/ui`; only Selkies-added comments there follow these rules. The three
 Python forks are vendored so that they can be changed here rather than worked around, so editing them is the
 expected way to fix what they do -- a change belongs upstream as well where upstream would take it. The
@@ -74,21 +75,22 @@ same rule; the exact strings the suites wait on (`Capture started for`, `Stream 
 
 Validate in a sandbox, never in the session you are shown: the devcontainer, or a host set up as the Agentic
 Development section of `docs/development.md` describes, where `scripts/ci/test-stack.sh` provides the display and
-audio the suites stream from on `E2E_DISPLAY`, apart from any desktop's `DISPLAY`. Run the cheapest tier that covers
-a change on every change (`pre-commit run --all-files`, `pytest tests -m unit`), the `integration` tier and the `e2e`
-blocks the change touches before reporting it, and a measurement for every claim that is a number. End-to-end testing
-is possible with the installed Firefox and Chrome, and Playwright/Selenium/Puppeteer/Cypress WebKit in place of
-Safari. Ask before building an environment on a machine that was not set up for one (Miniforge serves a host with a
-closed package manager; keep the system `libgbm.so` for GBM on NVIDIA and other GPUs) and take the operator's
-directives on how it is constructed and constrained. A suite that skips is a failure in CI; say which checks could
-not run where the hardware for them was not available.
+audio the suites stream from on `E2E_DISPLAY`, apart from any desktop's `DISPLAY`, and the suites run under a `HOME`
+apart from any desktop's, since their servers write every density they apply into its resource files. Run the cheapest
+tier that covers a change on every change (`pre-commit run --all-files`, `pytest tests -m unit`), the `integration`
+tier and the `e2e` blocks the change touches before reporting it, and a measurement for every claim that is a number.
+End-to-end testing is possible with the installed Firefox and Chrome, and Playwright/Selenium/Puppeteer/Cypress WebKit
+in place of Safari. Ask before building an environment on a machine that was not set up for one (Miniforge serves a
+host with a closed package manager; keep the system `libgbm.so` for GBM on NVIDIA and other GPUs) and take the
+operator's directives on how it is constructed and constrained. A suite that skips is a failure in CI; say which
+checks could not run where the hardware for them was not available.
 
 A defect that predates the change you are making is still in scope: fix it, or say precisely what is broken, what
 you ruled out, and what you would do next. The same applies to a failure you cannot reproduce yet — narrow it until
 it is fixed or precisely described, and never let a test that fails for an unknown reason pass unremarked.
 
 Nothing is pushed before `pre-commit run --all-files` passes on the exact tree being pushed: CI's Lint job runs the
-same hooks (`ruff-check`, `codespell`, `settings-doc`, `file-index`, and `web-lint` for the dashboards) and fails the
+same hooks (`ruff-check`, `codespell`, `settings-doc`, `file-index`, and `web-lint` for the web client) and fails the
 run on what they find. Before a suite failure is called a regression, run it against the unchanged tree as well: the
 suites' servers come from the editable install, so a worktree needs `SELKIES_TEST_PYTHON` pointed at a wrapper that
 sets `PYTHONPATH` to its `src`. Check the sandbox's own health the same way. The sound server must answer
@@ -124,6 +126,11 @@ what runs where.
 
 ## Engineering priorities
 
+- Priority: End-to-End Processing Latency > Resource Usage or Unrestricted Frame Rate >= Quality (non-perceptible or
+  statistically insignificant latency fluctuations of up to 5% are acceptable in exchange for quality or bandwidth
+  consistency, and slightly more GPU or CPU usage is also acceptable if it has no latency impact and brings a
+  substantial quality improvement) >> Overall Bandwidth Efficiency (since encoded frames are only used once, unlike
+  .mp4/.mkv)
 - Parity between X11 and Wayland, WebSockets and WebRTC, and the default and wish dashboards: anything wired up on
   one side but not the other is a bug. Prefer deduplicating code that serves the same purpose across modes over
   keeping parallel copies, when you are confident there is no regression or can validate it.
@@ -150,7 +157,7 @@ what runs where.
 
 Each is documented in full where named; read that before changing the subsystem.
 
-- The Wayland path is subprocess-free: never reintroduce wtype, wl-copy or similar forks where the in-process
+- The Wayland path is subprocess-free: never reintroduce wtype, wl-copy, or similar forks where the in-process
   pixelflux harness exists. Injection and clipboard are fallback ladders whose cooldowns re-probe the top rung
   rather than latching (`src/selkies/input_handler.py` module docstring).
 - A DPI is an output scale on the session compositor, never Xft resources; only a changed capture scale restarts a
@@ -186,7 +193,7 @@ Each is documented in full where named; read that before changing the subsystem.
   reaching one that never saw the press and leaving one that never sees the release
   (`Input._mouseButtonMovement`).
 - That drag is placed through the stream box the page it crossed onto published in desktop coordinates (the
-  `vp` verb), never from the grabbed page's own coordinates: two viewports share no origin, chrome height or
+  `vp` verb), never from the grabbed page's own coordinates: two viewports share no origin, chrome height, or
   device pixel ratio. Two events have to agree on the offset between a page's client frame and the desktop's
   before it publishes a box, because page zoom scales one frame and not the other, and short of that agreement
   the crossing keeps to the scaled overshoot. So does a crossing between two boxes that overlap on the desktop:
@@ -203,7 +210,14 @@ Each is documented in full where named; read that before changing the subsystem.
   and `nextRung` in the core): the full-frame codecs the host encodes in hardware, most efficient first, then those it
   encodes in software by their encoders' measured time per frame, then striped H.264, and JPEG last. Over WebSockets the client walks it
   through the encoders it decodes; over WebRTC the offer lists it behind the display's codec
-  (`RTCApp.prefer_codec`) and the display follows the codec the answer took.
+  (`RTCApp.prefer_codec`) and the display follows the codec the answer took. 10 bits (`video_10bit`) follow the
+  same rule with one difference: the client is asked by decoding a 10-bit key frame of the format, never by
+  its decoder's word, since engines accept 10-bit configurations they then fail to decode
+  (`util.canDecodeTenBit`); the server says which formats its encode node and its software encoders carry
+  (`encoder_backends`' `ten_bit`, from `pixelflux.hardware_formats` and `SOFTWARE_FORMATS`), a format the
+  engine lacks running on the software encoder as a 4:4:4 it lacks does (`AppSettings.encoder_ten_bit`,
+  `conditional-settings.tenBitStream`), a WebRTC hello names the formats decoded (`tenbit_codecs`), and
+  `RTCApp._settle_ten_bit` settles it before the offer.
 - A picture a client could not decode is repaired by taking it out of the encoder's references, not by a key
   frame: the client names the frame it lost, the server asks that display's capture to forget it, and the
   stream keeps predicting past it while the other clients see nothing. Over WebSockets the client's decode
@@ -211,7 +225,7 @@ Each is documented in full where named; read that before changing the subsystem.
   WebRTC a second NACK for a packet the sender still holds does (`RTCRtpSender._retransmit`, the `lost_frame`
   event, `RTCApp.on_lost_frame`). A stream whose encoder names no reference -- a stripe, a session that cannot
   invalidate -- gets the key frame instead, and so does a run of drops the encoder never predicts past, or an H.264 loss covering the frame at the
-  encoder's `frame_num` wrap, which FFmpeg's decoder cannot be predicted past.
+  encoder's `frame_num` wrap, which the browsers' FFmpeg decoder cannot be predicted past.
 - The webcam uplink mirrors the microphone: nothing about a frame is decoded or copied in Python
   (`addons/selkies-web-core/lib/webcam-capture.js` header, `src/selkies/webcam.py`,
   `addons/v4l2-interposer/v4l2_interposer.c` header for the interposer's locking rules).
@@ -229,8 +243,9 @@ Each is documented in full where named; read that before changing the subsystem.
   only while a controller's dashboard has its stats on screen (the `_stats` verb; `stream_stats` module
   docstring, `addons/selkies-web-core/lib/stream-stats.js`). A shared viewer is sent neither, and both
   dashboards draw one reading of it (`lib/stream-stats-view.js`), where a row warns for a session that fell
-  short of what it asked for, never for a choice and never for a server exposed no GPU, which is an ordinary
-  deployment (`stream_stats.gpu_present`).
+  short of what it asked for, never for a choice and never for a host built without the faster path: a server
+  exposed no GPU (`stream_stats.gpu_present`), or a display server that offers the encoder no zero-copy path
+  (pixelflux's `zero_copy_available`), each an ordinary deployment.
 - The WebRTC ICE topology is decided once, at startup: `RTCApp.open_ice_muxes` binds the shared UDP and
   TCP ports the settings name (failing the service on a port in use), and every peer's gatherer reads the
   muxes and the ICE-lite choice from its `RTCConfiguration`, never from the settings directly; sessions on

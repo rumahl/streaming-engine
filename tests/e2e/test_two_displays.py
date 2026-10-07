@@ -195,14 +195,15 @@ def run(mode: str, wayland: bool) -> bool:
 
             # A root that matches the monitors still shows a broken desktop when the
             # desktop window itself is placed off the layout origin: the far screen
-            # is then left with no wallpaper, icons or menu, and the root's own far
+            # is then left with no wallpaper, icons, or menu, and the root's own far
             # edge is uncovered.
             if shutil.which("wmctrl") is None:
                 res.skip("desktop window covers the layout",
                          "wmctrl not installed; cannot list X11 windows")
             elif (desktop := desktop_window()) is None:
                 res.skip("desktop window covers the layout",
-                         "no X11 desktop window (a native Wayland session has none)")
+                         "a native Wayland session has no X11 desktop window" if wayland
+                         else "no pcmanfm-qt desktop window runs on this display")
             else:
                 x, y, w, h = desktop
                 root_w, root_h = H.x_root_size()

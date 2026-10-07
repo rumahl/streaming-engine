@@ -55,7 +55,7 @@ This server provides the backend infrastructure for establishing and managing in
 9.  **Token-Based Authentication & Authorization:**
     *   Features an optional secure mode, enabled by setting a `master_token`.
     *   When enabled, it exposes a token-management API (`POST /api/tokens`) on the main streaming port, gated by the master token.
-    *   Clients must connect with a valid token (`?token=...`) to establish a WebSocket connection.
+    *   Clients must present a valid token to establish a WebSocket connection: a token from the page's fragment as a WebSocket subprotocol, or `?token=...`.
     *   Assigns roles (e.g., `controller`, `viewer`) and properties (e.g., gamepad `slot`) to clients based on their token.
     *   Enforces permissions on the server-side, restricting actions that viewers can perform.
     *   Automatically disconnects clients if their token is revoked or their permissions change.
@@ -74,9 +74,12 @@ When secure mode is enabled (`SELKIES_MASTER_TOKEN` is set), the server exposes 
 *   `"role"`: (String, required) Can be one of the following:
     *   `"controller"`: Full access. Can send keyboard, mouse, and all other input events (unless overridden by `mk_control`).
     *   `"viewer"`: Restricted access. Primarily for viewing the stream. Can be granted specific input rights via the `slot` or `mk_control` properties.
-*   `"slot"`: (Integer or `null`, required) Assigns an input slot, primarily for gamepads.
+*   `"slot"`: (Integer, list of integers, or `null`, required) Assigns input slots, primarily for gamepads.
     *   `null`: No specific input slot.
     *   `1` - `4`: Grants the user control over the specific virtual gamepad slot (Player 1 through Player 4).
+    *   A list, such as `[3, 4]`: Grants several slots to one client, for several controllers in one browser. Its
+        pads take them in the browser's order: its first pad drives the first slot listed, its second the next. With
+        more pads than slots, the pad last used takes a slot.
 *   `"mk_control"`: (Boolean, optional) Exclusive override for Mouse & Keyboard input.
     *   If `true` on **any** active token in the set, only that specific client processes mouse and keyboard events.
     *   If `false` or omitted on **all** active tokens, mouse and keyboard access defaults to clients with the `"controller"` role.
@@ -92,7 +95,8 @@ curl -X POST http://localhost:8080/api/tokens \
 -H "Content-Type: application/json" \
 -d '{
   "token-1": {"role": "controller", "slot": null, "mk_control": false},
-  "token-2": {"role": "viewer", "slot": 1, "mk_control": true}
+  "token-2": {"role": "viewer", "slot": 1, "mk_control": true},
+  "token-3": {"role": "viewer", "slot": [3, 4], "mk_control": false}
 }'
 ```
 
@@ -218,7 +222,7 @@ The table below lists all available server settings.
 | `SELKIES_RAW_POINTER_MOTION` | `--raw-pointer-motion` | `True` | Ask the browser for unaccelerated (raw) pointer movement under pointer lock; clients leave it off on macOS unless it is chosen or set here. |
 | `SELKIES_USE_CSS_SCALING` | `--use-css-scaling` | `False` | HiDPI when false, if true a lower resolution is sent from the client and the canvas is stretched. |
 | `SELKIES_PORT` (or `CUSTOM_WS_PORT`) | `--port` | `8080` | Port for the data websocket server. |
-| `SELKIES_SUBFOLDER` (or `SUBFOLDER`) | `--subfolder` | `''` | URL path prefix the server is reverse-proxied under, prepended to every route. Optional: set it only when the proxy does not strip the prefix before forwarding. Slashes are optional (`desk`, `/desk` and `/desk/` are the same prefix; `/` is the root). The web client derives its own prefix from the URL it was loaded from, so this configures the server alone. |
+| `SELKIES_SUBFOLDER` (or `SUBFOLDER`) | `--subfolder` | `''` | URL path prefix the server is reverse-proxied under, prepended to every route. Optional: set it only when the proxy does not strip the prefix before forwarding. Slashes are optional (`desk`, `/desk`, and `/desk/` are the same prefix; `/` is the root). The web client derives its own prefix from the URL it was loaded from, so this configures the server alone. |
 | `SELKIES_MASTER_TOKEN` | `--master-token` | `''` | Master token to enable secure mode. If set, clients must authenticate using tokens provided via the token-management API (`POST /api/tokens`). |
 | `SELKIES_MASTER_TOKEN_FILE` | `--master-token-file` | `''` | Private regular file containing the master token; cannot be combined with `SELKIES_MASTER_TOKEN`. |
 | `SELKIES_ENCODE_DRI` (or `DRI_NODE`) | `--encode-dri` | `''` | Path to the DRI render node the encoder uses (VA-API/NVENC device selection). When unset, the node is auto-selected. |

@@ -27,7 +27,7 @@ import asyncio
 import logging
 from importlib.metadata import PackageNotFoundError, version
 
-from .settings import settings
+from .settings import settings, socket_dir
 from .display_utils import cursor_size_for_dpi, restore_dpi, set_cursor_size
 from .webrtc_mode import WebRTCService
 from .websockets_mode import DataStreamingServer
@@ -43,7 +43,7 @@ def _startup_summary() -> str:
     """The one line that says what this server came up as.
 
     Transport, capture backend, encoder and rate, how the desktop is sized,
-    and which of audio, gamepads and access control are on: the facts a log
+    and which of audio, gamepads, and access control are on: the facts a log
     reader needs before any client line makes sense.
     """
     try:
@@ -92,7 +92,7 @@ async def wait_for_app_ready(ready_file: str, app_wait_ready: bool = False) -> N
 def _install_shutdown_signal_handlers() -> None:
     """Make a service-manager stop (systemd, `docker stop`, `kill`) unwind the same
     way Ctrl-C does: canceling the main task raises CancelledError through the
-    server loop, so the streaming service is stopped, the unix socket is removed and
+    server loop, so the streaming service is stopped, the unix socket is removed, and
     the disconnect hooks run. Without this SIGTERM is fatal by default, and as
     container PID 1 it is ignored outright until SIGKILL.
 
@@ -144,13 +144,13 @@ async def run() -> None:
     """
     _install_shutdown_signal_handlers()
 
-    os.environ["SELKIES_JS_SOCKET_PATH"] = settings.js_socket_path
-    os.environ["SELKIES_WEBCAM_SOCKET_PATH"] = settings.webcam_socket_path
+    os.environ["SELKIES_JS_SOCKET_PATH"] = socket_dir(settings.js_socket_path)
+    os.environ["SELKIES_WEBCAM_SOCKET_PATH"] = socket_dir(settings.webcam_socket_path)
 
     if settings.computer_use_bind:
         try:
             from pixelflux import start_computer_use
-            start_computer_use(settings.computer_use_bind)
+            start_computer_use(settings.computer_use_bind, settings.computer_use_token or None)
         except Exception as e:
             logger.warning(f"Computer-Use server not started: {e}")
 

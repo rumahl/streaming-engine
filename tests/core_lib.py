@@ -25,6 +25,20 @@ CHROME_PATH: Optional[str] = os.environ.get("E2E_CHROME") or None
 FIREFOX_PATH: Optional[str] = os.environ.get("E2E_FIREFOX") or None
 
 
+def installed_firefox(kwargs: dict) -> dict:
+    """``kwargs`` of a Playwright Firefox launch, pointed at FIREFOX_PATH when one is named.
+
+    A release Firefox has no Juggler, the protocol Playwright's own Firefox build speaks, so
+    it is driven over WebDriver BiDi, which the ``moz-firefox`` channel selects. The
+    persistent profile may last have been opened by a newer build than the one launching,
+    Playwright's or the release one, which Firefox refuses without ``--allow-downgrade``.
+    """
+    kwargs["args"] = [*kwargs.get("args", []), "--allow-downgrade"]
+    if FIREFOX_PATH:
+        kwargs.update(executable_path=FIREFOX_PATH, channel="moz-firefox")
+    return kwargs
+
+
 # The socket lives in a worker on the websockets transport, so wrapping
 # `WebSocket.prototype.send` on the page sees nothing of the wire. Every
 # page-side send goes through the transport handle the core publishes as
@@ -87,6 +101,22 @@ PC_TAP_JS = """
 })();
 """
 
+# WebCodecs audio taken from the page and from every script it starts from a
+# blob (its workers), the way an engine without the API presents, so the audio
+# workers fall back on libopus in WASM.
+NO_WEBCODECS_AUDIO_JS = """
+(() => {
+  const strip = "for (const n of ['AudioDecoder', 'AudioEncoder', 'AudioData', 'EncodedAudioChunk']) {" +
+    " try { Object.defineProperty(globalThis, n, { value: undefined, configurable: true, writable: true }); } catch (e) {} }\\n";
+  new Function(strip)();
+  const create = URL.createObjectURL;
+  URL.createObjectURL = function (obj) {
+    if (obj instanceof Blob && /javascript/.test(obj.type)) obj = new Blob([strip, obj], { type: obj.type });
+    return create.call(URL, obj);
+  };
+})();
+"""
+
 # Text messages the page sent, in `window.__wireSent`. Only strings are kept:
 # a binary payload is transferred to the socket worker and detached, so a
 # reference held here would read as empty.
@@ -132,6 +162,14 @@ def webkit_gl_sink_ready() -> bool:
     return _WEBKIT_GL_SINK_READY
 
 
+# GStreamer's hardware VP8 decoders, ranked out of the suites' WebKit so it decodes VP8 as CI's
+# GPU-less runners do. Where one is ranked above vp8dec, WebKit's GStreamer ports decode WebRTC VP8
+# with it instead of libwebrtc's decoder, and that path paints the stream with GStreamer's default
+# matrix for its size (BT.709 above 576 lines) whatever its RTP color space declares: a WebKit
+# fault, not the stream's, which would fail the color checks on a host with NVDEC or VA-API.
+WEBKIT_SOFTWARE_VP8 = "nvvp8dec:0,vavp8dec:0,v4l2slvp8dec:0"
+
+
 def launch_browser(pw: Any, engine: str = "chromium") -> Any:
     """Launch a headless browser for ``engine``: chromium, firefox, or webkit.
 
@@ -148,15 +186,14 @@ def launch_browser(pw: Any, engine: str = "chromium") -> Any:
             "media.autoplay.blocking_policy": 0,
             "media.autoplay.block-webaudio": False,
         }}
-        if FIREFOX_PATH:
-            kwargs["executable_path"] = FIREFOX_PATH
-        return pw.firefox.launch(**kwargs)
+        return pw.firefox.launch(**installed_firefox(kwargs))
     if engine == "webkit":
         if not webkit_gl_sink_ready():
             raise RuntimeError("GStreamer has no opengl plugin, so WebKit would paint through its "
                                "software fallback sink; install gstreamer1.0-gl "
                                "(playwright install --with-deps webkit)")
-        return pw.webkit.launch(headless=True)
+        ranks = ",".join(filter(None, (os.environ.get("GST_PLUGIN_FEATURE_RANK", ""), WEBKIT_SOFTWARE_VP8)))
+        return pw.webkit.launch(headless=True, env={**os.environ, "GST_PLUGIN_FEATURE_RANK": ranks})
     return chromium_launch(pw)
 
 
@@ -228,11 +265,12 @@ def openh264_prefs() -> dict:
 
 
 def firefox_persistent_context(pw: Any, viewport: Optional[dict] = None,
-                               prefs: Optional[dict] = None) -> Any:
+                               prefs: Optional[dict] = None, **context: Any) -> Any:
     """A headless Firefox context on the persistent profile.
 
     Carries the autoplay allowance `launch_browser` gives Firefox, the clipboard
-    testing pref and the OpenH264 prefs; the caller closes the context.
+    testing pref, and the OpenH264 prefs; the caller closes the context.
+    `context` adds further context options (`has_touch`).
     """
     user_prefs = {
         "media.gmp-gmpopenh264.enabled": True,
@@ -244,12 +282,66 @@ def firefox_persistent_context(pw: Any, viewport: Optional[dict] = None,
         **(prefs or {}),
     }
     kwargs = {"user_data_dir": FF_E2E_PROFILE, "headless": True,
-              "firefox_user_prefs": user_prefs}
+              "firefox_user_prefs": user_prefs, **context}
     if viewport:
         kwargs["viewport"] = viewport
-    if FIREFOX_PATH:
-        kwargs["executable_path"] = FIREFOX_PATH
-    return pw.firefox.launch_persistent_context(**kwargs)
+    return pw.firefox.launch_persistent_context(**installed_firefox(kwargs))
+
+
+# Counts the page's WebSocket binary frames (`window.__wsFrames`, and by their
+# first byte in `window.__wsTypes`): headless rAF throttling makes the client's
+# own fps counter read 0 while the stream flows. Also records the server's audio
+# and video state messages, and clipboard, display and role postMessages.
+PAGE_TAP_JS = """
+      window.__wsFrames = 0;
+      window.__wsTypes = {};
+      window.__wsStates = [];
+      (() => {
+        const tap = (e) => {
+          if (e.data instanceof ArrayBuffer) {
+            window.__wsFrames++;
+            const type = e.data.byteLength ? new Uint8Array(e.data, 0, 1)[0] : -1;
+            window.__wsTypes[type] = (window.__wsTypes[type] || 0) + 1;
+          } else if (typeof e.data === 'string') {
+            window.__wsTexts = window.__wsTexts || [];
+            if (e.data.includes('DISPLAY_CONFIG_UPDATE')) window.__wsTexts.push(e.data);
+            if (/^(AUDIO_|VIDEO_|PIPELINE_RESETTING)/.test(e.data)) window.__wsStates.push(e.data);
+          }
+        };
+        const WS = window.WebSocket;
+        window.WebSocket = function(...a) {
+          const s = a.length === 1 ? new WS(a[0]) : new WS(a[0], a[1]);
+          s.__rxTapped = true;
+          s.addEventListener('message', tap);
+          return s;
+        };
+        window.WebSocket.prototype = WS.prototype;
+        Object.setPrototypeOf(window.WebSocket, WS);
+        // The websockets transport runs its socket in a worker; its receive
+        // side is observed through the page handle, which never passes above.
+        let transport = null;
+        Object.defineProperty(window, 'selkiesTransport', {
+          configurable: true,
+          get: () => transport,
+          set: (v) => {
+            transport = v;
+            if (v && v.addEventListener && !v.__rxTapped) {
+              v.__rxTapped = true;
+              v.addEventListener('message', tap);
+            }
+          },
+        });
+      })();
+      window.__clipMsgs = [];
+      window.__displayCfg = [];
+      window.__roleUpdates = [];
+      window.addEventListener('message', (e) => {
+        if (!e.data || !e.data.type) return;
+        if (e.data.type === 'clipboardContentUpdate') window.__clipMsgs.push(e.data);
+        if (e.data.type === 'displayConfigUpdate' || e.data.type === 'DISPLAY_CONFIG_UPDATE') window.__displayCfg.push(e.data);
+        if (e.data.type === 'clientRoleUpdate') window.__roleUpdates.push(e.data.role);
+      });
+"""
 
 
 def launch_chrome(pw: Any, url_hash: str = "", mode: Optional[str] = None,
@@ -294,52 +386,7 @@ def launch_chrome(pw: Any, url_hash: str = "", mode: Optional[str] = None,
     page.on("pageerror", lambda e: console_errors.append(str(e)))
     not_found = []
     page.on("response", lambda r: not_found.append(r.url) if r.status == 404 else None)
-    page.add_init_script("""
-      // Instrument WebSocket binary frames: headless rAF throttling makes the
-      // client's fps counter read 0 even while the stream flows.
-      window.__wsFrames = 0;
-      (() => {
-        const tap = (e) => {
-          if (e.data instanceof ArrayBuffer) window.__wsFrames++;
-          else if (typeof e.data === 'string') {
-            window.__wsTexts = window.__wsTexts || [];
-            if (e.data.includes('DISPLAY_CONFIG_UPDATE')) window.__wsTexts.push(e.data);
-          }
-        };
-        const WS = window.WebSocket;
-        window.WebSocket = function(...a) {
-          const s = a.length === 1 ? new WS(a[0]) : new WS(a[0], a[1]);
-          s.__rxTapped = true;
-          s.addEventListener('message', tap);
-          return s;
-        };
-        window.WebSocket.prototype = WS.prototype;
-        Object.setPrototypeOf(window.WebSocket, WS);
-        // The websockets transport runs its socket in a worker; its receive
-        // side is observed through the page handle, which never passes above.
-        let transport = null;
-        Object.defineProperty(window, 'selkiesTransport', {
-          configurable: true,
-          get: () => transport,
-          set: (v) => {
-            transport = v;
-            if (v && v.addEventListener && !v.__rxTapped) {
-              v.__rxTapped = true;
-              v.addEventListener('message', tap);
-            }
-          },
-        });
-      })();
-      window.__clipMsgs = [];
-      window.__displayCfg = [];
-      window.__roleUpdates = [];
-      window.addEventListener('message', (e) => {
-        if (!e.data || !e.data.type) return;
-        if (e.data.type === 'clipboardContentUpdate') window.__clipMsgs.push(e.data);
-        if (e.data.type === 'displayConfigUpdate' || e.data.type === 'DISPLAY_CONFIG_UPDATE') window.__displayCfg.push(e.data);
-        if (e.data.type === 'clientRoleUpdate') window.__roleUpdates.push(e.data.role);
-      });
-    """)
+    page.add_init_script(PAGE_TAP_JS)
     page.goto(H.BASE_URL + "/" + url_hash, wait_until="load")
     return browser, page, console_errors, not_found
 
@@ -423,8 +470,20 @@ def wait_wr_video(page: Any, timeout: float = 45) -> Optional[dict]:
         if info:
             return info
         time.sleep(0.5)
-    print(f"[wr-video] no decoded frame in {timeout:.0f}s: {wr_video_state(page)}", flush=True)
+    state = wr_video_state(page)
+    print(f"[wr-video] no frame shown in {timeout:.0f}s: {state}", flush=True)
+    if player_stuck(state):
+        print("[wr-video] the <video> sat at HAVE_NOTHING on a live track its peer connection decodes", flush=True)
     return None
+
+
+def player_stuck(state: Any) -> bool:
+    """Whether `state` is Playwright WebKit's player stall: its GStreamer player
+    never prerolls some H.264 sessions, while the decoder behind it runs, and no
+    page call brings it back."""
+    video = state.get("video") if isinstance(state, dict) else None
+    return bool(video and video["readyState"] == 0 and "video:live" in (video["tracks"] or [])
+                and any(i.get("kind") == "video" and i.get("decoded") for pc in state["pcs"] for i in pc["inbound"]))
 
 
 WR_VIDEO_STATE_JS = """(async () => {

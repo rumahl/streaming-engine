@@ -8,6 +8,7 @@ import faulthandler
 import functools
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -18,7 +19,7 @@ import tempfile
 import threading
 import time
 import weakref
-from typing import Any, Iterable, Iterator, NoReturn, Optional
+from typing import Any, Dict, Iterable, Iterator, NoReturn, Optional
 
 REPO = os.environ.get(
     "SELKIES_REPO",
@@ -55,40 +56,192 @@ PAGE_CALL_TIMEOUT = float(os.environ.get("E2E_PAGE_CALL_TIMEOUT", "60"))
 # Receivers that have already outlasted the bound. An engine wedged once stays
 # wedged, so the calls after the first are refused instead of waited out.
 _stalled: "weakref.WeakSet" = weakref.WeakSet()
+# The bounds `answers_within` holds open on each thread: (deadline, seconds, what).
+_bounds = threading.local()
 # Backstop on x_own_clipboard()'s serving thread, for a caller that never sets
 # its stop flag. Every block that owns the clipboard sets it in a `finally`, so
 # this only has to outlast the longest of them: an owner that stopped answering
 # while its block still ran would read as an empty clipboard, which is a
 # passing check away from a real one.
 SELECTION_SERVE_MAX_S = 600.0
-_guarded = 0
 
 
 @contextlib.contextmanager
 def answers_within(seconds: float, what: str = "the browser") -> Iterator[None]:
-    """Raise `PageStalled` if the block outlasts `seconds`.
+    """Raise `PageStalled` from the Playwright call that would carry the block
+    past `seconds`, the earliest of nested bounds applying.
 
-    Only the main thread can take a signal, so a call off it is left plain, as
-    is one already inside a bound: the process has a single interval timer and
-    a nested wait would move the outer deadline.
+    The call is cut off on Playwright's own loop (`_bound_browser_calls`): an
+    exception raised into it from a signal ends the sync API's dispatcher, after
+    which every call on that connection spins until the suite's deadline.
     """
-    global _guarded
-    if seconds <= 0 or _guarded or threading.current_thread() is not threading.main_thread():
+    if seconds <= 0:
         yield
         return
-
-    def expired(signum: int, frame: Any) -> NoReturn:
-        raise PageStalled(f"{what} did not answer within {seconds:.0f}s")
-
-    previous = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    _guarded += 1
+    bounds = _bounds.__dict__.setdefault("open", [])
+    bounds.append((time.monotonic() + seconds, seconds, what))
     try:
         yield
     finally:
-        _guarded -= 1
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+        bounds.pop()
+
+
+# Playwright WebKit's processes (UI, web, network, GPU), by name prefix.
+_WEBKIT_PROCESSES = ("MiniBrowser", "WPE", "WebKit")
+# A stall dumps each process at most twice, the second showing whether it moved.
+_dumped: Dict[int, int] = {}
+_GDB_THREAD = re.compile(r"^Thread \d+ \(.*?LWP (\d+)\)")
+_GDB_FRAME = re.compile(r"^#\d+\s+(?:(0x[0-9a-f]+) in )?(\S+)")
+
+
+def _descendants(root: int) -> list:
+    """PIDs below `root`, from /proc."""
+    children: Dict[int, list] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    found, todo = [], [root]
+    while todo:
+        kids = children.get(todo.pop(), [])
+        found += kids
+        todo += kids
+    return found
+
+
+def _threads(pid: int) -> Dict[int, list]:
+    """Each thread's [name, state, CPU ticks, kernel wait channel, start tick], by TID."""
+    out = {}
+    try:
+        tids = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return out
+    for tid in tids:
+        try:
+            with open(f"/proc/{pid}/task/{tid}/stat") as f:
+                head, rest = f.read().rsplit(")", 1)
+            fields = rest.split()
+            out[int(tid)] = [head.split("(", 1)[1], fields[0], int(fields[11]) + int(fields[12]),
+                             "?", int(fields[19])]
+            with open(f"/proc/{pid}/task/{tid}/wchan") as f:
+                out[int(tid)][3] = f.read().strip() or "-"
+        except (OSError, IndexError, ValueError):
+            continue
+    return out
+
+
+def _gdb_stacks(pid: int) -> Dict[int, list]:
+    """Every thread's backtrace from gdb, one "function (library)" line a frame,
+    by TID: under `sudo -n` where it works, Yama refusing a non-child otherwise."""
+    gdb = ["timeout", "60", "gdb", "-p", str(pid), "-batch", "-nx",
+           "-iex", "set debuginfod enabled off", "-ex", "thread apply all bt 40"]
+    text = ""
+    for cmd in (["sudo", "-n"] + gdb, gdb):
+        try:
+            text = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if "(LWP " in text:
+            break
+    # A frame without a symbol is named by its offset in the file mapped there,
+    # which holds across runs of one build; one outside any file is JIT code.
+    maps = []
+    try:
+        with open(f"/proc/{pid}/maps") as f:
+            for row in f:
+                cols = row.split()
+                if len(cols) > 5 and cols[5].startswith("/"):
+                    start, end = (int(x, 16) for x in cols[0].split("-"))
+                    maps.append((start, end, int(cols[2], 16), cols[5].rsplit("/", 1)[-1]))
+    except OSError:
+        pass
+    stacks: Dict[int, list] = {}
+    frames = None
+    for line in text.splitlines():
+        m = _GDB_THREAD.match(line)
+        if m:
+            frames = stacks.setdefault(int(m.group(1)), [])
+            continue
+        m = _GDB_FRAME.match(line)
+        if m and frames is not None:
+            addr, func = m.groups()
+            if func == "??":
+                at = int(addr or "0", 16)
+                hit = next((mp for mp in maps if mp[0] <= at < mp[1]), None)
+                frames.append(f"{hit[3]}+{at - hit[0] + hit[2]:#x}" if hit else f"?? {addr}")
+            else:
+                lib = line.rsplit(" from ", 1)[1].rsplit("/", 1)[-1] if " from " in line else ""
+                frames.append(f"{func} ({lib})" if lib else func)
+    return stacks
+
+
+def report_stall(receiver: Any, why: str) -> None:
+    """Print what an engine that stopped answering was doing: the page's last
+    console lines, the host's load, and every WebKit thread's name, state, CPU
+    share over a second and stack, threads with one stack grouped. Kept in
+    WORKDIR as well, the only record a suite that passes on its retry leaves."""
+    lines = [f"[stall] {why}"]
+    page = getattr(receiver, "page", receiver)
+    if hasattr(page, "console_messages"):
+        lines[0] += f" ({page.url[:200]})"
+        try:
+            with answers_within(10, "the driver"):
+                said = [f"{m.type}: {m.text}" for m in page.console_messages()[-40:]]
+                said += [f"pageerror: {e}" for e in page.page_errors()[-10:]]
+            lines += [f"[stall] console {s[:300]}" for s in said]
+        except Exception as e:
+            lines.append(f"[stall] console unread: {e!r}")
+    try:
+        with open("/proc/loadavg") as f:
+            load = " ".join(f.read().split()[:3])
+        with open("/proc/meminfo") as f:
+            avail = next(int(line.split()[1]) for line in f if line.startswith("MemAvailable"))
+        lines.append(f"[stall] load {load}, {avail // 1024} MB available")
+        procs = []
+        for pid in _descendants(os.getpid()):
+            try:
+                with open(f"/proc/{pid}/comm") as f:
+                    name = f.read().strip()
+            except OSError:
+                continue
+            if name.startswith(_WEBKIT_PROCESSES) and _dumped.get(pid, 0) < 2:
+                _dumped[pid] = _dumped.get(pid, 0) + 1
+                procs.append((pid, name))
+        before = {pid: _threads(pid) for pid, _ in procs}
+        time.sleep(1 if procs else 0)
+        after = {pid: _threads(pid) for pid, _ in procs}
+        tick = os.sysconf("SC_CLK_TCK")
+        with open("/proc/uptime") as f:
+            now = float(f.read().split()[0]) * tick
+        for pid, name in procs:
+            threads = after[pid]
+            stacks = _gdb_stacks(pid)
+            age = (now - threads[pid][4]) / tick if pid in threads else 0
+            lines.append(f"[stall] {name} {pid}: {len(threads)} threads, up {age:.0f}s"
+                         + ("" if stacks else ", no stacks (gdb absent or refused)"))
+            groups: Dict[tuple, list] = {}
+            for tid in sorted(threads, key=lambda t: t != pid):
+                tname, state, ticks, wchan, _ = threads[tid]
+                cpu = (ticks - before[pid].get(tid, threads[tid])[2]) * 100 // tick
+                groups.setdefault(tuple(stacks.get(tid, ())), []).append(
+                    f"{tname} {tid} {state} {wchan} {cpu}%")
+            for frames, labels in groups.items():
+                lines.append("[stall]   " + "; ".join(labels))
+                lines += [f"[stall]     {frame}" for frame in frames]
+    except Exception as e:
+        lines.append(f"[stall] report cut short: {e!r}")
+    text = "\n".join(lines)
+    print(text, flush=True)
+    try:
+        with open(os.path.join(WORKDIR, f"browser-stall-{os.getpid()}.log"), "a") as f:
+            f.write(text + "\n")
+    except OSError:
+        pass
 
 
 def _bound_browser_calls() -> None:
@@ -102,9 +255,28 @@ def _bound_browser_calls() -> None:
     Wrapped here, once, rather than at the hundreds of call sites.
     """
     try:
+        from playwright._impl._sync_base import SyncBase
         from playwright.sync_api import Browser, BrowserContext, Frame, Page
     except ImportError:
         return
+    # Every sync call waits in `_sync`, so the bound is applied there, as a
+    # timeout on the dispatcher's loop that leaves the dispatcher running.
+    plain = SyncBase._sync
+
+    def within(self: Any, coro: Any) -> Any:
+        bounds = getattr(_bounds, "open", None)
+        if not bounds or not asyncio.iscoroutine(coro):
+            return plain(self, coro)
+        deadline, seconds, what = min(bounds)
+
+        async def call() -> Any:
+            try:
+                return await asyncio.wait_for(coro, max(deadline - time.monotonic(), 0))
+            except asyncio.TimeoutError:
+                raise PageStalled(f"{what} did not answer within {seconds:.0f}s") from None
+        return plain(self, call())
+
+    SyncBase._sync = within
     for cls, name, what in ((Page, "evaluate", "the page"),
                             (Frame, "evaluate", "the frame"),
                             (Browser, "close", "the browser"),
@@ -118,7 +290,9 @@ def _bound_browser_calls() -> None:
             try:
                 with answers_within(PAGE_CALL_TIMEOUT, _what):
                     return _call(self, *args, **kwargs)
-            except PageStalled:
+            except PageStalled as e:
+                if self not in _stalled:
+                    report_stall(self, str(e))
                 _stalled.add(self)
                 raise
 
@@ -156,7 +330,7 @@ WISH_DIST = os.path.join(REPO, "addons/selkies-dashboard-wish/dist")
 
 WORKDIR = os.environ.get("E2E_WORKDIR", os.path.join(tempfile.gettempdir(), "selkies-tests"))
 os.makedirs(WORKDIR, exist_ok=True)
-# The XDG runtime directory every compositor, observer and client the suites
+# The XDG runtime directory every compositor, observer, and client the suites
 # start is given: the session's own would collect their sockets beside the
 # desktop's, and a stale socket there can be mistaken for a live compositor.
 RUNTIME_DIR = os.path.join(WORKDIR, "run")
@@ -364,6 +538,38 @@ def spawn(cmd: Iterable, **kwargs: Any) -> subprocess.Popen:
     return subprocess.Popen(cmd, **kwargs)
 
 
+def named_process(name: str, env: dict) -> subprocess.Popen:
+    """A sleeping child the kernel names `name`, which `pgrep -x` then finds as
+    that daemon or session, started with `env` and PATH alone.
+
+    It ends on SIGHUP whatever disposition the suite inherited, as the daemons
+    it stands in for handle that signal themselves: under `nohup` an ignored
+    SIGHUP passes to every child, which would then outlive the reload a check
+    waits for. The disposition is reset before the rename, so a child that
+    carries the name already takes the signal.
+    """
+    proc = spawn([sys.executable, "-c", "import ctypes, signal, sys, time; "
+                  "signal.signal(signal.SIGHUP, signal.SIG_DFL); ctypes.CDLL(None).prctl("
+                  "15, sys.argv[1].encode(), 0, 0, 0); time.sleep(120)", name],
+                 env={"PATH": os.environ.get("PATH", ""), **env})
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        with open(f"/proc/{proc.pid}/comm") as f:
+            if f.read().strip() == name:
+                break
+        time.sleep(0.05)
+    return proc
+
+
+def inherited_env() -> dict:
+    """What a hermetic child environment still takes from the suite's own: the
+    warnings config, so a deprecation sweep sees server-side hits, and GPU
+    visibility, so ``CUDA_VISIBLE_DEVICES=`` keeps the server's encoders off the
+    host's GPUs."""
+    names = ("PYTHONWARNINGS", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
 def server_start(mode: str = "websockets", wayland: bool = False,
                  web_root: str = CORE_DIST,
                  extra_env: Optional[dict] = None,
@@ -405,10 +611,7 @@ def server_start(mode: str = "websockets", wayland: bool = False,
     # endpoint is only wired in when one is offered.
     if os.environ.get("E2E_TURN_REST_URI"):
         env["SELKIES_TURN_REST_URI"] = os.environ["E2E_TURN_REST_URI"]
-    # Warnings config crosses into the server so a deprecation sweep can see
-    # server-side hits; everything else stays hermetic.
-    if os.environ.get("PYTHONWARNINGS"):
-        env["PYTHONWARNINGS"] = os.environ["PYTHONWARNINGS"]
+    env.update(inherited_env())
     if not wayland:
         env["DISPLAY"] = require_display()
     pulse = pulse_server()
@@ -581,10 +784,10 @@ def uinput_shim_env(tag: str) -> tuple:
         `(env, stream_path, log_path)`, both files truncated.
 
     Raises:
-        RuntimeError: The shim library has not been built.
+        subprocess.CalledProcessError: The shim library does not build.
     """
     if not os.path.exists(UINPUT_SHIM):
-        raise RuntimeError(f"{UINPUT_SHIM} is missing; run make -C tests/tools")
+        subprocess.run(["make", "-s", "-C", TOOLS, "uinput_shim.so"], check=True)
     stream = os.path.join(WORKDIR, f"uinput-{tag}-stream.bin")
     log = os.path.join(WORKDIR, f"uinput-{tag}-shim.log")
     for path in (stream, log):
@@ -695,6 +898,16 @@ def free_display(taken: Iterable[str] = ()) -> Iterable[str]:
         yield f":{number}"
 
 
+def x_lock_holder(display: str) -> Optional[int]:
+    """The process id the display's lock file names, None without a readable one."""
+    number = display.lstrip(":").split(".")[0]
+    try:
+        with open(f"/tmp/.X{number}-lock") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def private_x_server(width: int = 1280, height: int = 720, depth: int = 24,
                      extra_args: Iterable[str] = (), xvfb: str = "Xvfb") -> tuple:
     """A throwaway Xvfb of this suite's own, on a display nothing else holds.
@@ -703,7 +916,10 @@ def private_x_server(width: int = 1280, height: int = 720, depth: int = 24,
     private server needs it. A number another server takes first is simply the
     next candidate, so suites running side by side do not collide; the attempts
     are bounded, because a host where no server can start at all must report
-    that rather than work through every number in the range.
+    that rather than work through every number in the range. A display that
+    answers is taken only when its lock names this server: two suites starting
+    together try the same number, and the one whose server loses the lock would
+    otherwise take the winner's display in the moment before its own exits.
 
     Args:
         width: Screen width. Xvfb fixes its maximum screen size here, so a
@@ -736,7 +952,9 @@ def private_x_server(width: int = 1280, height: int = 720, depth: int = 24,
                 break
             if subprocess.run(["xdpyinfo", "-display", display],
                               capture_output=True).returncode == 0:
-                return proc, display
+                if x_lock_holder(display) == proc.pid:
+                    return proc, display
+                break
             time.sleep(0.25)
         proc.kill()
         proc.wait(timeout=5)
@@ -758,16 +976,10 @@ def stop_x_server(proc: subprocess.Popen, display: str) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+    if x_lock_holder(display) != proc.pid:
+        return
     number = display.lstrip(":").split(".")[0]
-    lock = f"/tmp/.X{number}-lock"
-    try:
-        with open(lock) as f:
-            stale = int(f.read().strip()) == proc.pid
-    except (OSError, ValueError):
-        return
-    if not stale:
-        return
-    for path in (lock, f"/tmp/.X11-unix/X{number}"):
+    for path in (f"/tmp/.X{number}-lock", f"/tmp/.X11-unix/X{number}"):
         try:
             os.unlink(path)
         except OSError:
@@ -780,11 +992,13 @@ def x_display() -> Any:
     return xdisp.Display(require_display())
 
 
-def x_own_clipboard(payload: bytes) -> tuple:
+def x_own_clipboard(payload: bytes, extra: Optional[Dict[str, bytes]] = None) -> tuple:
     """Own CLIPBOARD on the test X server and serve selection requests.
 
     Args:
         payload: Bytes handed to any requestor asking for the selection.
+        extra: Further targets offered beside UTF8_STRING, each answered with
+            its own bytes (a password manager's hint, say).
 
     Returns:
         `(display, stop)` where setting `stop["flag"]` ends the serving thread.
@@ -797,6 +1011,7 @@ def x_own_clipboard(payload: bytes) -> tuple:
     clip = ext.get_atom("CLIPBOARD")
     utf8 = ext.get_atom("UTF8_STRING")
     targets = ext.get_atom("TARGETS")
+    extras = {ext.get_atom(name): data for name, data in (extra or {}).items()}
     win.set_selection_owner(clip, X.CurrentTime)
     ext.flush()
     import threading
@@ -819,7 +1034,9 @@ def x_own_clipboard(payload: bytes) -> tuple:
                 e = ext.next_event()
                 if isinstance(e, xevent.SelectionRequest):
                     if e.target == targets:
-                        e.requestor.change_property(e.property, targets, 32, [utf8])
+                        e.requestor.change_property(e.property, targets, 32, [utf8, *extras])
+                    elif e.target in extras:
+                        e.requestor.change_property(e.property, e.target, 8, extras[e.target])
                     else:
                         # ChangeProperty's length field is 16-bit, so a payload
                         # larger than 64 KiB must be appended in chunks.
