@@ -5,6 +5,8 @@ description: "Token authentication for orchestrated sessions: the master token, 
 
 Selkies has two authentication modes. Without a master token it is in **legacy mode**: the server is either open or behind HTTP Basic authentication (`--enable-basic-auth`, the default, with an optional view-only password), and the browser presents the same credentials on every route. Setting a master token (`--master-token` / `SELKIES_MASTER_TOKEN`) switches the server into **secure mode**, where an orchestrator provisions per-session tokens and every client presents its token instead of a shared login. This page describes secure mode; the login settings are in the [Settings Reference](settings.md).
 
+An orchestrator can supply the master token through `--master-token-file` / `SELKIES_MASTER_TOKEN_FILE` instead. The file must be a non-symlink regular file owned by the service user, with no group or other permissions. Only one of the direct token and token file may be set. The file path may appear in process arguments; the token value does not.
+
 ## Master Token and Session Tokens
 
 The master token is the administrative credential. It is never sent to clients and authenticates two control-plane requests as an `Authorization: Bearer <master token>` header:

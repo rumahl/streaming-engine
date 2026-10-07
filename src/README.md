@@ -224,6 +224,7 @@ The table below lists all available server settings.
 | `SELKIES_PORT` (or `CUSTOM_WS_PORT`) | `--port` | `8080` | Port for the data websocket server. |
 | `SELKIES_SUBFOLDER` (or `SUBFOLDER`) | `--subfolder` | `''` | URL path prefix the server is reverse-proxied under, prepended to every route. Optional: set it only when the proxy does not strip the prefix before forwarding. Slashes are optional (`desk`, `/desk`, and `/desk/` are the same prefix; `/` is the root). The web client derives its own prefix from the URL it was loaded from, so this configures the server alone. |
 | `SELKIES_MASTER_TOKEN` | `--master-token` | `''` | Master token to enable secure mode. If set, clients must authenticate using tokens provided via the token-management API (`POST /api/tokens`). |
+| `SELKIES_MASTER_TOKEN_FILE` | `--master-token-file` | `''` | Private regular file containing the master token; cannot be combined with `SELKIES_MASTER_TOKEN`. |
 | `SELKIES_ENCODE_DRI` (or `DRI_NODE`) | `--encode-dri` | `''` | Path to the DRI render node the encoder uses (VA-API/NVENC device selection). When unset, the node is auto-selected. |
 | `SELKIES_RENDER_DRI` (or `DRINODE`) | `--render-dri` | `''` | Path to the DRI render node the Wayland compositor renders on. Defaults to the `auto_gpu` selection, else software rendering. |
 | `SELKIES_AUDIO_DEVICE_NAME` | `--audio-device-name` | `'output.monitor'` | Audio device name for pcmflux capture. |
